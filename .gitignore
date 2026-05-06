@@ -1,0 +1,7 @@
+node_modules/
+user-data/
+auth.json
+*.png
+recon.json
+.env
+.qodo/
