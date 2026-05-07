@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.5.5
+  // @version      0.5.6
   // @description  Census report (full) + Prior Payroll YTD report (scrape → confirm dialog → fill → generate → download → loop)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -1014,13 +1014,25 @@
     async function ensureCurrentYearTab() {
       const currentYear = String(new Date().getFullYear());
       const yearTab = findVisibleByExactText(currentYear);
-      if (!yearTab) {
-        log(`Year tab for ${currentYear} not found — scraping whatever year is active`);
-        return;
+      if (yearTab) {
+        log(`Clicking year ${currentYear} tab`);
+        clickEl(yearTab);
+      } else {
+        log(`Year tab for ${currentYear} not found — waiting for whatever year is active`);
       }
-      log(`Clicking year ${currentYear} tab`);
-      clickEl(yearTab);
-      await sleep(1500);
+      // Paycom re-fetches the table via AJAX after a year-tab click — rows briefly
+      // disappear and the spinner shows. Wait for at least one row whose check date
+      // ends with the year we want (or any year, if our tab wasn't found) before
+      // returning. Otherwise scrapePayrollSchedule() runs against an empty table.
+      await waitFor(
+        () => {
+          const rows = scrapePayrollSchedule();
+          if (!rows.length) return null;
+          if (!yearTab) return rows;
+          return rows.some(r => (r.checkDate || '').endsWith('/' + currentYear)) ? rows : null;
+        },
+        { timeout: 30000, interval: 500, label: `schedule rows for ${currentYear}` }
+      );
     }
 
     // Modal asking the user to pick one schedule when multiple have processed periods.
@@ -1167,8 +1179,10 @@
 
       log('Waiting for schedule table to load');
       await waitFor(
-        () => Array.from(document.querySelectorAll('tr')).some(r => /1st Quarter/i.test(r.innerText || '')),
-        { timeout: 20000, label: 'schedule dates table' }
+        () => Array.from(document.querySelectorAll('tr'))
+          .filter(visible)
+          .some(r => /1st Quarter/i.test(r.innerText || '')),
+        { timeout: 30000, label: 'schedule dates table (visible 1st Quarter row)' }
       );
 
       await ensureCurrentYearTab();
