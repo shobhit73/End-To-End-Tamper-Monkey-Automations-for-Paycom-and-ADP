@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.5.1
+  // @version      0.5.5
   // @description  Census report (full) + Prior Payroll YTD report (scrape → confirm dialog → fill → generate → download → loop)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -274,7 +274,29 @@
     // ====== END field list ======
 
     const log = (...args) => console.log('[PaycomBot]', ...args);
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Both modes IDLE means the user clicked Stop / reset. Used by sleep + waitFor
+    // so any in-flight async work bails within ~100ms of the click.
+    function shouldAbort() {
+      return !isRunning() && !isPpRunning();
+    }
+
+    // Abort-aware sleep: rejects with err.aborted=true if the user clicks Stop
+    // partway through. Without this, the Census field-selection loop and wizard
+    // transitions would keep marching through their sleeps after Stop was pressed.
+    const sleep = (ms) => new Promise((resolve, reject) => {
+      const start = Date.now();
+      (function tick() {
+        if (shouldAbort()) {
+          const e = new Error('Aborted during sleep');
+          e.aborted = true;
+          return reject(e);
+        }
+        const remaining = ms - (Date.now() - start);
+        if (remaining <= 0) return resolve();
+        setTimeout(tick, Math.min(100, remaining));
+      })();
+    });
 
     const getState = () => localStorage.getItem(STATE_KEY) || STATES.IDLE;
     const setState = (s) => {
@@ -331,10 +353,17 @@
       return null;
     }
 
+    function makeAbortError(label) {
+      const e = new Error(`Aborted by user (was waiting for ${label})`);
+      e.aborted = true;
+      return e;
+    }
+
     function waitFor(predicate, { timeout = 30000, interval = 250, label = 'element' } = {}) {
       return new Promise((resolve, reject) => {
         const start = Date.now();
         (function tick() {
+          if (shouldAbort()) return reject(makeAbortError(label));
           let r;
           try { r = predicate(); } catch (_) { r = null; }
           if (r) return resolve(r);
@@ -700,12 +729,15 @@
       AT_SCHEDULE: 'PP_AT_SCHEDULE',
       AT_REPORT: 'PP_AT_REPORT',
     };
+    // Schedule ID is per-client, so we don't hardcode it. We navigate to the
+    // listing page and click whichever schedule appears there. Report ID 58
+    // (Employee YTD Balances Report) is a Paycom global ID that's stable
+    // across clients.
     const PP_CONFIG = {
-      scheduleId: 5701,
       ytdReportId: 58,
     };
-    const ppScheduleUrl = () =>
-      `https://www.paycomonline.net/v4/cl/web.php/paygrid/processingschedules/index/${PP_CONFIG.scheduleId}`;
+    const ppScheduleListUrl = () =>
+      'https://www.paycomonline.net/v4/cl/web.php/paygrid/processingschedules/indexTable';
     const ppYtdReportUrl = () =>
       `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${PP_CONFIG.ytdReportId}`;
 
@@ -991,6 +1023,140 @@
       await sleep(1500);
     }
 
+    // Modal asking the user to pick one schedule when multiple have processed periods.
+    function showSchedulePickDialog(schedules, onPick, onCancel) {
+      const old = document.getElementById('paycom-bot-schedule-pick');
+      if (old) old.remove();
+
+      const overlay = document.createElement('div');
+      overlay.id = 'paycom-bot-schedule-pick';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2147483647;display:flex;align-items:center;justify-content:center;font:14px sans-serif;';
+
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#fff;border-radius:10px;padding:20px;max-width:520px;width:92%;box-shadow:0 8px 32px rgba(0,0,0,0.35);';
+
+      const title = document.createElement('h3');
+      title.textContent = 'Multiple schedules with processed payrolls';
+      title.style.cssText = 'margin:0 0 4px;color:#0b7dda;font-size:16px;';
+      box.appendChild(title);
+
+      const subtitle = document.createElement('div');
+      subtitle.textContent = 'Pick which schedule to use for this run.';
+      subtitle.style.cssText = 'color:#666;font-size:12px;margin-bottom:14px;';
+      box.appendChild(subtitle);
+
+      const list = document.createElement('div');
+      list.style.cssText = 'margin-bottom:14px;';
+      schedules.forEach((s, i) => {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;padding:10px;cursor:pointer;border:1px solid #e0e0e0;border-radius:6px;margin-bottom:6px;';
+        const r = document.createElement('input');
+        r.type = 'radio';
+        r.name = 'paycom-schedule-pick';
+        r.value = String(i);
+        if (i === 0) r.checked = true;
+        r.style.cssText = 'margin-right:10px;transform:scale(1.2);';
+        const text = document.createElement('div');
+        const safeName = s.name.replace(/</g, '&lt;');
+        text.innerHTML = `<b>${safeName}</b><br><span style="color:#666;font-size:12px">${s.processed} of ${s.total} periods processed</span>`;
+        row.appendChild(r);
+        row.appendChild(text);
+        list.appendChild(row);
+      });
+      box.appendChild(list);
+
+      const buttons = document.createElement('div');
+      buttons.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;';
+      const cancel = document.createElement('button');
+      cancel.textContent = 'Cancel';
+      cancel.style.cssText = 'padding:9px 18px;border:1px solid #bbb;background:#fff;border-radius:5px;cursor:pointer;font-size:13px;';
+      cancel.onclick = () => { overlay.remove(); onCancel(); };
+      buttons.appendChild(cancel);
+
+      const confirm = document.createElement('button');
+      confirm.textContent = 'Use this schedule';
+      confirm.style.cssText = 'padding:9px 18px;border:0;background:#0b7dda;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;font-size:13px;';
+      confirm.onclick = () => {
+        const picked = overlay.querySelector('input[name="paycom-schedule-pick"]:checked');
+        const idx = parseInt(picked?.value || '0', 10);
+        overlay.remove();
+        onPick(schedules[idx]);
+      };
+      buttons.appendChild(confirm);
+      box.appendChild(buttons);
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    }
+
+    // On the schedule listing page (/processingschedules/indexTable), parse all
+    // schedule rows, filter to ones with processed periods > 0, then auto-pick
+    // (if 1 valid) or prompt the user (if multiple).
+    async function ppHandleScheduleList() {
+      log('On schedule listing page, parsing schedules table');
+      await waitFor(
+        () => Array.from(document.querySelectorAll('a[href*="/processingschedules/index/"]'))
+          .filter(a => visible(a) && (a.textContent || '').trim().length > 0)[0],
+        { timeout: 15000, label: 'schedule listing rows' }
+      );
+
+      // Find the "Processed Period" column index from the table headers.
+      const headers = Array.from(document.querySelectorAll('th'));
+      const procColIdx = headers.findIndex(h => /Processed\s+Period/i.test(h.innerText || ''));
+
+      const schedules = [];
+      for (const row of Array.from(document.querySelectorAll('tr'))) {
+        const link = Array.from(row.querySelectorAll('a[href*="/processingschedules/index/"]'))
+          .filter(a => visible(a) && (a.textContent || '').trim().length > 0)[0];
+        if (!link) continue;
+
+        const cells = row.querySelectorAll('td');
+        const processedText = procColIdx >= 0 ? (cells[procColIdx]?.innerText || '').trim() : '';
+        const m = processedText.match(/^(\d+)\s+of\s+(\d+)$/i);
+        const processed = m ? parseInt(m[1], 10) : 0;
+        const total = m ? parseInt(m[2], 10) : 0;
+
+        schedules.push({
+          name: (link.textContent || '').trim(),
+          link,
+          href: link.href,
+          processed,
+          total,
+        });
+      }
+
+      log(`Found ${schedules.length} schedule(s):`,
+        schedules.map(s => `${s.name} processed=${s.processed}/${s.total}`));
+
+      const usable = schedules.filter(s => s.processed > 0);
+
+      if (!usable.length) {
+        throw new Error(
+          `Found ${schedules.length} schedule(s), but none have any processed periods. ` +
+          `Nothing to download for prior payroll yet.`
+        );
+      }
+
+      if (usable.length === 1) {
+        log(`Auto-picking the only schedule with processed periods: ${usable[0].name}`);
+        clickEl(usable[0].link);
+        return;
+      }
+
+      // Multiple usable schedules → ask the user.
+      showSchedulePickDialog(
+        usable,
+        (chosen) => {
+          log(`User picked schedule: ${chosen.name}`);
+          clickEl(chosen.link);
+        },
+        () => {
+          log('User cancelled schedule picker');
+          setPpState(PP_STATES.IDLE);
+        }
+      );
+    }
+
     async function ppHandleSchedulePage() {
       log('On schedule page, clicking "2. Schedule Dates" tab');
       const datesTab = await waitFor(
@@ -1082,6 +1248,12 @@
       );
 
       while (true) {
+        // Cooperative abort — Stop / reset clears the running flag.
+        if (!isPpRunning()) {
+          log('Aborted by user mid-loop — exiting Prior Payroll task loop');
+          hideProgressBanner();
+          return;
+        }
         const index = getPpIndex();
         if (index >= tasks.length) {
           hideProgressBanner();
@@ -1130,21 +1302,35 @@
 
       if (state === PP_STATES.GO_TO_SCHEDULE) {
         setPpState(PP_STATES.AT_SCHEDULE);
-        location.href = ppScheduleUrl();
+        location.href = ppScheduleListUrl();
         return;
       }
 
       if (state === PP_STATES.AT_SCHEDULE) {
-        if (!url.includes('/processingschedules/index/')) {
-          location.href = ppScheduleUrl();
+        // Listing page → click first schedule link
+        if (url.includes('/processingschedules/indexTable')) {
+          try {
+            await ppHandleScheduleList();
+          } catch (err) {
+            if (err.aborted) { log('PP list aborted by user'); return; }
+            alert('Paycom Bot (PP, list): ' + err.message);
+            setPpState(PP_STATES.IDLE);
+          }
           return;
         }
-        try {
-          await ppHandleSchedulePage();
-        } catch (err) {
-          alert('Paycom Bot (PP, schedule): ' + err.message);
-          setPpState(PP_STATES.IDLE);
+        // Detail page (schedule ID in path) → click Schedule Dates, scrape
+        if (/\/processingschedules\/index\/\d+/.test(url)) {
+          try {
+            await ppHandleSchedulePage();
+          } catch (err) {
+            if (err.aborted) { log('PP schedule aborted by user'); return; }
+            alert('Paycom Bot (PP, schedule): ' + err.message);
+            setPpState(PP_STATES.IDLE);
+          }
+          return;
         }
+        // Wrong page → bounce back to listing
+        location.href = ppScheduleListUrl();
         return;
       }
 
@@ -1156,6 +1342,7 @@
         try {
           await ppHandleReportPage();
         } catch (err) {
+          if (err.aborted) { log('PP report aborted by user'); hideProgressBanner(); return; }
           alert('Paycom Bot (PP, report): ' + err.message);
           setPpState(PP_STATES.IDLE);
         }
@@ -1184,6 +1371,7 @@
             await waitForReportAndDownload();
           } catch (err) {
             hideProgressBanner();
+            if (err.aborted) { log('Census download aborted by user'); return; }
             alert('Paycom Bot (download): ' + err.message);
             setState(STATES.IDLE);
           }
@@ -1204,6 +1392,7 @@
           log('Clicking option', CONFIG.reportType);
           option.click();
         } catch (err) {
+          if (err.aborted) { log('Census aborted by user'); return; }
           alert('Paycom Bot: ' + err.message);
           setState(STATES.IDLE);
         }
@@ -1221,6 +1410,7 @@
           // Page then navigates to Recent reports — dispatcher fires there.
           await runWizardAfterStep1();
         } catch (err) {
+          if (err.aborted) { log('Census builder aborted by user'); return; }
           alert('Paycom Bot (builder): ' + err.message);
           setState(STATES.IDLE);
         }
@@ -1265,8 +1455,15 @@
         startPriorPayroll();
       });
       panelEl.querySelector('.stop').addEventListener('click', () => {
+        log('Stop / reset clicked — clearing state and tearing down UI');
         setState(STATES.IDLE);
         setPpState(PP_STATES.IDLE);
+        // Close any modal dialogs the user might be looking at.
+        document.getElementById('paycom-bot-confirm')?.remove();
+        document.getElementById('paycom-bot-schedule-pick')?.remove();
+        document.getElementById('paycom-bot-info')?.remove();
+        // Hide banners.
+        hideProgressBanner();
       });
       refreshPanel();
       return panelEl;
