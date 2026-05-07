@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.5.6
+  // @version      0.5.7
   // @description  Census report (full) + Prior Payroll YTD report (scrape → confirm dialog → fill → generate → download → loop)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -632,22 +632,22 @@
         await sleep(300);
       }
 
-      // Step 4: Review — select XLSX, click Generate Report
+      // Step 4: Review — select CSV, click Generate Report
       await waitFor(() => findGenerateReportButton(), {
         timeout: 15000,
         label: 'Generate Report button on Review step',
       });
 
-      const xlsxRadio = findRadioByLabel('XLSX');
-      if (xlsxRadio) {
-        if (!xlsxRadio.checked) {
-          log('Selecting XLSX radio');
-          xlsxRadio.click();
+      const csvRadio = findRadioByLabel('CSV');
+      if (csvRadio) {
+        if (!csvRadio.checked) {
+          log('Selecting CSV radio');
+          csvRadio.click();
         } else {
-          log('XLSX already selected');
+          log('CSV already selected');
         }
       } else {
-        log('Warning: XLSX radio not found, proceeding with default format');
+        log('Warning: CSV radio not found, proceeding with default format');
       }
       await sleep(400);
 
@@ -1216,10 +1216,10 @@
     }
 
     async function ppFillReportForm(task) {
-      const xlsxRadio = findRadioByLabel('XLSX');
-      if (xlsxRadio && !xlsxRadio.checked) {
-        log('Selecting XLSX');
-        clickEl(xlsxRadio);
+      const csvRadio = findRadioByLabel('CSV');
+      if (csvRadio && !csvRadio.checked) {
+        log('Selecting CSV');
+        clickEl(csvRadio);
       }
       await sleep(150);
 
@@ -1420,7 +1420,7 @@
             label: 'filter checkboxes',
           });
           await selectRequiredFieldsAndNext();
-          // Continue: click Next on Filters & Sorting, select XLSX, click Generate Report.
+          // Continue: click Next on Filters & Sorting, select CSV, click Generate Report.
           // Page then navigates to Recent reports — dispatcher fires there.
           await runWizardAfterStep1();
         } catch (err) {
