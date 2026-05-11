@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ADP Census + SIT/FIT Report Automation
+// @name         ADP Census + SIT/FIT + License/EC Report Automation
 // @namespace    https://workforcenow.adp.com/
-// @version      0.2.1
-// @description  Two-button automation: Download Census or Download SIT/FIT. End-to-end from the home page through Reports & Analytics → All Custom Reports → Create new report → field selection (v9.2 column lists embedded) → SSN unmask.
+// @version      0.4.0
+// @description  Four-button automation: Download Census, Download SIT/FIT, Download License/EC, or Download Payroll History. End-to-end from the home page through Reports & Analytics → report selection → field selection → CSV export.
 // @match        https://workforcenow.adp.com/theme/admin.html*
 // @run-at       document-end
 // @grant        none
@@ -139,6 +139,58 @@
     "Legal / Preferred Address: Zip / Postal Code (Personal Profile)",
     "Legal / Preferred Address: State / Territory Code (Personal Profile)",
     "Pronouns (Personal Profile)"
+  ];
+
+  const LICENSE_EC_COLUMNS = [
+    "Legal First Name (Personal Profile)",
+    "Legal Last Name (Personal Profile)",
+    "Associate ID (Employment Profile)",
+    "License/Certification Description (Talent Profile)",
+    "License/Certification ID (Talent Profile)",
+    "Issued By (Talent Profile)",
+    "Expiration Date (Talent Profile)",
+    "Contact Name (personal profile)",
+    "Relationship Description (personal profile)",
+    "Mobile Phone (personal profile)"
+  ];
+
+  // Fields to select on the Payroll History "What's Displayed" panel.
+  // These are the aria-label values on the checkbox buttons.
+  const PAYROLL_HISTORY_FIELDS = [
+    "Tax ID",
+    "Associate ID",
+    "Worked In State",
+    "Period Beginning Date",
+    "Period Ending Date",
+    "Pay Date",
+    "Check/Voucher #",
+    "Gross Pay",
+    "Take Home",
+    "Direct Deposit",
+    "Net Pay",
+    "Regular Hours",
+    "Overtime Hours",
+    "Additional Hours",
+    "Total Hours",
+    "Regular Earnings",
+    "Overtime Earnings",
+    "Additional Earnings",
+    "Total Earnings",
+    "Voluntary Deductions",
+    "Total Voluntary Deductions",
+    "Memos",
+    "Total Memos",
+    "Federal Tax - Employee",
+    "State Tax - Employee",
+    "Local Tax - Employee",
+    "Total Employee Tax",
+    "Federal Tax - Employer",
+    "State Tax- Employer",
+    "Local tax - Employer",
+    "Total Employer Tax",
+    "Federal taxable",
+    "State taxable",
+    "Local taxable"
   ];
 
   const FIELD_NAME_CORRECTIONS = {
@@ -626,6 +678,670 @@
     return false;
   }
 
+  // ───────────────── payroll history steps ─────────────────
+
+  // Step P1: click "All Standard Reports" in the mega-menu.
+  async function stepClickAllStandardReports() {
+    let a = null;
+    for (let i = 0; i < 15 && !a; i++) {
+      a = findAnchorByText('All Standard Reports');
+      if (!a) await sleep(200);
+    }
+    if (!a) {
+      logError('"All Standard Reports" anchor not found');
+      return false;
+    }
+    const href = a.getAttribute('href');
+    const startHash = location.hash;
+    clickEl(a);
+    logInfo('Clicked All Standard Reports (href=' + href + ')');
+    await sleep(800);
+    if (location.hash === startHash) {
+      if (href && href.startsWith('#')) {
+        location.hash = href;
+        await sleep(400);
+      } else {
+        logError('Navigation failed — href is not a hash route');
+        return false;
+      }
+    }
+    await sleep(200);
+    dismissMegaMenuPanes();
+    const navBtn = findReportsButton();
+    if (navBtn) navBtn.setAttribute('aria-expanded', 'false');
+    logSuccess('Navigated to All Standard Reports');
+    return true;
+  }
+
+  // Step P2: search for "Payroll History" on the Standard Reports page.
+  // The search box is a Dojo dijit TextBox (id="RevSearchInput_searchbox")
+  // and the submit button is hidden (height:0) but clickable
+  // (id="RevSearchInput_searchboxButton", data-dojo-attach-event="onClick:_onSearch").
+  async function stepSearchPayrollHistory() {
+    // Find the Dojo search input by its specific ID
+    let searchInput = null;
+    for (let i = 0; i < 30 && !searchInput; i++) {
+      searchInput = deepQueryAll('#RevSearchInput_searchbox')
+        .find(el => el.tagName && el.tagName.toLowerCase() === 'input');
+      if (!searchInput) await sleep(300);
+    }
+    if (!searchInput) {
+      logError('Dojo search input #RevSearchInput_searchbox not found');
+      return false;
+    }
+    logInfo('Found Dojo search input');
+
+    // Set value using multiple approaches for Dojo compatibility
+    searchInput.focus();
+    searchInput.value = 'Payroll History';
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // Also try the native setter (in case Dojo intercepts .value)
+    try {
+      const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+      if (desc && desc.set) {
+        desc.set.call(searchInput, 'Payroll History');
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    } catch (_) {}
+
+    // Also try setting via the Dojo widget API if available
+    try {
+      const ownerDoc = searchInput.ownerDocument || document;
+      const ownerWin = ownerDoc.defaultView || window;
+      if (ownerWin.dijit && ownerWin.dijit.byId) {
+        const widget = ownerWin.dijit.byId('RevSearchInput_searchbox');
+        if (widget && widget.set) {
+          widget.set('value', 'Payroll History');
+          logInfo('Set value via Dojo widget API');
+        }
+      }
+    } catch (e) {
+      logDebug('Dojo widget API not available: ' + e);
+    }
+
+    await sleep(300);
+
+    // Click the search button directly by ID (it has height:0 but click still works)
+    let searchBtn = null;
+    searchBtn = deepQueryAll('#RevSearchInput_searchboxButton')[0];
+    if (searchBtn) {
+      logInfo('Found search button by ID, clicking');
+      // Use el.click() directly — Dojo's attach-event responds to native click
+      try { searchBtn.click(); } catch (_) {}
+      // Also dispatch dijitclick for good measure
+      try {
+        const ownerDoc = searchBtn.ownerDocument || document;
+        const ownerWin = ownerDoc.defaultView || window;
+        searchBtn.dispatchEvent(new (ownerWin.Event || Event)('dijitclick', { bubbles: true, cancelable: true }));
+      } catch (_) {}
+    } else {
+      logWarn('Search button not found by ID — trying Enter key');
+      searchInput.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true
+      }));
+    }
+
+    // Wait for results to load
+    await sleep(3000);
+    logSuccess('Search submitted for "Payroll History"');
+    return true;
+  }
+
+  // Step P3: select "Payroll History" with Type "Standard" from results.
+  // The report name is a Dojo dijit Button (<span role="button" title="Payroll History">)
+  // — NOT an <a> tag. Use the title attribute for clean matching.
+  async function stepSelectPayrollHistoryStandard() {
+    let target = null;
+    for (let attempt = 0; attempt < 20 && !target; attempt++) {
+      // Find all elements with title="Payroll History" (exact match)
+      const candidates = deepQueryAll('[title="Payroll History"]').filter(visible);
+      for (const el of candidates) {
+        // Verify this is in a row that also contains "Standard"
+        const row = el.closest('tr, [role="row"], li, div[class*="row"]');
+        if (row) {
+          const rowText = (row.textContent || '');
+          if (rowText.includes('Standard')) {
+            target = el;
+            break;
+          }
+        }
+        // Fallback: if no row container found, check parent/grandparent
+        if (!target) {
+          let parent = el.parentElement;
+          for (let depth = 0; depth < 5 && parent; depth++) {
+            const txt = (parent.textContent || '');
+            if (txt.includes('Standard') && txt.includes('Payroll History')) {
+              target = el;
+              break;
+            }
+            parent = parent.parentElement;
+          }
+        }
+        if (target) break;
+      }
+      if (!target) await sleep(500);
+    }
+
+    if (!target) {
+      logError('Payroll History (Standard) not found in search results');
+      return false;
+    }
+
+    logInfo('Found Payroll History button:', target.tagName, target.id);
+    clickEl(target);
+    logSuccess('Selected Payroll History (Standard)');
+    return true;
+  }
+
+  // Step P4: wait for the "Run Report" page to load after selecting Payroll History.
+  // Instead of looking for a specific heading tag, we look for elements that only
+  // appear on this page: "What's Displayed on the Report" or "Run as Excel".
+  async function stepWaitForRunReportPage() {
+    for (let i = 0; i < 40; i++) { // up to 20s
+      const clickables = deepQueryAll(CLICKABLE_HOST_SELECTOR).filter(visible);
+      for (const el of clickables) {
+        const text = normalize(el.textContent || el.value);
+        if (text.includes("what's displayed on the report") ||
+            text.includes("what\u2019s displayed on the report") ||
+            text === 'run as excel' || text === 'save my settings') {
+          logSuccess('Run Report page loaded');
+          return true;
+        }
+      }
+      await sleep(500);
+    }
+    logError('Run Report page did not load in time');
+    return false;
+  }
+
+  // Step P5: click the pencil icon next to "What's Displayed on the Report".
+  // The pencil is an SVG inside a clickable container near that text.
+  async function stepClickWhatsDisplayed() {
+    let target = null;
+    for (let i = 0; i < 20 && !target; i++) {
+      // Strategy 1: find a clickable element whose text contains "What's Displayed"
+      const clickables = deepQueryAll('a, button, [role="button"], [role="link"]').filter(visible);
+      for (const el of clickables) {
+        const text = (el.textContent || '').trim();
+        if (text.includes("What's Displayed on the Report") || text.includes("What\u2019s Displayed on the Report")) {
+          target = el;
+          break;
+        }
+      }
+
+      // Strategy 2: find the text, then look for a nearby SVG/pencil icon
+      if (!target) {
+        const allEls = deepQueryAll('span, div, a, h3, h4, p').filter(visible);
+        for (const el of allEls) {
+          const text = (el.textContent || '').trim();
+          if (text.startsWith("What's Displayed") || text.startsWith("What\u2019s Displayed")) {
+            // Look for an SVG (pencil icon) inside or next to this element
+            const parent = el.parentElement;
+            if (parent) {
+              const svg = parent.querySelector('svg');
+              if (svg) {
+                // Click the parent container that holds both the text and the icon
+                target = parent;
+                break;
+              }
+            }
+            // Or the element itself might be the clickable container
+            const svgInside = el.querySelector('svg');
+            if (svgInside) {
+              target = el;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!target) await sleep(500);
+    }
+
+    if (!target) {
+      logError('"What\'s Displayed on the Report" pencil not found');
+      return false;
+    }
+
+    logInfo('Found What\'s Displayed target:', target.tagName);
+    clickEl(target);
+    logSuccess('Clicked "What\'s Displayed on the Report"');
+    return true;
+  }
+
+  // Step P6b: on the "What's Displayed" panel, clear all defaults then select
+  // only the fields in PAYROLL_HISTORY_FIELDS. Finally click Save.
+  async function stepSelectPayrollDisplayFields() {
+    // Wait for the field selection panel to appear
+    let panelReady = false;
+    for (let i = 0; i < 20 && !panelReady; i++) {
+      const labels = deepQueryAll('.checkactionbubble-text').filter(visible);
+      if (labels.length > 5) {
+        panelReady = true;
+        break;
+      }
+      await sleep(500);
+    }
+    if (!panelReady) {
+      logError('Field selection panel did not load');
+      return false;
+    }
+    logInfo('Field selection panel loaded');
+    await sleep(500);
+
+    // Step 1: Click "Select All" to enable "Clear All"
+    const selectAllBtn = deepQueryAll('#stdrptlabel_selectAll')[0];
+    if (selectAllBtn) {
+      logInfo('Clicking Select All');
+      clickEl(selectAllBtn);
+      await sleep(800);
+    }
+
+    // Step 2: Click "Clear All" to uncheck everything
+    let clearAllBtn = deepQueryAll('#stdrptlabel_RemoveAll')[0];
+    if (clearAllBtn) {
+      // Force-enable if disabled (DOM manipulation — per our lesson)
+      if (clearAllBtn.hasAttribute('disabled')) {
+        clearAllBtn.removeAttribute('disabled');
+        clearAllBtn.removeAttribute('aria-disabled');
+        clearAllBtn.classList.remove('disabled');
+        clearAllBtn.setAttribute('tabindex', '0');
+        logInfo('Force-enabled Clear All button');
+      }
+      logInfo('Clicking Clear All');
+      clickEl(clearAllBtn);
+      await sleep(800);
+    } else {
+      logWarn('Clear All button not found — will try to uncheck individually');
+    }
+
+    // Step 3: Select each field in PAYROLL_HISTORY_FIELDS by aria-label
+    let selectedCount = 0;
+    let failedFields = [];
+
+    for (const fieldName of PAYROLL_HISTORY_FIELDS) {
+      // Find the checkbox button by aria-label (exact match, case-insensitive)
+      let fieldBtn = null;
+      const allBtns = deepQueryAll('button[aria-label]').filter(visible);
+      for (const btn of allBtns) {
+        const label = (btn.getAttribute('aria-label') || '').trim();
+        if (label.toLowerCase() === fieldName.toLowerCase()) {
+          fieldBtn = btn;
+          break;
+        }
+      }
+
+      // Fallback: find by the checkactionbubble-text span
+      if (!fieldBtn) {
+        const textSpans = deepQueryAll('.checkactionbubble-text').filter(visible);
+        for (const span of textSpans) {
+          if (span.textContent.trim().toLowerCase() === fieldName.toLowerCase()) {
+            // Find the button in the same row
+            const container = span.closest('.flexSpaceBetween') || span.parentElement?.parentElement;
+            if (container) {
+              fieldBtn = container.querySelector('button');
+            }
+            break;
+          }
+        }
+      }
+
+      if (fieldBtn) {
+        // Check if it's already selected (container has _selected class)
+        const container = fieldBtn.closest('[class*="checkactionbubble-container"]');
+        const isSelected = container && container.className.includes('_selected');
+        if (!isSelected) {
+          clickEl(fieldBtn);
+          selectedCount++;
+          logDebug('Selected: ' + fieldName);
+        } else {
+          selectedCount++;
+          logDebug('Already selected: ' + fieldName);
+        }
+      } else {
+        failedFields.push(fieldName);
+        logWarn('Field not found: ' + fieldName);
+      }
+      await sleep(200); // brief pause between each
+    }
+
+    logInfo('Selected ' + selectedCount + '/' + PAYROLL_HISTORY_FIELDS.length + ' fields');
+    if (failedFields.length) {
+      logWarn('Failed to find: ' + failedFields.join(', '));
+    }
+
+    // Step 4: Click Save
+    await sleep(500);
+    let saveBtn = null;
+    const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+    for (const btn of buttons) {
+      const text = normalize(btn.textContent);
+      if (text === 'save') {
+        saveBtn = btn;
+        break;
+      }
+    }
+    if (saveBtn) {
+      clickEl(saveBtn);
+      logSuccess('Clicked Save — field selection complete');
+      await sleep(1000);
+    } else {
+      logError('Save button not found on field selection panel');
+      return false;
+    }
+
+    return failedFields.length === 0;
+  }
+
+  // ───────────────── payroll: appearance + quarterly download ─────────────────
+
+  // Helper: calculate which quarters to download based on current date.
+  // ADP requires start date +1 day and end date +1 day for correct filtering.
+  function getQuartersToDownload() {
+    const now = new Date();
+    const year = now.getFullYear();
+    const currentQuarter = Math.floor(now.getMonth() / 3) + 1;
+    const quarters = [];
+    for (let q = 1; q <= currentQuarter; q++) {
+      const startMonth = (q - 1) * 3 + 1; // 1, 4, 7, 10
+      const endMonth = q * 3;              // 3, 6, 9, 12
+
+      // From = quarter start + 1 day (e.g. Q1 = 01/02)
+      const fromMM = String(startMonth).padStart(2, '0');
+      const from = fromMM + '/02/' + year;
+
+      // To = quarter end + 1 day (rolls into next month's 1st)
+      let toMonth = endMonth + 1;
+      let toYear = year;
+      if (toMonth > 12) { toMonth = 1; toYear = year + 1; }
+      const toMM = String(toMonth).padStart(2, '0');
+      const to = toMM + '/01/' + toYear;
+
+      quarters.push({
+        label: 'Q' + q + ' ' + year,
+        from: from,
+        to: to
+      });
+    }
+    return quarters;
+  }
+
+  // Helper: click a VDL dropdown, then select an option by text
+  async function selectVdlDropdownOption(dropdownText, optionText) {
+    // Find the dropdown by its current displayed text
+    const dropdowns = deepQueryAll('.vdl-dropdown-list__input, [class*="dropdown"]').filter(visible);
+    let dropdown = null;
+    for (const dd of dropdowns) {
+      const text = (dd.textContent || '').trim().toLowerCase();
+      if (text === dropdownText.toLowerCase()) {
+        dropdown = dd;
+        break;
+      }
+    }
+    if (!dropdown) {
+      // Fallback: find by partial match
+      for (const dd of dropdowns) {
+        const text = (dd.textContent || '').trim().toLowerCase();
+        if (text.includes(dropdownText.toLowerCase())) {
+          dropdown = dd;
+          break;
+        }
+      }
+    }
+    if (!dropdown) {
+      logError('Dropdown showing "' + dropdownText + '" not found');
+      return false;
+    }
+
+    // Click to open
+    clickEl(dropdown);
+    await sleep(500);
+
+    // Find and click the option
+    const options = deepQueryAll('li, [role="option"], [role="menuitem"], [class*="dropdown"] [class*="option"], .vdl-dropdown-list__option').filter(visible);
+    for (const opt of options) {
+      const text = (opt.textContent || '').trim().toLowerCase();
+      if (text === optionText.toLowerCase()) {
+        clickEl(opt);
+        logInfo('Selected "' + optionText + '" from dropdown');
+        return true;
+      }
+    }
+
+    // Fallback: search all visible elements for the option text
+    const allEls = deepQueryAll('span, div, li, a').filter(visible);
+    for (const el of allEls) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text === optionText.toLowerCase() && el.closest('[class*="dropdown"], [role="listbox"], ul')) {
+        clickEl(el);
+        logInfo('Selected "' + optionText + '" (fallback)');
+        return true;
+      }
+    }
+
+    logError('Option "' + optionText + '" not found in dropdown');
+    return false;
+  }
+
+  // Step P8: click pencil next to "Appearance and Other Settings"
+  async function stepClickAppearanceSettings() {
+    let target = null;
+    for (let i = 0; i < 20 && !target; i++) {
+      const clickables = deepQueryAll('a, button, [role="button"], [role="link"], sdf-button').filter(visible);
+      for (const el of clickables) {
+        const text = (el.textContent || '').trim();
+        if (text.includes('Appearance and Other Settings') || text.includes('Appearance And Other Settings')) {
+          target = el;
+          break;
+        }
+      }
+      if (!target) await sleep(500);
+    }
+    if (!target) {
+      logError('"Appearance and Other Settings" not found');
+      return false;
+    }
+    clickEl(target);
+    logSuccess('Clicked "Appearance and Other Settings"');
+    await sleep(2000); // wait for page to load
+    return true;
+  }
+
+  // Step P9: configure Sort By, Group By, Totals Only, Tax ID, and date range.
+  // useTotals=true for closed quarters (Associate ID + Group By + Totals Only).
+  // useTotals=false for current quarter (keep Name, no Group By, no Totals Only).
+  async function stepConfigureAppearance(fromDate, toDate, useTotals) {
+    // Wait for page content to load
+    let ready = false;
+    for (let i = 0; i < 20 && !ready; i++) {
+      const labels = deepQueryAll('label, span, div').filter(visible);
+      for (const l of labels) {
+        if ((l.textContent || '').trim() === 'Totals Only') { ready = true; break; }
+      }
+      if (!ready) await sleep(500);
+    }
+    if (!ready) {
+      logError('Appearance settings page did not load fully');
+      return false;
+    }
+    logInfo('Appearance settings page ready');
+    await sleep(500);
+
+    // 1-3: Only for closed quarters (totals view)
+    if (useTotals) {
+      // 1. Change 2nd Sort By dropdown to "Associate ID"
+      logInfo('Changing Sort By #2 to Associate ID (closed quarter)');
+      await sleep(1000);
+      if (!await selectVdlDropdownOption('Name', 'Associate ID')) {
+        logWarn('Could not change Sort By #2 — may already be set');
+      }
+      await sleep(1000);
+
+      // 2. Check Group By checkbox for the 2nd row
+      logInfo('Checking Group By for Sort By #2');
+      const allCheckboxes = deepQueryAll('input[type="checkbox"]');
+      const checkLabels = deepQueryAll('label').filter(visible);
+      for (const label of checkLabels) {
+        const forId = label.getAttribute('for');
+        if (!forId) continue;
+        const row = label.closest('tr, [role="row"], div[class*="row"]');
+        if (!row) continue;
+        const rowText = (row.textContent || '');
+        if (rowText.includes('Associate ID') && !rowText.includes('Totals')) {
+          const checkbox = deepQueryAll('#' + forId)[0];
+          if (checkbox && !checkbox.checked) {
+            clickEl(label);
+            logInfo('Checked Group By for Associate ID row');
+          } else if (checkbox && checkbox.checked) {
+            logInfo('Group By already checked');
+          }
+          break;
+        }
+      }
+      await sleep(800);
+
+      // 3. Check "Totals Only"
+      logInfo('Checking Totals Only');
+      const totalsLabels = deepQueryAll('label').filter(visible);
+      for (const label of totalsLabels) {
+        if ((label.textContent || '').trim() === 'Totals Only') {
+          const forId = label.getAttribute('for');
+          if (forId) {
+            const checkbox = deepQueryAll('#' + forId)[0];
+            if (checkbox && !checkbox.checked) {
+              clickEl(label);
+              logInfo('Checked Totals Only');
+            } else {
+              logInfo('Totals Only already checked');
+            }
+          } else {
+            clickEl(label);
+            logInfo('Clicked Totals Only label');
+          }
+          break;
+        }
+      }
+      await sleep(800);
+    } else {
+      logInfo('Current quarter — keeping Name, skipping Group By and Totals Only');
+      await sleep(500);
+    }
+
+    // 4. Change Tax ID to "Not Masked"
+    logInfo('Setting Tax ID to Not Masked');
+    await sleep(1000);
+    if (!await selectVdlDropdownOption('Partially', 'Not Masked')) {
+      // Try alternate text
+      if (!await selectVdlDropdownOption('Partially masked', 'Not Masked')) {
+        await selectVdlDropdownOption('Partially Masked', 'Not masked');
+      }
+    }
+    await sleep(1500);
+
+    // 5. Click "Yes" on the confirmation popup — wait patiently for it
+    let yesBtn = null;
+    for (let i = 0; i < 25 && !yesBtn; i++) {
+      const btns = deepQueryAll('button, [role="button"], sdf-button').filter(visible);
+      for (const btn of btns) {
+        const text = normalize(btn.textContent);
+        if (text === 'yes') {
+          yesBtn = btn;
+          break;
+        }
+      }
+      if (!yesBtn) await sleep(400);
+    }
+    if (yesBtn) {
+      clickEl(yesBtn);
+      logSuccess('Clicked Yes on Tax ID confirmation');
+      await sleep(1500); // wait for popup to close and setting to apply
+    } else {
+      logWarn('Tax ID confirmation popup not found — may not have appeared');
+    }
+    await sleep(1000);
+
+    // 6. Select "Custom Date Range" from Request Period
+    logInfo('Setting Request Period to Custom Date Range');
+    await sleep(1000);
+    if (!await selectVdlDropdownOption('Last 30 Days', 'Custom Date Range')) {
+      // Try other current values it might show
+      if (!await selectVdlDropdownOption('Last 30', 'Custom Date Range')) {
+        if (!await selectVdlDropdownOption('Year-to-Date', 'Custom Date Range')) {
+          await selectVdlDropdownOption('Custom Date', 'Custom Date Range');
+        }
+      }
+    }
+    await sleep(1500);
+
+    // 7. Enter From and To dates
+    logInfo('Setting date range: ' + fromDate + ' to ' + toDate);
+    const dateInputs = deepQueryAll('input').filter(visible).filter(inp => {
+      const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
+      return ph.includes('mm/dd/yyyy') || ph.includes('mm/dd');
+    });
+
+    if (dateInputs.length >= 2) {
+      // First date input = From, second = To
+      dateInputs[0].focus();
+      await sleep(300);
+      setReactInputValue(dateInputs[0], fromDate);
+      await sleep(800);
+      dateInputs[1].focus();
+      await sleep(300);
+      setReactInputValue(dateInputs[1], toDate);
+      await sleep(800);
+      // Click somewhere neutral to dismiss any datepicker
+      dateInputs[1].blur();
+      await sleep(500);
+      logInfo('Dates entered: ' + fromDate + ' → ' + toDate);
+    } else if (dateInputs.length === 1) {
+      logWarn('Only 1 date input found — entering From date');
+      setReactInputValue(dateInputs[0], fromDate);
+    } else {
+      logError('Date inputs not found');
+    }
+    await sleep(800);
+
+    // 8. Click Save
+    const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+    for (const btn of saveBtns) {
+      if (normalize(btn.textContent) === 'save') {
+        clickEl(btn);
+        logSuccess('Clicked Save on Appearance settings');
+        await sleep(1500);
+        return true;
+      }
+    }
+    logError('Save button not found');
+    return false;
+  }
+
+  // Step P10: click "Run as Excel" on the Run Report page
+  async function stepClickRunAsExcel() {
+    let btn = null;
+    for (let i = 0; i < 20 && !btn; i++) {
+      const clickables = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+      for (const el of clickables) {
+        const text = normalize(el.textContent);
+        if (text === 'run as excel') {
+          btn = el;
+          break;
+        }
+      }
+      if (!btn) await sleep(500);
+    }
+    if (!btn) {
+      logError('Run as Excel button not found');
+      return false;
+    }
+    clickEl(btn);
+    logSuccess('Clicked Run as Excel');
+    return true;
+  }
+
   // ───────────────── field-selection (ported from v9.2) ─────────────────
 
   function findFieldSearchInput() {
@@ -958,6 +1674,169 @@
     });
   }
 
+  function downloadLicenseEC(setStatus) {
+    return runFullFlow({
+      type: 'License/EC',
+      columns: LICENSE_EC_COLUMNS,
+      title: 'License and Emergency Contact',
+      unmaskSsn: false,
+      setStatus,
+    });
+  }
+
+  // Payroll History uses a different flow: Standard Reports → search → select,
+  // instead of Custom Reports → Create new → Select Fields. So it has its own
+  // flow function rather than going through runFullFlow.
+  async function downloadPayrollHistory(setStatus) {
+    logInfo('=== Download Payroll History ===');
+    resetAbort();
+
+    try {
+      setStatus('Step 1: Opening Reports menu…');
+      checkAbort();
+      if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
+
+      setStatus('Step 2: Navigating to All Standard Reports…');
+      checkAbort();
+      if (!await stepClickAllStandardReports()) { setStatus('Step 2 failed — see log'); return; }
+
+      setStatus('Step 3: Searching for Payroll History…');
+      checkAbort();
+      if (!await stepSearchPayrollHistory()) { setStatus('Step 3 failed — see log'); return; }
+
+      setStatus('Step 4: Selecting Payroll History (Standard)…');
+      checkAbort();
+      if (!await stepSelectPayrollHistoryStandard()) { setStatus('Step 4 failed — see log'); return; }
+
+      setStatus('Step 5: Waiting for Run Report page…');
+      checkAbort();
+      if (!await stepWaitForRunReportPage()) { setStatus('Step 5 failed — see log'); return; }
+
+      // Wait for the page content to fully initialize (Dojo widgets inside sections
+      // need extra time after the outer shell appears). We look for "Included Fields"
+      // text which only appears once the "What's Displayed" section is populated.
+      setStatus('Step 5b: Waiting for report sections to fully load…');
+      logInfo('Waiting for report sections to populate...');
+      for (let i = 0; i < 20; i++) { // up to 10s
+        const allText = deepQueryAll('*').filter(visible);
+        let found = false;
+        for (const el of allText) {
+          const txt = (el.textContent || '').trim();
+          if (txt === 'Included Fields' || txt === 'Sort Order' || txt.startsWith('All Employees')) {
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          logSuccess('Report sections fully populated');
+          break;
+        }
+        await sleep(500);
+      }
+      await sleep(2000); // extra buffer for Dojo widget init
+
+      setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
+      checkAbort();
+      if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
+
+      await sleep(1000); // let panel animate open
+
+      setStatus('Step 7: Selecting payroll fields…');
+      checkAbort();
+      if (!await stepSelectPayrollDisplayFields()) {
+        logWarn('Some payroll fields could not be selected — continuing anyway');
+      }
+
+      // Calculate quarters to download
+      const quarters = getQuartersToDownload();
+      logInfo('Current quarter: Q' + quarters.length + '. Quarters to download: ' + quarters.map(q => q.label).join(', '));
+
+      // Loop through each quarter
+      for (let qi = 0; qi < quarters.length; qi++) {
+        const q = quarters[qi];
+        logInfo('───── Processing ' + q.label + ' (' + (qi + 1) + '/' + quarters.length + ') ─────');
+
+        if (qi > 0) {
+          // For subsequent quarters, navigate back to Payroll History from scratch
+          setStatus('Navigating back for ' + q.label + '…');
+          checkAbort();
+
+          // Wait for the output page to settle, then re-navigate
+          await sleep(3000);
+
+          if (!await stepOpenReportsMenu()) { setStatus('Re-nav step 1 failed'); return; }
+          checkAbort();
+          if (!await stepClickAllStandardReports()) { setStatus('Re-nav step 2 failed'); return; }
+          checkAbort();
+          if (!await stepSearchPayrollHistory()) { setStatus('Re-nav step 3 failed'); return; }
+          checkAbort();
+          if (!await stepSelectPayrollHistoryStandard()) { setStatus('Re-nav step 4 failed'); return; }
+          checkAbort();
+          if (!await stepWaitForRunReportPage()) { setStatus('Re-nav step 5 failed'); return; }
+
+          // Wait for sections to fully populate
+          logInfo('Waiting for report sections to populate...');
+          for (let i = 0; i < 20; i++) {
+            const allText = deepQueryAll('*').filter(visible);
+            let found = false;
+            for (const el of allText) {
+              const txt = (el.textContent || '').trim();
+              if (txt === 'Included Fields' || txt === 'Sort Order' || txt.startsWith('All Employees')) {
+                found = true; break;
+              }
+            }
+            if (found) break;
+            await sleep(500);
+          }
+          await sleep(2000);
+
+          // Re-select fields for this run
+          setStatus('Re-selecting fields for ' + q.label + '…');
+          checkAbort();
+          if (!await stepClickWhatsDisplayed()) { setStatus('Re-nav field selection failed'); return; }
+          await sleep(1000);
+          if (!await stepSelectPayrollDisplayFields()) {
+            logWarn('Some fields could not be re-selected');
+          }
+        }
+
+        // Open Appearance settings and configure for this quarter
+        // Closed quarters (all except last) get totals view; current quarter gets detailed view
+        const isClosedQuarter = qi < quarters.length - 1;
+        const viewType = isClosedQuarter ? 'totals' : 'detailed';
+        setStatus('Configuring ' + viewType + ' view for ' + q.label + ' (' + q.from + ' → ' + q.to + ')…');
+        checkAbort();
+        await sleep(2000);
+        if (!await stepClickAppearanceSettings()) { setStatus('Appearance click failed for ' + q.label); return; }
+        checkAbort();
+        if (!await stepConfigureAppearance(q.from, q.to, isClosedQuarter)) { setStatus('Appearance config failed for ' + q.label); return; }
+
+        // Run as Excel
+        setStatus('Running report for ' + q.label + '…');
+        checkAbort();
+        await sleep(1500);
+        if (!await stepClickRunAsExcel()) { setStatus('Run as Excel failed for ' + q.label); return; }
+
+        logSuccess(q.label + ' report triggered!');
+
+        // Wait for the report to process and redirect to output page
+        await sleep(5000);
+      }
+
+      setStatus('All ' + quarters.length + ' quarter(s) downloaded ✓');
+      logSuccess('=== Payroll History complete: ' + quarters.map(q => q.label).join(', ') + ' ===');
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Payroll History aborted by user');
+        logWarn('Flow aborted by user (Stop / reset)');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + (err && err.message ? err.message : err));
+    }
+  }
+
   // ───────────────── diagnostic ─────────────────
 
   function dumpDiagnostic() {
@@ -1002,21 +1881,45 @@
     wrapper.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:2147483646;background:#fff;border:2px solid #d40511;padding:10px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font:12px sans-serif;width:340px;';
 
     const titleRow = document.createElement('div');
-    titleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;';
+    titleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;cursor:pointer;';
     const title = document.createElement('h4');
     title.textContent = 'ADP Bot';
     title.style.cssText = 'margin:0;color:#d40511;font-size:14px;';
     titleRow.appendChild(title);
+
+    const titleRight = document.createElement('div');
+    titleRight.style.cssText = 'display:flex;align-items:center;gap:8px;';
     const versionTag = document.createElement('span');
-    versionTag.textContent = 'v0.2.0';
+    versionTag.textContent = 'v0.4.0';
     versionTag.style.cssText = 'color:#888;font-size:10px;';
-    titleRow.appendChild(versionTag);
+    titleRight.appendChild(versionTag);
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.textContent = '▼';
+    toggleBtn.style.cssText = 'background:none;border:1px solid #ccc;border-radius:3px;cursor:pointer;font-size:12px;padding:1px 6px;color:#666;';
+    titleRight.appendChild(toggleBtn);
+    titleRow.appendChild(titleRight);
     wrapper.appendChild(titleRow);
+
+    // Content wrapper — everything below the title goes here so we can toggle it
+    const contentDiv = document.createElement('div');
+    contentDiv.id = 'adp-bot-content';
+
+    let minimized = false;
+    function togglePanel() {
+      minimized = !minimized;
+      contentDiv.style.display = minimized ? 'none' : 'block';
+      toggleBtn.textContent = minimized ? '▲' : '▼';
+      wrapper.style.width = minimized ? 'auto' : '340px';
+      wrapper.style.padding = minimized ? '6px 10px' : '10px';
+    }
+    toggleBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePanel(); });
+    titleRow.addEventListener('click', togglePanel);
 
     const status = document.createElement('div');
     status.style.cssText = 'font-size:11px;color:#555;margin-bottom:6px;min-height:14px;';
     status.textContent = 'Idle';
-    wrapper.appendChild(status);
+    contentDiv.appendChild(status);
 
     const btnRow = document.createElement('div');
     btnRow.style.cssText = 'display:grid;grid-template-columns:1fr;gap:4px;margin-bottom:6px;';
@@ -1055,6 +1958,18 @@
     sitFitBtn.addEventListener('click', withRunGuard(downloadSitFit));
     btnRow.appendChild(sitFitBtn);
 
+    const licenseEcBtn = document.createElement('button');
+    licenseEcBtn.textContent = 'Download License/EC';
+    licenseEcBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#e67e22;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
+    licenseEcBtn.addEventListener('click', withRunGuard(downloadLicenseEC));
+    btnRow.appendChild(licenseEcBtn);
+
+    const payrollBtn = document.createElement('button');
+    payrollBtn.textContent = 'Download Payroll History';
+    payrollBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#8e44ad;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
+    payrollBtn.addEventListener('click', withRunGuard(downloadPayrollHistory));
+    btnRow.appendChild(payrollBtn);
+
     const stopBtn = document.createElement('button');
     stopBtn.textContent = 'Stop / reset';
     stopBtn.style.cssText = 'padding:8px;border:none;border-radius:4px;background:#c0392b;color:#fff;font-weight:bold;cursor:pointer;font-size:12px;';
@@ -1077,7 +1992,9 @@
     diagBtn.addEventListener('click', dumpDiagnostic);
     btnRow.appendChild(diagBtn);
 
-    wrapper.appendChild(btnRow);
+    wrapper.appendChild(contentDiv); // add contentDiv to wrapper before filling it
+
+    contentDiv.appendChild(btnRow);
 
     const logRow = document.createElement('div');
     logRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:2px;';
@@ -1104,11 +2021,11 @@
     });
     logActions.appendChild(copyBtn);
     logRow.appendChild(logActions);
-    wrapper.appendChild(logRow);
+    contentDiv.appendChild(logRow);
 
     logEl = document.createElement('div');
     logEl.style.cssText = 'height:200px;overflow-y:auto;background:#fafafa;border:1px solid #e0e0e0;border-radius:4px;padding:6px;font:10px/1.3 monospace;';
-    wrapper.appendChild(logEl);
+    contentDiv.appendChild(logEl);
 
     document.body.appendChild(wrapper);
     flushPendingLogs();
