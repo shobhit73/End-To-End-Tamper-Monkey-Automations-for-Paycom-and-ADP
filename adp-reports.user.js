@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ADP Census + SIT/FIT + License/EC Report Automation
 // @namespace    https://workforcenow.adp.com/
-// @version      0.4.0
-// @description  Four-button automation: Download Census, Download SIT/FIT, Download License/EC, or Download Payroll History. End-to-end from the home page through Reports & Analytics → report selection → field selection → CSV export.
+// @version      0.6.0
+// @description  Six-button automation: Census, SIT/FIT, License/EC, Payroll History (quarterly), Deduction Report, and Direct Deposit Report.
 // @match        https://workforcenow.adp.com/theme/admin.html*
 // @run-at       document-end
 // @grant        none
@@ -474,7 +474,7 @@
     let a = null;
     for (let i = 0; i < 15 && !a; i++) {
       a = findAnchorByText('All Custom Reports');
-      if (!a) await sleep(200);
+      if (!a) await sleep(150);
     }
     if (!a) {
       logError('"All Custom Reports" anchor not found');
@@ -484,7 +484,7 @@
     const startHash = location.hash;
     clickEl(a);
     logInfo('Clicked All Custom Reports (href=' + href + ')');
-    await sleep(800);
+    await sleep(600);
     if (location.hash === startHash) {
       if (href && href.startsWith('#')) {
         location.hash = href;
@@ -495,7 +495,7 @@
       }
     }
     // Cleanup: re-hide the manually-opened pane.
-    await sleep(200);
+    await sleep(150);
     dismissMegaMenuPanes();
     const navBtn = findReportsButton();
     if (navBtn) navBtn.setAttribute('aria-expanded', 'false');
@@ -508,7 +508,7 @@
     let createBtn = null;
     for (let i = 0; i < 30 && !createBtn; i++) {
       createBtn = findVisibleClickableByText('Create new report');
-      if (!createBtn) await sleep(300);
+      if (!createBtn) await sleep(150);
     }
     if (!createBtn) {
       logError('"Create new report" button not found');
@@ -525,7 +525,7 @@
     for (let i = 0; i < 30 && !titleInput; i++) {
       titleInput = deepQueryAll('input').filter(visible)
         .find(inp => /report ?name|report ?title/i.test(inp.placeholder || ''));
-      if (!titleInput) await sleep(300);
+      if (!titleInput) await sleep(150);
     }
     if (!titleInput) {
       logError('Report Title input not found');
@@ -538,7 +538,7 @@
       titleInput.focus();
       titleInput.select && titleInput.select();
       setReactInputValue(titleInput, title);
-      await sleep(300);
+      await sleep(150);
     }
     logSuccess('Typed title: ' + title);
     return true;
@@ -549,7 +549,7 @@
     let sfBtn = null;
     for (let i = 0; i < 15 && !sfBtn; i++) {
       sfBtn = findVisibleClickableByText('Select Fields');
-      if (!sfBtn) await sleep(300);
+      if (!sfBtn) await sleep(150);
     }
     if (!sfBtn) {
       logError('Select Fields button not found');
@@ -568,7 +568,7 @@
         logSuccess('Field-selection canvas ready');
         return true;
       }
-      await sleep(500);
+      await sleep(350);
     }
     logError('Field-selection canvas did not appear in time');
     return false;
@@ -581,7 +581,7 @@
       btn = deepQueryAll('#saveRunBtn').filter(visible)[0]
         || deepQueryAll('button[aria-label="Save + Run"]').filter(visible)[0]
         || findVisibleClickableByText('Save + Run');
-      if (!btn) await sleep(300);
+      if (!btn) await sleep(150);
     }
     if (!btn) { logError('Save + Run button not found'); return false; }
     clickEl(btn);
@@ -625,7 +625,7 @@
         logSuccess('View Report page ready');
         return true;
       }
-      await sleep(500);
+      await sleep(350);
     }
     logError('View Report page did not appear in time');
     return false;
@@ -650,7 +650,7 @@
     let btn = null;
     for (let i = 0; i < 15 && !btn; i++) {
       btn = findExportButton();
-      if (!btn) await sleep(300);
+      if (!btn) await sleep(150);
     }
     if (!btn) { logError('Export button not found'); return false; }
 
@@ -685,7 +685,7 @@
     let a = null;
     for (let i = 0; i < 15 && !a; i++) {
       a = findAnchorByText('All Standard Reports');
-      if (!a) await sleep(200);
+      if (!a) await sleep(150);
     }
     if (!a) {
       logError('"All Standard Reports" anchor not found');
@@ -695,7 +695,7 @@
     const startHash = location.hash;
     clickEl(a);
     logInfo('Clicked All Standard Reports (href=' + href + ')');
-    await sleep(800);
+    await sleep(600);
     if (location.hash === startHash) {
       if (href && href.startsWith('#')) {
         location.hash = href;
@@ -705,7 +705,7 @@
         return false;
       }
     }
-    await sleep(200);
+    await sleep(150);
     dismissMegaMenuPanes();
     const navBtn = findReportsButton();
     if (navBtn) navBtn.setAttribute('aria-expanded', 'false');
@@ -723,7 +723,7 @@
     for (let i = 0; i < 30 && !searchInput; i++) {
       searchInput = deepQueryAll('#RevSearchInput_searchbox')
         .find(el => el.tagName && el.tagName.toLowerCase() === 'input');
-      if (!searchInput) await sleep(300);
+      if (!searchInput) await sleep(150);
     }
     if (!searchInput) {
       logError('Dojo search input #RevSearchInput_searchbox not found');
@@ -762,7 +762,7 @@
       logDebug('Dojo widget API not available: ' + e);
     }
 
-    await sleep(300);
+    await sleep(150);
 
     // Click the search button directly by ID (it has height:0 but click still works)
     let searchBtn = null;
@@ -785,7 +785,7 @@
     }
 
     // Wait for results to load
-    await sleep(3000);
+    await sleep(2500);
     logSuccess('Search submitted for "Payroll History"');
     return true;
   }
@@ -822,7 +822,7 @@
         }
         if (target) break;
       }
-      if (!target) await sleep(500);
+      if (!target) await sleep(350);
     }
 
     if (!target) {
@@ -851,7 +851,7 @@
           return true;
         }
       }
-      await sleep(500);
+      await sleep(350);
     }
     logError('Run Report page did not load in time');
     return false;
@@ -898,7 +898,7 @@
         }
       }
 
-      if (!target) await sleep(500);
+      if (!target) await sleep(350);
     }
 
     if (!target) {
@@ -923,21 +923,21 @@
         panelReady = true;
         break;
       }
-      await sleep(500);
+      await sleep(350);
     }
     if (!panelReady) {
       logError('Field selection panel did not load');
       return false;
     }
     logInfo('Field selection panel loaded');
-    await sleep(500);
+    await sleep(350);
 
     // Step 1: Click "Select All" to enable "Clear All"
     const selectAllBtn = deepQueryAll('#stdrptlabel_selectAll')[0];
     if (selectAllBtn) {
       logInfo('Clicking Select All');
       clickEl(selectAllBtn);
-      await sleep(800);
+      await sleep(600);
     }
 
     // Step 2: Click "Clear All" to uncheck everything
@@ -953,7 +953,7 @@
       }
       logInfo('Clicking Clear All');
       clickEl(clearAllBtn);
-      await sleep(800);
+      await sleep(600);
     } else {
       logWarn('Clear All button not found — will try to uncheck individually');
     }
@@ -1005,7 +1005,7 @@
         failedFields.push(fieldName);
         logWarn('Field not found: ' + fieldName);
       }
-      await sleep(200); // brief pause between each
+      await sleep(150); // brief pause between each
     }
 
     logInfo('Selected ' + selectedCount + '/' + PAYROLL_HISTORY_FIELDS.length + ' fields');
@@ -1014,7 +1014,7 @@
     }
 
     // Step 4: Click Save
-    await sleep(500);
+    await sleep(350);
     let saveBtn = null;
     const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
     for (const btn of buttons) {
@@ -1027,13 +1027,452 @@
     if (saveBtn) {
       clickEl(saveBtn);
       logSuccess('Clicked Save — field selection complete');
-      await sleep(1000);
+      await sleep(600);
     } else {
       logError('Save button not found on field selection panel');
       return false;
     }
 
     return failedFields.length === 0;
+  }
+
+  // ───────────────── generic standard-report helpers ─────────────────
+
+  // Generic: search for any report in the Dojo search box on Standard Reports page
+  async function stepSearchDojoReport(searchTerm) {
+    let searchInput = null;
+    for (let i = 0; i < 30 && !searchInput; i++) {
+      searchInput = deepQueryAll('#RevSearchInput_searchbox')
+        .find(el => el.tagName && el.tagName.toLowerCase() === 'input');
+      if (!searchInput) await sleep(150);
+    }
+    if (!searchInput) {
+      logError('Dojo search input not found');
+      return false;
+    }
+    logInfo('Found Dojo search input');
+
+    searchInput.focus();
+    searchInput.value = searchTerm;
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+    try {
+      const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+      if (desc && desc.set) {
+        desc.set.call(searchInput, searchTerm);
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    } catch (_) {}
+
+    try {
+      const ownerDoc = searchInput.ownerDocument || document;
+      const ownerWin = ownerDoc.defaultView || window;
+      if (ownerWin.dijit && ownerWin.dijit.byId) {
+        const widget = ownerWin.dijit.byId('RevSearchInput_searchbox');
+        if (widget && widget.set) {
+          widget.set('value', searchTerm);
+          logInfo('Set value via Dojo widget API');
+        }
+      }
+    } catch (_) {}
+
+    await sleep(150);
+
+    let searchBtn = deepQueryAll('#RevSearchInput_searchboxButton')[0];
+    if (searchBtn) {
+      logInfo('Clicking search button');
+      try { searchBtn.click(); } catch (_) {}
+      try {
+        searchBtn.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true }));
+      } catch (_) {}
+    }
+
+    await sleep(2500);
+    logSuccess('Search submitted for "' + searchTerm + '"');
+    return true;
+  }
+
+  // Generic: select a Standard report from search results by its title attribute
+  async function stepSelectStandardReportByTitle(reportTitle) {
+    let target = null;
+    for (let attempt = 0; attempt < 20 && !target; attempt++) {
+      const candidates = deepQueryAll('[title="' + reportTitle + '"]').filter(visible);
+      for (const el of candidates) {
+        const row = el.closest('tr, [role="row"], li, div[class*="row"]');
+        if (row) {
+          const rowText = (row.textContent || '');
+          if (rowText.includes('Standard')) {
+            target = el;
+            break;
+          }
+        }
+        if (!target) {
+          let parent = el.parentElement;
+          for (let depth = 0; depth < 5 && parent; depth++) {
+            const txt = (parent.textContent || '');
+            if (txt.includes('Standard') && txt.includes(reportTitle)) {
+              target = el;
+              break;
+            }
+            parent = parent.parentElement;
+          }
+        }
+        if (target) break;
+      }
+      if (!target) await sleep(350);
+    }
+    if (!target) {
+      logError(reportTitle + ' (Standard) not found in search results');
+      return false;
+    }
+    clickEl(target);
+    logSuccess('Selected ' + reportTitle + ' (Standard)');
+    return true;
+  }
+
+  // Select a single field on the "What's Displayed" panel WITHOUT clearing others
+  async function stepSelectSingleDisplayField(fieldName) {
+    let panelReady = false;
+    for (let i = 0; i < 20 && !panelReady; i++) {
+      const labels = deepQueryAll('.checkactionbubble-text').filter(visible);
+      if (labels.length > 3) { panelReady = true; break; }
+      await sleep(350);
+    }
+    if (!panelReady) {
+      logError('Field selection panel did not load');
+      return false;
+    }
+    await sleep(350);
+
+    // Find the field's checkbox button by aria-label
+    const allBtns = deepQueryAll('button[aria-label]').filter(visible);
+    for (const btn of allBtns) {
+      const label = (btn.getAttribute('aria-label') || '').trim();
+      if (label.toLowerCase() === fieldName.toLowerCase()) {
+        const container = btn.closest('[class*="checkactionbubble-container"]');
+        const isSelected = container && container.className.includes('_selected');
+        if (!isSelected) {
+          clickEl(btn);
+          logInfo('Selected: ' + fieldName);
+        } else {
+          logInfo('Already selected: ' + fieldName);
+        }
+
+        // Click Save
+        await sleep(350);
+        const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+        for (const b of buttons) {
+          if (normalize(b.textContent) === 'save') {
+            clickEl(b);
+            logSuccess('Clicked Save');
+            await sleep(600);
+            return true;
+          }
+        }
+        logError('Save button not found');
+        return false;
+      }
+    }
+
+    // Fallback: find by text span
+    const textSpans = deepQueryAll('.checkactionbubble-text').filter(visible);
+    for (const span of textSpans) {
+      if (span.textContent.trim().toLowerCase() === fieldName.toLowerCase()) {
+        const container = span.closest('.flexSpaceBetween') || span.parentElement?.parentElement;
+        if (container) {
+          const btn = container.querySelector('button');
+          if (btn) {
+            clickEl(btn);
+            logInfo('Selected (fallback): ' + fieldName);
+            await sleep(350);
+            const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+            for (const b of buttons) {
+              if (normalize(b.textContent) === 'save') {
+                clickEl(b);
+                logSuccess('Clicked Save');
+                await sleep(600);
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    logError('Field "' + fieldName + '" not found');
+    return false;
+  }
+
+  // ───────────────── deduction report flow ─────────────────
+
+  async function downloadDeductionReport(setStatus) {
+    logInfo('=== Download Deduction Report ===');
+    resetAbort();
+
+    try {
+      setStatus('Step 1: Opening Reports menu…');
+      checkAbort();
+      if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
+
+      setStatus('Step 2: Navigating to All Standard Reports…');
+      checkAbort();
+      if (!await stepClickAllStandardReports()) { setStatus('Step 2 failed — see log'); return; }
+
+      setStatus('Step 3: Searching for Voluntary Deduction…');
+      checkAbort();
+      if (!await stepSearchDojoReport('Voluntary Deduction')) { setStatus('Step 3 failed — see log'); return; }
+
+      setStatus('Step 4: Selecting Voluntary Deduction (Standard)…');
+      checkAbort();
+      if (!await stepSelectStandardReportByTitle('Voluntary Deduction')) { setStatus('Step 4 failed — see log'); return; }
+
+      setStatus('Step 5: Waiting for Run Report page…');
+      checkAbort();
+      if (!await stepWaitForRunReportPage()) { setStatus('Step 5 failed — see log'); return; }
+
+      // Wait for page sections to fully populate
+      logInfo('Waiting for report sections to populate...');
+      for (let i = 0; i < 20; i++) {
+        const allText = deepQueryAll('*').filter(visible);
+        let found = false;
+        for (const el of allText) {
+          const txt = (el.textContent || '').trim();
+          if (txt === 'Included Fields' || txt === 'Sort Order' || txt.startsWith('All Employees')) {
+            found = true; break;
+          }
+        }
+        if (found) { logSuccess('Report sections populated'); break; }
+        await sleep(350);
+      }
+      await sleep(1700);
+
+      setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
+      checkAbort();
+      if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
+
+      await sleep(600);
+
+      setStatus('Step 7: Selecting Associate ID…');
+      checkAbort();
+      if (!await stepSelectSingleDisplayField('Associate ID')) { setStatus('Step 7 failed — see log'); return; }
+
+      setStatus('Step 8: Running report…');
+      checkAbort();
+      await sleep(1300);
+      if (!await stepClickRunAsExcel()) { setStatus('Step 8 failed — see log'); return; }
+
+      setStatus('Deduction Report triggered ✓');
+      logSuccess('=== Deduction Report complete ===');
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Deduction Report aborted');
+        logWarn('Flow aborted by user');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + (err && err.message ? err.message : err));
+    }
+  }
+
+  // ───────────────── direct deposit report flow ─────────────────
+
+  // Configure Appearance for Direct Deposit: unmask both Tax ID and Bank Account dropdowns
+  async function stepConfigureDirectDepositAppearance() {
+    // Wait for page to load
+    let ready = false;
+    for (let i = 0; i < 20 && !ready; i++) {
+      const els = deepQueryAll('.vdl-dropdown-list__input, label, span').filter(visible);
+      for (const el of els) {
+        const txt = (el.textContent || '').trim().toLowerCase();
+        if (txt.includes('masked') || txt === 'save') { ready = true; break; }
+      }
+      if (!ready) await sleep(350);
+    }
+    if (!ready) {
+      logError('Direct Deposit Appearance page did not load');
+      return false;
+    }
+    logInfo('Direct Deposit Appearance page ready');
+    await sleep(600);
+
+    // Collect ALL dropdown inputs upfront, sorted by position (top to bottom)
+    const allDropdowns = deepQueryAll('.vdl-dropdown-list__input').filter(visible)
+      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+    logInfo('Found ' + allDropdowns.length + ' dropdown(s) on page');
+
+    let unmaskedCount = 0;
+
+    // Process each dropdown by index — never re-scan
+    for (let di = 0; di < allDropdowns.length; di++) {
+      const dd = allDropdowns[di];
+      const text = (dd.textContent || '').trim().toLowerCase();
+
+      // Skip if already "not masked"
+      if (text === 'not masked') {
+        logInfo('Dropdown #' + (di + 1) + ' already "Not masked" — skipping');
+        continue;
+      }
+
+      // Skip if not a masking dropdown (could be other unrelated dropdowns)
+      if (!text.includes('partially') && !text.includes('masked') && !text.includes('full')) {
+        logInfo('Dropdown #' + (di + 1) + ' is "' + dd.textContent.trim() + '" — not a masking dropdown, skipping');
+        continue;
+      }
+
+      logInfo('Dropdown #' + (di + 1) + ': "' + dd.textContent.trim() + '" → changing to Not Masked');
+
+      // Click to open this specific dropdown
+      clickEl(dd);
+      await sleep(600);
+
+      // Find "Not masked" option in the open dropdown list
+      let found = false;
+      const options = deepQueryAll('li, [role="option"], .vdl-dropdown-list__option').filter(visible);
+      for (const opt of options) {
+        const optText = (opt.textContent || '').trim().toLowerCase();
+        if (optText === 'not masked') {
+          clickEl(opt);
+          logInfo('Selected "Not masked" for dropdown #' + (di + 1));
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        // Fallback
+        const allEls = deepQueryAll('span, div, li, a').filter(visible);
+        for (const el of allEls) {
+          const t = (el.textContent || '').trim().toLowerCase();
+          if (t === 'not masked' && el.closest('[class*="dropdown"], [role="listbox"], ul')) {
+            clickEl(el);
+            logInfo('Selected "Not masked" (fallback) for dropdown #' + (di + 1));
+            found = true;
+            break;
+          }
+        }
+      }
+
+      await sleep(1300);
+
+      // Click "Yes" on popup if it appears
+      let yesBtn = null;
+      for (let j = 0; j < 10 && !yesBtn; j++) {
+        const btns = deepQueryAll('button, [role="button"], sdf-button').filter(visible);
+        for (const btn of btns) {
+          if (normalize(btn.textContent) === 'yes') { yesBtn = btn; break; }
+        }
+        if (!yesBtn) await sleep(400);
+      }
+      if (yesBtn) {
+        clickEl(yesBtn);
+        logSuccess('Clicked Yes on confirmation popup');
+        await sleep(1700);
+      } else {
+        logInfo('No popup appeared for dropdown #' + (di + 1));
+        await sleep(350);
+      }
+
+      unmaskedCount++;
+      await sleep(600);
+    }
+
+    logInfo('Unmasked ' + unmaskedCount + ' dropdown(s)');
+
+    // Click Save
+    await sleep(600);
+    const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+    for (const btn of saveBtns) {
+      if (normalize(btn.textContent) === 'save') {
+        clickEl(btn);
+        logSuccess('Clicked Save on Appearance settings');
+        await sleep(1300);
+        return true;
+      }
+    }
+    logError('Save button not found');
+    return false;
+  }
+
+  async function downloadDirectDeposit(setStatus) {
+    logInfo('=== Download Direct Deposit Report ===');
+    resetAbort();
+
+    try {
+      setStatus('Step 1: Opening Reports menu…');
+      checkAbort();
+      if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
+
+      setStatus('Step 2: Navigating to All Standard Reports…');
+      checkAbort();
+      if (!await stepClickAllStandardReports()) { setStatus('Step 2 failed — see log'); return; }
+
+      setStatus('Step 3: Searching for Direct Deposit Information…');
+      checkAbort();
+      if (!await stepSearchDojoReport('Direct Deposit Information')) { setStatus('Step 3 failed — see log'); return; }
+
+      setStatus('Step 4: Selecting Direct Deposit Information (Standard)…');
+      checkAbort();
+      if (!await stepSelectStandardReportByTitle('Direct Deposit Information')) { setStatus('Step 4 failed — see log'); return; }
+
+      setStatus('Step 5: Waiting for Run Report page…');
+      checkAbort();
+      if (!await stepWaitForRunReportPage()) { setStatus('Step 5 failed — see log'); return; }
+
+      // Wait for sections to populate
+      logInfo('Waiting for report sections to populate...');
+      for (let i = 0; i < 20; i++) {
+        const allText = deepQueryAll('*').filter(visible);
+        let found = false;
+        for (const el of allText) {
+          const txt = (el.textContent || '').trim();
+          if (txt === 'Included Fields' || txt === 'Sort Order' || txt.startsWith('All Employees')) {
+            found = true; break;
+          }
+        }
+        if (found) { logSuccess('Report sections populated'); break; }
+        await sleep(350);
+      }
+      await sleep(1700);
+
+      setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
+      checkAbort();
+      if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
+      await sleep(600);
+
+      setStatus('Step 7: Selecting Associate ID…');
+      checkAbort();
+      if (!await stepSelectSingleDisplayField('Associate ID')) { setStatus('Step 7 failed — see log'); return; }
+
+      setStatus('Step 8: Opening Appearance settings…');
+      checkAbort();
+      await sleep(1700);
+      if (!await stepClickAppearanceSettings()) { setStatus('Step 8 failed — see log'); return; }
+
+      setStatus('Step 9: Unmasking Tax ID and Bank Account…');
+      checkAbort();
+      if (!await stepConfigureDirectDepositAppearance()) { setStatus('Step 9 failed — see log'); return; }
+
+      setStatus('Step 10: Running report…');
+      checkAbort();
+      await sleep(1300);
+      if (!await stepClickRunAsExcel()) { setStatus('Step 10 failed — see log'); return; }
+
+      setStatus('Direct Deposit Report triggered ✓');
+      logSuccess('=== Direct Deposit Report complete ===');
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Direct Deposit Report aborted');
+        logWarn('Flow aborted by user');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + (err && err.message ? err.message : err));
+    }
   }
 
   // ───────────────── payroll: appearance + quarterly download ─────────────────
@@ -1098,7 +1537,7 @@
 
     // Click to open
     clickEl(dropdown);
-    await sleep(500);
+    await sleep(350);
 
     // Find and click the option
     const options = deepQueryAll('li, [role="option"], [role="menuitem"], [class*="dropdown"] [class*="option"], .vdl-dropdown-list__option').filter(visible);
@@ -1138,7 +1577,7 @@
           break;
         }
       }
-      if (!target) await sleep(500);
+      if (!target) await sleep(350);
     }
     if (!target) {
       logError('"Appearance and Other Settings" not found');
@@ -1146,7 +1585,7 @@
     }
     clickEl(target);
     logSuccess('Clicked "Appearance and Other Settings"');
-    await sleep(2000); // wait for page to load
+    await sleep(1700); // wait for page to load
     return true;
   }
 
@@ -1161,24 +1600,24 @@
       for (const l of labels) {
         if ((l.textContent || '').trim() === 'Totals Only') { ready = true; break; }
       }
-      if (!ready) await sleep(500);
+      if (!ready) await sleep(350);
     }
     if (!ready) {
       logError('Appearance settings page did not load fully');
       return false;
     }
     logInfo('Appearance settings page ready');
-    await sleep(500);
+    await sleep(350);
 
     // 1-3: Only for closed quarters (totals view)
     if (useTotals) {
       // 1. Change 2nd Sort By dropdown to "Associate ID"
       logInfo('Changing Sort By #2 to Associate ID (closed quarter)');
-      await sleep(1000);
+      await sleep(600);
       if (!await selectVdlDropdownOption('Name', 'Associate ID')) {
         logWarn('Could not change Sort By #2 — may already be set');
       }
-      await sleep(1000);
+      await sleep(600);
 
       // 2. Check Group By checkbox for the 2nd row
       logInfo('Checking Group By for Sort By #2');
@@ -1201,7 +1640,7 @@
           break;
         }
       }
-      await sleep(800);
+      await sleep(600);
 
       // 3. Check "Totals Only"
       logInfo('Checking Totals Only');
@@ -1224,22 +1663,22 @@
           break;
         }
       }
-      await sleep(800);
+      await sleep(600);
     } else {
       logInfo('Current quarter — keeping Name, skipping Group By and Totals Only');
-      await sleep(500);
+      await sleep(350);
     }
 
     // 4. Change Tax ID to "Not Masked"
     logInfo('Setting Tax ID to Not Masked');
-    await sleep(1000);
+    await sleep(600);
     if (!await selectVdlDropdownOption('Partially', 'Not Masked')) {
       // Try alternate text
       if (!await selectVdlDropdownOption('Partially masked', 'Not Masked')) {
         await selectVdlDropdownOption('Partially Masked', 'Not masked');
       }
     }
-    await sleep(1500);
+    await sleep(1300);
 
     // 5. Click "Yes" on the confirmation popup — wait patiently for it
     let yesBtn = null;
@@ -1257,15 +1696,15 @@
     if (yesBtn) {
       clickEl(yesBtn);
       logSuccess('Clicked Yes on Tax ID confirmation');
-      await sleep(1500); // wait for popup to close and setting to apply
+      await sleep(1300); // wait for popup to close and setting to apply
     } else {
       logWarn('Tax ID confirmation popup not found — may not have appeared');
     }
-    await sleep(1000);
+    await sleep(600);
 
     // 6. Select "Custom Date Range" from Request Period
     logInfo('Setting Request Period to Custom Date Range');
-    await sleep(1000);
+    await sleep(600);
     if (!await selectVdlDropdownOption('Last 30 Days', 'Custom Date Range')) {
       // Try other current values it might show
       if (!await selectVdlDropdownOption('Last 30', 'Custom Date Range')) {
@@ -1274,7 +1713,7 @@
         }
       }
     }
-    await sleep(1500);
+    await sleep(1300);
 
     // 7. Enter From and To dates
     logInfo('Setting date range: ' + fromDate + ' to ' + toDate);
@@ -1286,16 +1725,16 @@
     if (dateInputs.length >= 2) {
       // First date input = From, second = To
       dateInputs[0].focus();
-      await sleep(300);
+      await sleep(150);
       setReactInputValue(dateInputs[0], fromDate);
-      await sleep(800);
+      await sleep(600);
       dateInputs[1].focus();
-      await sleep(300);
+      await sleep(150);
       setReactInputValue(dateInputs[1], toDate);
-      await sleep(800);
+      await sleep(600);
       // Click somewhere neutral to dismiss any datepicker
       dateInputs[1].blur();
-      await sleep(500);
+      await sleep(350);
       logInfo('Dates entered: ' + fromDate + ' → ' + toDate);
     } else if (dateInputs.length === 1) {
       logWarn('Only 1 date input found — entering From date');
@@ -1303,7 +1742,7 @@
     } else {
       logError('Date inputs not found');
     }
-    await sleep(800);
+    await sleep(600);
 
     // 8. Click Save
     const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
@@ -1311,7 +1750,7 @@
       if (normalize(btn.textContent) === 'save') {
         clickEl(btn);
         logSuccess('Clicked Save on Appearance settings');
-        await sleep(1500);
+        await sleep(1300);
         return true;
       }
     }
@@ -1331,7 +1770,7 @@
           break;
         }
       }
-      if (!btn) await sleep(500);
+      if (!btn) await sleep(350);
     }
     if (!btn) {
       logError('Run as Excel button not found');
@@ -1464,7 +1903,7 @@
 
       const searchTerm = FIELD_NAME_CORRECTIONS[col] || col.split(' (')[0];
       triggerFieldSearch(searchTerm);
-      await sleep(800); // wait for search filter to render
+      await sleep(600); // wait for search filter to render
 
       let success = false;
       let attempts = 0;
@@ -1475,7 +1914,7 @@
         if (success) break;
         attempts++;
         if (attempts === 5) triggerFieldSearch(searchTerm); // re-trigger search
-        await sleep(500);
+        await sleep(350);
       }
 
       if (success) {
@@ -1484,7 +1923,7 @@
         logError('FAILED: ' + col);
         failed.push(col);
       }
-      await sleep(300);
+      await sleep(150);
     }
     return failed;
   }
@@ -1603,7 +2042,7 @@
       checkAbort();
       if (!await stepWaitForCanvas()) { setStatus('Step 6 failed — see log'); return; }
 
-      await sleep(1000); // give the canvas a moment to fully populate
+      await sleep(600); // give the canvas a moment to fully populate
 
       setStatus('Step 7/11: Selecting ' + columns.length + ' fields…');
       const failed = await selectFields(columns, setStatus);
@@ -1731,15 +2170,15 @@
           logSuccess('Report sections fully populated');
           break;
         }
-        await sleep(500);
+        await sleep(350);
       }
-      await sleep(2000); // extra buffer for Dojo widget init
+      await sleep(1700); // extra buffer for Dojo widget init
 
       setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
       checkAbort();
       if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
 
-      await sleep(1000); // let panel animate open
+      await sleep(600); // let panel animate open
 
       setStatus('Step 7: Selecting payroll fields…');
       checkAbort();
@@ -1762,7 +2201,7 @@
           checkAbort();
 
           // Wait for the output page to settle, then re-navigate
-          await sleep(3000);
+          await sleep(2500);
 
           if (!await stepOpenReportsMenu()) { setStatus('Re-nav step 1 failed'); return; }
           checkAbort();
@@ -1786,15 +2225,15 @@
               }
             }
             if (found) break;
-            await sleep(500);
+            await sleep(350);
           }
-          await sleep(2000);
+          await sleep(1700);
 
           // Re-select fields for this run
           setStatus('Re-selecting fields for ' + q.label + '…');
           checkAbort();
           if (!await stepClickWhatsDisplayed()) { setStatus('Re-nav field selection failed'); return; }
-          await sleep(1000);
+          await sleep(600);
           if (!await stepSelectPayrollDisplayFields()) {
             logWarn('Some fields could not be re-selected');
           }
@@ -1806,7 +2245,7 @@
         const viewType = isClosedQuarter ? 'totals' : 'detailed';
         setStatus('Configuring ' + viewType + ' view for ' + q.label + ' (' + q.from + ' → ' + q.to + ')…');
         checkAbort();
-        await sleep(2000);
+        await sleep(1700);
         if (!await stepClickAppearanceSettings()) { setStatus('Appearance click failed for ' + q.label); return; }
         checkAbort();
         if (!await stepConfigureAppearance(q.from, q.to, isClosedQuarter)) { setStatus('Appearance config failed for ' + q.label); return; }
@@ -1814,7 +2253,7 @@
         // Run as Excel
         setStatus('Running report for ' + q.label + '…');
         checkAbort();
-        await sleep(1500);
+        await sleep(1300);
         if (!await stepClickRunAsExcel()) { setStatus('Run as Excel failed for ' + q.label); return; }
 
         logSuccess(q.label + ' report triggered!');
@@ -1890,7 +2329,7 @@
     const titleRight = document.createElement('div');
     titleRight.style.cssText = 'display:flex;align-items:center;gap:8px;';
     const versionTag = document.createElement('span');
-    versionTag.textContent = 'v0.4.0';
+    versionTag.textContent = 'v0.6.0';
     versionTag.style.cssText = 'color:#888;font-size:10px;';
     titleRight.appendChild(versionTag);
 
@@ -1969,6 +2408,18 @@
     payrollBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#8e44ad;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
     payrollBtn.addEventListener('click', withRunGuard(downloadPayrollHistory));
     btnRow.appendChild(payrollBtn);
+
+    const deductionBtn = document.createElement('button');
+    deductionBtn.textContent = 'Download Deduction';
+    deductionBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#2c3e50;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
+    deductionBtn.addEventListener('click', withRunGuard(downloadDeductionReport));
+    btnRow.appendChild(deductionBtn);
+
+    const directDepositBtn = document.createElement('button');
+    directDepositBtn.textContent = 'Download Direct Deposit';
+    directDepositBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#16a085;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
+    directDepositBtn.addEventListener('click', withRunGuard(downloadDirectDeposit));
+    btnRow.appendChild(directDepositBtn);
 
     const stopBtn = document.createElement('button');
     stopBtn.textContent = 'Stop / reset';
