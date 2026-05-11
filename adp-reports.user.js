@@ -474,7 +474,7 @@
     let a = null;
     for (let i = 0; i < 15 && !a; i++) {
       a = findAnchorByText('All Custom Reports');
-      if (!a) await sleep(150);
+      if (!a) await sleep(200);
     }
     if (!a) {
       logError('"All Custom Reports" anchor not found');
@@ -484,7 +484,7 @@
     const startHash = location.hash;
     clickEl(a);
     logInfo('Clicked All Custom Reports (href=' + href + ')');
-    await sleep(600);
+    await sleep(800);
     if (location.hash === startHash) {
       if (href && href.startsWith('#')) {
         location.hash = href;
@@ -495,7 +495,7 @@
       }
     }
     // Cleanup: re-hide the manually-opened pane.
-    await sleep(150);
+    await sleep(200);
     dismissMegaMenuPanes();
     const navBtn = findReportsButton();
     if (navBtn) navBtn.setAttribute('aria-expanded', 'false');
@@ -508,7 +508,7 @@
     let createBtn = null;
     for (let i = 0; i < 30 && !createBtn; i++) {
       createBtn = findVisibleClickableByText('Create new report');
-      if (!createBtn) await sleep(150);
+      if (!createBtn) await sleep(300);
     }
     if (!createBtn) {
       logError('"Create new report" button not found');
@@ -525,7 +525,7 @@
     for (let i = 0; i < 30 && !titleInput; i++) {
       titleInput = deepQueryAll('input').filter(visible)
         .find(inp => /report ?name|report ?title/i.test(inp.placeholder || ''));
-      if (!titleInput) await sleep(150);
+      if (!titleInput) await sleep(300);
     }
     if (!titleInput) {
       logError('Report Title input not found');
@@ -538,7 +538,7 @@
       titleInput.focus();
       titleInput.select && titleInput.select();
       setReactInputValue(titleInput, title);
-      await sleep(150);
+      await sleep(300);
     }
     logSuccess('Typed title: ' + title);
     return true;
@@ -549,7 +549,7 @@
     let sfBtn = null;
     for (let i = 0; i < 15 && !sfBtn; i++) {
       sfBtn = findVisibleClickableByText('Select Fields');
-      if (!sfBtn) await sleep(150);
+      if (!sfBtn) await sleep(300);
     }
     if (!sfBtn) {
       logError('Select Fields button not found');
@@ -568,7 +568,7 @@
         logSuccess('Field-selection canvas ready');
         return true;
       }
-      await sleep(350);
+      await sleep(500);
     }
     logError('Field-selection canvas did not appear in time');
     return false;
@@ -581,7 +581,7 @@
       btn = deepQueryAll('#saveRunBtn').filter(visible)[0]
         || deepQueryAll('button[aria-label="Save + Run"]').filter(visible)[0]
         || findVisibleClickableByText('Save + Run');
-      if (!btn) await sleep(150);
+      if (!btn) await sleep(300);
     }
     if (!btn) { logError('Save + Run button not found'); return false; }
     clickEl(btn);
@@ -625,7 +625,7 @@
         logSuccess('View Report page ready');
         return true;
       }
-      await sleep(350);
+      await sleep(500);
     }
     logError('View Report page did not appear in time');
     return false;
@@ -650,7 +650,7 @@
     let btn = null;
     for (let i = 0; i < 15 && !btn; i++) {
       btn = findExportButton();
-      if (!btn) await sleep(150);
+      if (!btn) await sleep(300);
     }
     if (!btn) { logError('Export button not found'); return false; }
 
@@ -685,7 +685,7 @@
     let a = null;
     for (let i = 0; i < 15 && !a; i++) {
       a = findAnchorByText('All Standard Reports');
-      if (!a) await sleep(150);
+      if (!a) await sleep(200);
     }
     if (!a) {
       logError('"All Standard Reports" anchor not found');
@@ -695,7 +695,7 @@
     const startHash = location.hash;
     clickEl(a);
     logInfo('Clicked All Standard Reports (href=' + href + ')');
-    await sleep(600);
+    await sleep(800);
     if (location.hash === startHash) {
       if (href && href.startsWith('#')) {
         location.hash = href;
@@ -705,7 +705,7 @@
         return false;
       }
     }
-    await sleep(150);
+    await sleep(200);
     dismissMegaMenuPanes();
     const navBtn = findReportsButton();
     if (navBtn) navBtn.setAttribute('aria-expanded', 'false');
@@ -723,7 +723,7 @@
     for (let i = 0; i < 30 && !searchInput; i++) {
       searchInput = deepQueryAll('#RevSearchInput_searchbox')
         .find(el => el.tagName && el.tagName.toLowerCase() === 'input');
-      if (!searchInput) await sleep(150);
+      if (!searchInput) await sleep(300);
     }
     if (!searchInput) {
       logError('Dojo search input #RevSearchInput_searchbox not found');
@@ -762,7 +762,7 @@
       logDebug('Dojo widget API not available: ' + e);
     }
 
-    await sleep(150);
+    await sleep(300);
 
     // Click the search button directly by ID (it has height:0 but click still works)
     let searchBtn = null;
@@ -785,7 +785,7 @@
     }
 
     // Wait for results to load
-    await sleep(2500);
+    await sleep(3000);
     logSuccess('Search submitted for "Payroll History"');
     return true;
   }
@@ -822,7 +822,7 @@
         }
         if (target) break;
       }
-      if (!target) await sleep(350);
+      if (!target) await sleep(500);
     }
 
     if (!target) {
@@ -851,7 +851,7 @@
           return true;
         }
       }
-      await sleep(350);
+      await sleep(500);
     }
     logError('Run Report page did not load in time');
     return false;
@@ -898,7 +898,7 @@
         }
       }
 
-      if (!target) await sleep(350);
+      if (!target) await sleep(500);
     }
 
     if (!target) {
@@ -923,21 +923,21 @@
         panelReady = true;
         break;
       }
-      await sleep(350);
+      await sleep(500);
     }
     if (!panelReady) {
       logError('Field selection panel did not load');
       return false;
     }
     logInfo('Field selection panel loaded');
-    await sleep(350);
+    await sleep(500);
 
     // Step 1: Click "Select All" to enable "Clear All"
     const selectAllBtn = deepQueryAll('#stdrptlabel_selectAll')[0];
     if (selectAllBtn) {
       logInfo('Clicking Select All');
       clickEl(selectAllBtn);
-      await sleep(600);
+      await sleep(800);
     }
 
     // Step 2: Click "Clear All" to uncheck everything
@@ -953,7 +953,7 @@
       }
       logInfo('Clicking Clear All');
       clickEl(clearAllBtn);
-      await sleep(600);
+      await sleep(800);
     } else {
       logWarn('Clear All button not found — will try to uncheck individually');
     }
@@ -1005,7 +1005,7 @@
         failedFields.push(fieldName);
         logWarn('Field not found: ' + fieldName);
       }
-      await sleep(150); // brief pause between each
+      await sleep(200); // brief pause between each
     }
 
     logInfo('Selected ' + selectedCount + '/' + PAYROLL_HISTORY_FIELDS.length + ' fields');
@@ -1014,7 +1014,7 @@
     }
 
     // Step 4: Click Save
-    await sleep(350);
+    await sleep(500);
     let saveBtn = null;
     const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
     for (const btn of buttons) {
@@ -1027,7 +1027,7 @@
     if (saveBtn) {
       clickEl(saveBtn);
       logSuccess('Clicked Save — field selection complete');
-      await sleep(600);
+      await sleep(1000);
     } else {
       logError('Save button not found on field selection panel');
       return false;
@@ -1044,7 +1044,7 @@
     for (let i = 0; i < 30 && !searchInput; i++) {
       searchInput = deepQueryAll('#RevSearchInput_searchbox')
         .find(el => el.tagName && el.tagName.toLowerCase() === 'input');
-      if (!searchInput) await sleep(150);
+      if (!searchInput) await sleep(300);
     }
     if (!searchInput) {
       logError('Dojo search input not found');
@@ -1078,7 +1078,7 @@
       }
     } catch (_) {}
 
-    await sleep(150);
+    await sleep(300);
 
     let searchBtn = deepQueryAll('#RevSearchInput_searchboxButton')[0];
     if (searchBtn) {
@@ -1089,7 +1089,7 @@
       } catch (_) {}
     }
 
-    await sleep(2500);
+    await sleep(3000);
     logSuccess('Search submitted for "' + searchTerm + '"');
     return true;
   }
@@ -1121,7 +1121,7 @@
         }
         if (target) break;
       }
-      if (!target) await sleep(350);
+      if (!target) await sleep(500);
     }
     if (!target) {
       logError(reportTitle + ' (Standard) not found in search results');
@@ -1138,13 +1138,13 @@
     for (let i = 0; i < 20 && !panelReady; i++) {
       const labels = deepQueryAll('.checkactionbubble-text').filter(visible);
       if (labels.length > 3) { panelReady = true; break; }
-      await sleep(350);
+      await sleep(500);
     }
     if (!panelReady) {
       logError('Field selection panel did not load');
       return false;
     }
-    await sleep(350);
+    await sleep(500);
 
     // Find the field's checkbox button by aria-label
     const allBtns = deepQueryAll('button[aria-label]').filter(visible);
@@ -1161,13 +1161,13 @@
         }
 
         // Click Save
-        await sleep(350);
+        await sleep(500);
         const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
         for (const b of buttons) {
           if (normalize(b.textContent) === 'save') {
             clickEl(b);
             logSuccess('Clicked Save');
-            await sleep(600);
+            await sleep(1000);
             return true;
           }
         }
@@ -1186,13 +1186,13 @@
           if (btn) {
             clickEl(btn);
             logInfo('Selected (fallback): ' + fieldName);
-            await sleep(350);
+            await sleep(500);
             const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
             for (const b of buttons) {
               if (normalize(b.textContent) === 'save') {
                 clickEl(b);
                 logSuccess('Clicked Save');
-                await sleep(600);
+                await sleep(1000);
                 return true;
               }
             }
@@ -1244,15 +1244,15 @@
           }
         }
         if (found) { logSuccess('Report sections populated'); break; }
-        await sleep(350);
+        await sleep(500);
       }
-      await sleep(1700);
+      await sleep(2000);
 
       setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
       checkAbort();
       if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
 
-      await sleep(600);
+      await sleep(1000);
 
       setStatus('Step 7: Selecting Associate ID…');
       checkAbort();
@@ -1260,7 +1260,7 @@
 
       setStatus('Step 8: Running report…');
       checkAbort();
-      await sleep(1300);
+      await sleep(1500);
       if (!await stepClickRunAsExcel()) { setStatus('Step 8 failed — see log'); return; }
 
       setStatus('Deduction Report triggered ✓');
@@ -1289,14 +1289,14 @@
         const txt = (el.textContent || '').trim().toLowerCase();
         if (txt.includes('masked') || txt === 'save') { ready = true; break; }
       }
-      if (!ready) await sleep(350);
+      if (!ready) await sleep(500);
     }
     if (!ready) {
       logError('Direct Deposit Appearance page did not load');
       return false;
     }
     logInfo('Direct Deposit Appearance page ready');
-    await sleep(600);
+    await sleep(1000);
 
     // Collect ALL dropdown inputs upfront, sorted by position (top to bottom)
     const allDropdowns = deepQueryAll('.vdl-dropdown-list__input').filter(visible)
@@ -1327,7 +1327,7 @@
 
       // Click to open this specific dropdown
       clickEl(dd);
-      await sleep(600);
+      await sleep(1000);
 
       // Find "Not masked" option in the open dropdown list
       let found = false;
@@ -1356,7 +1356,7 @@
         }
       }
 
-      await sleep(1300);
+      await sleep(1500);
 
       // Click "Yes" on popup if it appears
       let yesBtn = null;
@@ -1370,26 +1370,150 @@
       if (yesBtn) {
         clickEl(yesBtn);
         logSuccess('Clicked Yes on confirmation popup');
-        await sleep(1700);
+        await sleep(2000);
       } else {
         logInfo('No popup appeared for dropdown #' + (di + 1));
-        await sleep(350);
+        await sleep(500);
       }
 
       unmaskedCount++;
-      await sleep(600);
+      await sleep(1000);
     }
 
     logInfo('Unmasked ' + unmaskedCount + ' dropdown(s)');
 
     // Click Save
-    await sleep(600);
+    await sleep(800);
     const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
     for (const btn of saveBtns) {
       if (normalize(btn.textContent) === 'save') {
         clickEl(btn);
         logSuccess('Clicked Save on Appearance settings');
-        await sleep(1300);
+        await sleep(1500);
+        return true;
+      }
+    }
+    logError('Save button not found');
+    return false;
+  }
+
+  // Step: Click "Who Appears on This Report" → Employee List → All Employees → Save
+  async function stepConfigureWhoAppears() {
+    // 1. Click "Who Appears on This Report"
+    let target = null;
+    for (let i = 0; i < 20 && !target; i++) {
+      const clickables = deepQueryAll('a, button, [role="button"], [role="link"], sdf-button').filter(visible);
+      for (const el of clickables) {
+        const text = (el.textContent || '').trim();
+        if (text.includes('Who Appears on This Report')) {
+          target = el;
+          break;
+        }
+      }
+      if (!target) await sleep(500);
+    }
+    if (!target) {
+      logError('"Who Appears on This Report" not found');
+      return false;
+    }
+    clickEl(target);
+    logSuccess('Clicked "Who Appears on This Report"');
+    await sleep(2000);
+
+    // 2. Click "Employee List" accordion
+    let empList = null;
+    for (let i = 0; i < 20 && !empList; i++) {
+      const els = deepQueryAll('div, span, a, button, [role="button"]').filter(visible);
+      for (const el of els) {
+        const text = (el.textContent || '').trim();
+        if (text === 'Employee List') {
+          empList = el;
+          break;
+        }
+      }
+      if (!empList) await sleep(500);
+    }
+    if (!empList) {
+      logError('"Employee List" not found');
+      return false;
+    }
+    clickEl(empList);
+    logInfo('Clicked Employee List');
+    await sleep(1500);
+
+    // 3. Click the dropdown chevron to open it
+    // The dropdown is a react-select style component with a chevron SVG
+    let chevron = null;
+    const svgs = deepQueryAll('svg.css-8mmkcg, svg[class*="css-"]').filter(visible);
+    if (svgs.length > 0) {
+      // Click the parent of the SVG (usually a div acting as the dropdown indicator)
+      chevron = svgs[0].closest('[class*="indicator"], [class*="dropdown"]') || svgs[0].parentElement;
+    }
+    if (!chevron) {
+      // Fallback: find the MDFSelectBox input and click it to open
+      const selectInputs = deepQueryAll('#employeeFilterList, [id*="employeeFilter"], .MDFSelectBox__input').filter(visible);
+      if (selectInputs.length > 0) {
+        chevron = selectInputs[0];
+      }
+    }
+    if (chevron) {
+      clickEl(chevron);
+      logInfo('Clicked dropdown');
+      await sleep(1000);
+    } else {
+      logWarn('Dropdown chevron not found — trying to type in the input');
+    }
+
+    // 4. Select "All Employees" from the dropdown
+    // Try clicking the option directly
+    let found = false;
+    for (let attempt = 0; attempt < 10 && !found; attempt++) {
+      const options = deepQueryAll('[role="option"], [class*="option"], li, div[class*="menu"] div').filter(visible);
+      for (const opt of options) {
+        const text = (opt.textContent || '').trim();
+        if (text === 'All Employees') {
+          clickEl(opt);
+          logSuccess('Selected "All Employees"');
+          found = true;
+          break;
+        }
+      }
+      if (!found) await sleep(500);
+    }
+
+    if (!found) {
+      // Fallback: type "All Employees" into the input to filter
+      const input = deepQueryAll('#employeeFilterList').filter(visible)[0];
+      if (input) {
+        input.focus();
+        setReactInputValue(input, 'All Employees');
+        await sleep(1000);
+        // Try selecting the filtered option
+        const options = deepQueryAll('[role="option"], [class*="option"]').filter(visible);
+        for (const opt of options) {
+          if ((opt.textContent || '').trim() === 'All Employees') {
+            clickEl(opt);
+            logSuccess('Selected "All Employees" (via type filter)');
+            found = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!found) {
+      logError('"All Employees" option not found');
+      return false;
+    }
+    await sleep(1000);
+
+    // 5. Click Save
+    const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+    for (const btn of saveBtns) {
+      if (normalize(btn.textContent) === 'save') {
+        clickEl(btn);
+        logSuccess('Clicked Save on Who Appears');
+        await sleep(1500);
         return true;
       }
     }
@@ -1434,14 +1558,14 @@
           }
         }
         if (found) { logSuccess('Report sections populated'); break; }
-        await sleep(350);
+        await sleep(500);
       }
-      await sleep(1700);
+      await sleep(2000);
 
       setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
       checkAbort();
       if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
-      await sleep(600);
+      await sleep(1000);
 
       setStatus('Step 7: Selecting Associate ID…');
       checkAbort();
@@ -1449,17 +1573,22 @@
 
       setStatus('Step 8: Opening Appearance settings…');
       checkAbort();
-      await sleep(1700);
+      await sleep(2000);
       if (!await stepClickAppearanceSettings()) { setStatus('Step 8 failed — see log'); return; }
 
       setStatus('Step 9: Unmasking Tax ID and Bank Account…');
       checkAbort();
       if (!await stepConfigureDirectDepositAppearance()) { setStatus('Step 9 failed — see log'); return; }
 
-      setStatus('Step 10: Running report…');
+      setStatus('Step 10: Configuring "Who Appears on This Report"…');
       checkAbort();
-      await sleep(1300);
-      if (!await stepClickRunAsExcel()) { setStatus('Step 10 failed — see log'); return; }
+      await sleep(1500);
+      if (!await stepConfigureWhoAppears()) { setStatus('Step 10 failed — see log'); return; }
+
+      setStatus('Step 11: Running report…');
+      checkAbort();
+      await sleep(1500);
+      if (!await stepClickRunAsExcel()) { setStatus('Step 11 failed — see log'); return; }
 
       setStatus('Direct Deposit Report triggered ✓');
       logSuccess('=== Direct Deposit Report complete ===');
@@ -1537,7 +1666,7 @@
 
     // Click to open
     clickEl(dropdown);
-    await sleep(350);
+    await sleep(500);
 
     // Find and click the option
     const options = deepQueryAll('li, [role="option"], [role="menuitem"], [class*="dropdown"] [class*="option"], .vdl-dropdown-list__option').filter(visible);
@@ -1577,7 +1706,7 @@
           break;
         }
       }
-      if (!target) await sleep(350);
+      if (!target) await sleep(500);
     }
     if (!target) {
       logError('"Appearance and Other Settings" not found');
@@ -1585,7 +1714,7 @@
     }
     clickEl(target);
     logSuccess('Clicked "Appearance and Other Settings"');
-    await sleep(1700); // wait for page to load
+    await sleep(2000); // wait for page to load
     return true;
   }
 
@@ -1600,24 +1729,24 @@
       for (const l of labels) {
         if ((l.textContent || '').trim() === 'Totals Only') { ready = true; break; }
       }
-      if (!ready) await sleep(350);
+      if (!ready) await sleep(500);
     }
     if (!ready) {
       logError('Appearance settings page did not load fully');
       return false;
     }
     logInfo('Appearance settings page ready');
-    await sleep(350);
+    await sleep(500);
 
     // 1-3: Only for closed quarters (totals view)
     if (useTotals) {
       // 1. Change 2nd Sort By dropdown to "Associate ID"
       logInfo('Changing Sort By #2 to Associate ID (closed quarter)');
-      await sleep(600);
+      await sleep(1000);
       if (!await selectVdlDropdownOption('Name', 'Associate ID')) {
         logWarn('Could not change Sort By #2 — may already be set');
       }
-      await sleep(600);
+      await sleep(1000);
 
       // 2. Check Group By checkbox for the 2nd row
       logInfo('Checking Group By for Sort By #2');
@@ -1640,7 +1769,7 @@
           break;
         }
       }
-      await sleep(600);
+      await sleep(800);
 
       // 3. Check "Totals Only"
       logInfo('Checking Totals Only');
@@ -1663,22 +1792,22 @@
           break;
         }
       }
-      await sleep(600);
+      await sleep(800);
     } else {
       logInfo('Current quarter — keeping Name, skipping Group By and Totals Only');
-      await sleep(350);
+      await sleep(500);
     }
 
     // 4. Change Tax ID to "Not Masked"
     logInfo('Setting Tax ID to Not Masked');
-    await sleep(600);
+    await sleep(1000);
     if (!await selectVdlDropdownOption('Partially', 'Not Masked')) {
       // Try alternate text
       if (!await selectVdlDropdownOption('Partially masked', 'Not Masked')) {
         await selectVdlDropdownOption('Partially Masked', 'Not masked');
       }
     }
-    await sleep(1300);
+    await sleep(1500);
 
     // 5. Click "Yes" on the confirmation popup — wait patiently for it
     let yesBtn = null;
@@ -1696,15 +1825,15 @@
     if (yesBtn) {
       clickEl(yesBtn);
       logSuccess('Clicked Yes on Tax ID confirmation');
-      await sleep(1300); // wait for popup to close and setting to apply
+      await sleep(1500); // wait for popup to close and setting to apply
     } else {
       logWarn('Tax ID confirmation popup not found — may not have appeared');
     }
-    await sleep(600);
+    await sleep(1000);
 
     // 6. Select "Custom Date Range" from Request Period
     logInfo('Setting Request Period to Custom Date Range');
-    await sleep(600);
+    await sleep(1000);
     if (!await selectVdlDropdownOption('Last 30 Days', 'Custom Date Range')) {
       // Try other current values it might show
       if (!await selectVdlDropdownOption('Last 30', 'Custom Date Range')) {
@@ -1713,7 +1842,7 @@
         }
       }
     }
-    await sleep(1300);
+    await sleep(1500);
 
     // 7. Enter From and To dates
     logInfo('Setting date range: ' + fromDate + ' to ' + toDate);
@@ -1725,16 +1854,16 @@
     if (dateInputs.length >= 2) {
       // First date input = From, second = To
       dateInputs[0].focus();
-      await sleep(150);
+      await sleep(300);
       setReactInputValue(dateInputs[0], fromDate);
-      await sleep(600);
+      await sleep(800);
       dateInputs[1].focus();
-      await sleep(150);
+      await sleep(300);
       setReactInputValue(dateInputs[1], toDate);
-      await sleep(600);
+      await sleep(800);
       // Click somewhere neutral to dismiss any datepicker
       dateInputs[1].blur();
-      await sleep(350);
+      await sleep(500);
       logInfo('Dates entered: ' + fromDate + ' → ' + toDate);
     } else if (dateInputs.length === 1) {
       logWarn('Only 1 date input found — entering From date');
@@ -1742,7 +1871,7 @@
     } else {
       logError('Date inputs not found');
     }
-    await sleep(600);
+    await sleep(800);
 
     // 8. Click Save
     const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
@@ -1750,7 +1879,7 @@
       if (normalize(btn.textContent) === 'save') {
         clickEl(btn);
         logSuccess('Clicked Save on Appearance settings');
-        await sleep(1300);
+        await sleep(1500);
         return true;
       }
     }
@@ -1770,7 +1899,7 @@
           break;
         }
       }
-      if (!btn) await sleep(350);
+      if (!btn) await sleep(500);
     }
     if (!btn) {
       logError('Run as Excel button not found');
@@ -1903,7 +2032,7 @@
 
       const searchTerm = FIELD_NAME_CORRECTIONS[col] || col.split(' (')[0];
       triggerFieldSearch(searchTerm);
-      await sleep(600); // wait for search filter to render
+      await sleep(800); // wait for search filter to render
 
       let success = false;
       let attempts = 0;
@@ -1914,7 +2043,7 @@
         if (success) break;
         attempts++;
         if (attempts === 5) triggerFieldSearch(searchTerm); // re-trigger search
-        await sleep(350);
+        await sleep(500);
       }
 
       if (success) {
@@ -1923,7 +2052,7 @@
         logError('FAILED: ' + col);
         failed.push(col);
       }
-      await sleep(150);
+      await sleep(300);
     }
     return failed;
   }
@@ -2042,7 +2171,7 @@
       checkAbort();
       if (!await stepWaitForCanvas()) { setStatus('Step 6 failed — see log'); return; }
 
-      await sleep(600); // give the canvas a moment to fully populate
+      await sleep(1000); // give the canvas a moment to fully populate
 
       setStatus('Step 7/11: Selecting ' + columns.length + ' fields…');
       const failed = await selectFields(columns, setStatus);
@@ -2170,15 +2299,15 @@
           logSuccess('Report sections fully populated');
           break;
         }
-        await sleep(350);
+        await sleep(500);
       }
-      await sleep(1700); // extra buffer for Dojo widget init
+      await sleep(2000); // extra buffer for Dojo widget init
 
       setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
       checkAbort();
       if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
 
-      await sleep(600); // let panel animate open
+      await sleep(1000); // let panel animate open
 
       setStatus('Step 7: Selecting payroll fields…');
       checkAbort();
@@ -2201,7 +2330,7 @@
           checkAbort();
 
           // Wait for the output page to settle, then re-navigate
-          await sleep(2500);
+          await sleep(3000);
 
           if (!await stepOpenReportsMenu()) { setStatus('Re-nav step 1 failed'); return; }
           checkAbort();
@@ -2225,15 +2354,15 @@
               }
             }
             if (found) break;
-            await sleep(350);
+            await sleep(500);
           }
-          await sleep(1700);
+          await sleep(2000);
 
           // Re-select fields for this run
           setStatus('Re-selecting fields for ' + q.label + '…');
           checkAbort();
           if (!await stepClickWhatsDisplayed()) { setStatus('Re-nav field selection failed'); return; }
-          await sleep(600);
+          await sleep(1000);
           if (!await stepSelectPayrollDisplayFields()) {
             logWarn('Some fields could not be re-selected');
           }
@@ -2245,7 +2374,7 @@
         const viewType = isClosedQuarter ? 'totals' : 'detailed';
         setStatus('Configuring ' + viewType + ' view for ' + q.label + ' (' + q.from + ' → ' + q.to + ')…');
         checkAbort();
-        await sleep(1700);
+        await sleep(2000);
         if (!await stepClickAppearanceSettings()) { setStatus('Appearance click failed for ' + q.label); return; }
         checkAbort();
         if (!await stepConfigureAppearance(q.from, q.to, isClosedQuarter)) { setStatus('Appearance config failed for ' + q.label); return; }
@@ -2253,7 +2382,7 @@
         // Run as Excel
         setStatus('Running report for ' + q.label + '…');
         checkAbort();
-        await sleep(1300);
+        await sleep(1500);
         if (!await stepClickRunAsExcel()) { setStatus('Run as Excel failed for ' + q.label); return; }
 
         logSuccess(q.label + ' report triggered!');
