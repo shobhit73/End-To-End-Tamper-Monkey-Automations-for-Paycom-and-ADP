@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ADP Census + SIT/FIT + License/EC Report Automation
 // @namespace    https://workforcenow.adp.com/
-// @version      0.6.0
-// @description  Six-button automation: Census, SIT/FIT, License/EC, Payroll History (quarterly), Deduction Report, and Direct Deposit Report.
+// @version      0.7.0
+// @description  Seven-button automation: Download All (runs everything), plus individual Census, SIT/FIT, License/EC, Payroll History (quarterly), Deduction, and Direct Deposit reports.
 // @match        https://workforcenow.adp.com/theme/admin.html*
 // @run-at       document-end
 // @grant        none
@@ -2405,6 +2405,55 @@
     }
   }
 
+  // ───────────────── download all ─────────────────
+
+  async function downloadAll(setStatus) {
+    logInfo('=== Download All Reports ===');
+
+    const flows = [
+      { name: 'Census', fn: downloadCensus },
+      { name: 'SIT/FIT', fn: downloadSitFit },
+      { name: 'License/EC', fn: downloadLicenseEC },
+      { name: 'Payroll History', fn: downloadPayrollHistory },
+      { name: 'Deduction', fn: downloadDeductionReport },
+      { name: 'Direct Deposit', fn: downloadDirectDeposit },
+    ];
+
+    for (let i = 0; i < flows.length; i++) {
+      const flow = flows[i];
+
+      // Check if user pressed Stop during the previous flow
+      if (aborted) {
+        setStatus('Download All stopped after ' + (i > 0 ? flows[i - 1].name : 'start'));
+        logWarn('Download All aborted — remaining reports skipped');
+        return;
+      }
+
+      logInfo('───── Starting ' + flow.name + ' (' + (i + 1) + '/' + flows.length + ') ─────');
+      setStatus('Download All: ' + flow.name + ' (' + (i + 1) + '/' + flows.length + ')…');
+
+      await flow.fn(setStatus);
+
+      // Check abort again after the flow returned
+      if (aborted) {
+        setStatus('Download All stopped during ' + flow.name);
+        logWarn('Download All aborted during ' + flow.name + ' — remaining reports skipped');
+        return;
+      }
+
+      logSuccess(flow.name + ' done (' + (i + 1) + '/' + flows.length + ')');
+
+      // Wait between flows for the page to settle before starting next
+      if (i < flows.length - 1) {
+        logInfo('Waiting before next report...');
+        await sleep(5000);
+      }
+    }
+
+    setStatus('All ' + flows.length + ' reports downloaded ✓');
+    logSuccess('=== All reports complete! ===');
+  }
+
   // ───────────────── diagnostic ─────────────────
 
   function dumpDiagnostic() {
@@ -2458,7 +2507,7 @@
     const titleRight = document.createElement('div');
     titleRight.style.cssText = 'display:flex;align-items:center;gap:8px;';
     const versionTag = document.createElement('span');
-    versionTag.textContent = 'v0.6.0';
+    versionTag.textContent = 'v0.7.0';
     versionTag.style.cssText = 'color:#888;font-size:10px;';
     titleRight.appendChild(versionTag);
 
@@ -2513,6 +2562,12 @@
           .finally(() => { running = false; });
       };
     }
+
+    const downloadAllBtn = document.createElement('button');
+    downloadAllBtn.textContent = '⬇ Download All Reports';
+    downloadAllBtn.style.cssText = 'padding:12px;border:none;border-radius:4px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;font-weight:bold;cursor:pointer;font-size:14px;';
+    downloadAllBtn.addEventListener('click', withRunGuard(downloadAll));
+    btnRow.appendChild(downloadAllBtn);
 
     const censusBtn = document.createElement('button');
     censusBtn.textContent = 'Download Census';
