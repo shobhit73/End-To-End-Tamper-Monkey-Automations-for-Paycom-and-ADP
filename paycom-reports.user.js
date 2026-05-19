@@ -1,8 +1,8 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.5.7
-  // @description  Census report (full) + Prior Payroll YTD report (scrape → confirm dialog → fill → generate → download → loop)
+  // @version      0.5.8
+  // @description  Census report (full) + Prior Payroll YTD report (scrape → confirm dialog → fill → generate → download → loop) + Scheduled Deductions report (rpt_id=8)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
   // @grant        none
@@ -278,7 +278,7 @@
     // Both modes IDLE means the user clicked Stop / reset. Used by sleep + waitFor
     // so any in-flight async work bails within ~100ms of the click.
     function shouldAbort() {
-      return !isRunning() && !isPpRunning();
+      return !isRunning() && !isPpRunning() && !isSdRunning();
     }
 
     // Abort-aware sleep: rejects with err.aborted=true if the user clicks Stop
@@ -1364,11 +1364,124 @@
       }
     }
 
+    // ───────────────── Scheduled Deductions (rpt_id=8) ─────────────────
+
+    const SD_STATE_KEY = 'paycomBot.sd.state';
+    const SD_STATES = {
+      IDLE: 'IDLE',
+      AT_REPORT: 'SD_AT_REPORT',
+    };
+    const SD_CONFIG = {
+      reportId: 8,
+    };
+    const sdReportUrl = () =>
+      `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${SD_CONFIG.reportId}`;
+
+    const getSdState = () => localStorage.getItem(SD_STATE_KEY) || SD_STATES.IDLE;
+    const setSdState = (s) => {
+      if (s === SD_STATES.IDLE) localStorage.removeItem(SD_STATE_KEY);
+      else localStorage.setItem(SD_STATE_KEY, s);
+      refreshPanel();
+      log('SD state →', s);
+    };
+    const isSdRunning = () => getSdState() !== SD_STATES.IDLE;
+
+    function startScheduledDeductions() {
+      setState(STATES.IDLE);
+      setPpState(PP_STATES.IDLE);
+      setSdState(SD_STATES.AT_REPORT);
+      dispatch();
+    }
+
+    async function sdHandleReportPage() {
+      log('SD: waiting for report form');
+      await waitFor(
+        () => findRadioByLabel('CSV') || findGenerateReportButton(),
+        { timeout: 20000, label: 'Scheduled Deductions form' }
+      );
+
+      const csvRadio = findRadioByLabel('CSV');
+      if (csvRadio && !csvRadio.checked) {
+        log('SD: selecting CSV');
+        clickEl(csvRadio);
+      } else if (csvRadio) {
+        log('SD: CSV already selected');
+      } else {
+        log('SD: Warning — CSV radio not found, using default format');
+      }
+      await sleep(200);
+
+      const selectAll = findEmployeeSelectAllCheckbox();
+      if (selectAll) {
+        if (!selectAll.checked) {
+          log('SD: clicking Employee Select All');
+          clickEl(selectAll);
+          await sleep(2000); // employee list takes a moment to load
+        } else {
+          log('SD: Employee Select All already checked');
+        }
+      } else {
+        log('SD: Warning — Employee Select All checkbox not found');
+      }
+      await sleep(400);
+
+      const initialDownloads = getDownloadButtons().length;
+      log(`SD: initial Download buttons before generate: ${initialDownloads}`);
+
+      const genBtn = findGenerateReportButton();
+      if (!genBtn) throw new Error('SD: Generate Report button not found');
+      log('SD: clicking Generate Report');
+      showProgressBanner('Scheduled Deductions: generating…');
+      clickEl(genBtn);
+
+      log('SD: waiting for Download button (up to 10 min)');
+      await waitFor(
+        () => getDownloadButtons().length > initialDownloads,
+        { timeout: 10 * 60 * 1000, interval: 2500, label: 'Scheduled Deductions Download' }
+      );
+
+      const downloads = getDownloadButtons();
+      downloads.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      log('SD: clicking newest Download button');
+      clickEl(downloads[0]);
+
+      await sleep(1500);
+      hideProgressBanner();
+      showSuccessBanner('✓ Scheduled Deductions downloaded');
+      setSdState(SD_STATES.IDLE);
+    }
+
+    async function dispatchScheduledDeductions() {
+      if (!isSdRunning()) return;
+      dismissPrivacyBanner();
+      const url = location.href;
+      log('SD dispatch on', location.pathname);
+
+      // Distinguish from Prior Payroll's rpt-generate page by rpt_id.
+      const onSdReport = url.includes('/rpt-generate.php') &&
+        /[?&]rpt_id=8(?:[&#]|$)/.test(url);
+
+      if (!onSdReport) {
+        location.href = sdReportUrl();
+        return;
+      }
+
+      try {
+        await sdHandleReportPage();
+      } catch (err) {
+        if (err.aborted) { log('SD aborted by user'); hideProgressBanner(); return; }
+        hideProgressBanner();
+        alert('Paycom Bot (Scheduled Deductions): ' + err.message);
+        setSdState(SD_STATES.IDLE);
+      }
+    }
+
     // ───────────────── Page-router state machine ─────────────────
 
     async function dispatch() {
       if (isRunning()) return await dispatchCensus();
       if (isPpRunning()) return await dispatchPriorPayroll();
+      if (isSdRunning()) return await dispatchScheduledDeductions();
     }
 
     async function dispatchCensus() {
@@ -1455,23 +1568,31 @@
         <div class="status">URL: <span class="url"></span></div>
         <div class="status">Census: <span class="state"></span></div>
         <div class="status">Prior Payroll: <span class="pp-state"></span></div>
+        <div class="status">Sched Deductions: <span class="sd-state"></span></div>
         <button class="start">Start Census Report</button>
         <button class="start-pp" style="background:#0b7dda;color:#fff">Run Prior Payroll</button>
+        <button class="start-sd" style="background:#e67e22;color:#fff">Run Scheduled Deductions</button>
         <button class="stop">Stop / reset</button>
       `;
       document.body.appendChild(panelEl);
       panelEl.querySelector('.start').addEventListener('click', () => {
         setPpState(PP_STATES.IDLE);
+        setSdState(SD_STATES.IDLE);
         setState(STATES.RUNNING);
         dispatch();
       });
       panelEl.querySelector('.start-pp').addEventListener('click', () => {
+        setSdState(SD_STATES.IDLE);
         startPriorPayroll();
+      });
+      panelEl.querySelector('.start-sd').addEventListener('click', () => {
+        startScheduledDeductions();
       });
       panelEl.querySelector('.stop').addEventListener('click', () => {
         log('Stop / reset clicked — clearing state and tearing down UI');
         setState(STATES.IDLE);
         setPpState(PP_STATES.IDLE);
+        setSdState(SD_STATES.IDLE);
         // Close any modal dialogs the user might be looking at.
         document.getElementById('paycom-bot-confirm')?.remove();
         document.getElementById('paycom-bot-schedule-pick')?.remove();
@@ -1489,12 +1610,14 @@
       panelEl.querySelector('.state').textContent = getState();
       const ppEl = panelEl.querySelector('.pp-state');
       if (ppEl) ppEl.textContent = getPpState();
+      const sdEl = panelEl.querySelector('.sd-state');
+      if (sdEl) sdEl.textContent = getSdState();
     }
 
     function init() {
       if (location.href.includes('cl-login.php') || location.href.includes('two-factor')) return;
       ensurePanel();
-      if (isRunning() || isPpRunning()) setTimeout(dispatch, 800);
+      if (isRunning() || isPpRunning() || isSdRunning()) setTimeout(dispatch, 800);
     }
 
     if (document.readyState === 'complete') init();
