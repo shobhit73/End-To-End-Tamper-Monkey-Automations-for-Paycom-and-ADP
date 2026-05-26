@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Census + SIT/FIT + License/EC Report Automation
 // @namespace    https://workforcenow.adp.com/
-// @version      0.7.0
+// @version      0.7.1
 // @description  Seven-button automation: Download All (runs everything), plus individual Census, SIT/FIT, License/EC, Payroll History (quarterly), Deduction, and Direct Deposit reports.
 // @match        https://workforcenow.adp.com/theme/admin.html*
 // @run-at       document-end
@@ -138,7 +138,8 @@
     "Legal / Preferred Address: City (Personal Profile)",
     "Legal / Preferred Address: Zip / Postal Code (Personal Profile)",
     "Legal / Preferred Address: State / Territory Code (Personal Profile)",
-    "Pronouns (Personal Profile)"
+    "Pronouns (Personal Profile)",
+    "Worked in State Code (Tax Withholding)"
   ];
 
   const LICENSE_EC_COLUMNS = [
