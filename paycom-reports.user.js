@@ -1,8 +1,8 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.5.8
-  // @description  Census report (full) + Prior Payroll YTD report (scrape → confirm dialog → fill → generate → download → loop) + Scheduled Deductions report (rpt_id=8)
+  // @version      0.7.10
+  // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
   // @grant        none
@@ -273,12 +273,23 @@
   `;
     // ====== END field list ======
 
-    const log = (...args) => console.log('[PaycomBot]', ...args);
+    const log = (...args) => {
+      console.log('[PaycomBot]', ...args);
+      // Mirror single-string step messages to the on-screen banner while a flow
+      // is running, so the user sees each step as it happens. Multi-arg logs
+      // (e.g. "PP state →", s) are technical and skipped.
+      if (args.length === 1 && typeof args[0] === 'string' && !shouldAbort()) {
+        try {
+          const m = args[0];
+          showProgressBanner(m.length > 90 ? m.slice(0, 90) + '…' : m);
+        } catch (_) {}
+      }
+    };
 
     // Both modes IDLE means the user clicked Stop / reset. Used by sleep + waitFor
     // so any in-flight async work bails within ~100ms of the click.
     function shouldAbort() {
-      return !isRunning() && !isPpRunning() && !isSdRunning();
+      return !isRunning() && !isPpRunning() && !isSdRunning() && !isTpRunning();
     }
 
     // Abort-aware sleep: rejects with err.aborted=true if the user clicks Stop
@@ -450,10 +461,131 @@
       return 0;
     }
 
+    // Briefly outline an element so the user can see the script clicking it.
+    // Non-blocking: the script does not wait for the flash to fade, and outline
+    // / box-shadow don't affect layout, so this adds no delay and no reflow.
+    function flashEl(el) {
+      try {
+        const o = {
+          outline: el.style.outline,
+          outlineOffset: el.style.outlineOffset,
+          boxShadow: el.style.boxShadow,
+        };
+        el.style.outline = '3px solid #ff5722';
+        el.style.outlineOffset = '2px';
+        el.style.boxShadow = '0 0 0 4px rgba(255,87,34,0.45)';
+        setTimeout(() => {
+          try {
+            el.style.outline = o.outline;
+            el.style.outlineOffset = o.outlineOffset;
+            el.style.boxShadow = o.boxShadow;
+          } catch (_) {}
+        }, 450);
+      } catch (_) {}
+    }
+
     function clickEl(el) {
       if (!el) return;
       try { el.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (_) {}
+      flashEl(el);
       el.click();
+    }
+
+    // A more thorough click than clickEl: dispatches the full pointer + mouse
+    // event sequence. Needed for React components (e.g. the Mantle vertical
+    // stepper) that bind handlers to mousedown / pointerdown rather than a plain
+    // onClick — a bare element.click() never fires those.
+    function robustClick(el) {
+      if (!el) return;
+      try { el.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (_) {}
+      flashEl(el);
+      let cx = 0, cy = 0;
+      try {
+        const r = el.getBoundingClientRect();
+        cx = r.left + r.width / 2;
+        cy = r.top + r.height / 2;
+      } catch (_) {}
+      const base = { bubbles: true, cancelable: true, view: window, button: 0, clientX: cx, clientY: cy };
+      const PE = window.PointerEvent || MouseEvent;
+      const fire = (Ctor, type, extra) => {
+        try { el.dispatchEvent(new Ctor(type, Object.assign({}, base, extra || {}))); } catch (_) {}
+      };
+      fire(PE, 'pointerover', { pointerId: 1, isPrimary: true });
+      fire(MouseEvent, 'mouseover');
+      fire(PE, 'pointerdown', { pointerId: 1, isPrimary: true });
+      fire(MouseEvent, 'mousedown');
+      try { if (el.focus) el.focus(); } catch (_) {}
+      fire(PE, 'pointerup', { pointerId: 1, isPrimary: true });
+      fire(MouseEvent, 'mouseup');
+      fire(MouseEvent, 'click');
+    }
+
+    // Find a React-internal property on a DOM node by key prefix.
+    function getReactKey(el, prefix) {
+      try { for (const k in el) { if (k.startsWith(prefix)) return k; } } catch (_) {}
+      return null;
+    }
+    // Read the React props stashed on a DOM node (React 16/17/18).
+    function getReactProps(el) {
+      const k = getReactKey(el, '__reactProps$') || getReactKey(el, '__reactEventHandlers$');
+      return k ? el[k] : null;
+    }
+
+    // Last-resort click: find the React interaction handler bound to the element
+    // — either as DOM-node props OR on a component fiber up the tree — and
+    // invoke it directly. Per the golden rule, "when synthetic events fail,
+    // manipulate directly". Returns a short diagnostic string of what it did.
+    function reactClick(el) {
+      if (!el) return 'reactClick: no element';
+      const fake = {
+        type: 'click', bubbles: true, cancelable: true, button: 0, buttons: 1,
+        target: el, currentTarget: el, nativeEvent: {},
+        preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {},
+        isDefaultPrevented() { return false; }, isPropagationStopped() { return false; },
+        persist() {},
+      };
+      const HANDLERS = ['onClick', 'onMouseDown', 'onMouseUp', 'onPointerDown', 'onPointerUp'];
+      const fireFrom = (props, label) => {
+        if (!props) return null;
+        const present = HANDLERS.filter(h => typeof props[h] === 'function');
+        if (!present.length) return null;
+        const fired = [];
+        for (const h of present) {
+          try {
+            props[h](Object.assign({}, fake, { type: h.slice(2).toLowerCase() }));
+            fired.push(h);
+          } catch (_) {}
+        }
+        return fired.length ? ('called [' + fired.join(',') + '] on ' + label) : null;
+      };
+
+      // 1. __reactProps$ on the element, its ancestors, then its descendants.
+      const domNodes = [el];
+      let p = el.parentElement;
+      for (let i = 0; i < 8 && p; i++) { domNodes.push(p); p = p.parentElement; }
+      try { domNodes.push(...el.querySelectorAll('*')); } catch (_) {}
+      for (const n of domNodes) {
+        const r = fireFrom(getReactProps(n), '<' + (n.tagName || '?').toLowerCase() + '>');
+        if (r) { const m = 'reactClick: ' + r; log(m); return m; }
+      }
+
+      // 2. Walk the React fiber tree upward — catches handlers bound on a
+      //    component fiber rather than a host DOM node.
+      const fkey = getReactKey(el, '__reactFiber$') || getReactKey(el, '__reactInternalInstance$');
+      let fiber = fkey ? el[fkey] : null;
+      let depth = 0;
+      while (fiber && depth < 40) {
+        const t = fiber.type;
+        const name = (t && (t.displayName || t.name)) || (typeof t === 'string' ? t : '?');
+        const r = fireFrom(fiber.memoizedProps, 'fiber<' + name + '>');
+        if (r) { const m = 'reactClick: ' + r; log(m); return m; }
+        fiber = fiber.return;
+        depth++;
+      }
+
+      const m = 'reactClick: NO handler found (' + domNodes.length + ' DOM nodes, ' + depth + ' fibers checked)';
+      log(m);
+      return m;
     }
 
     function showResultPanel(notFound) {
@@ -683,7 +815,7 @@
 
       await waitFor(() => getDownloadButtons().length > initialCount, {
         timeout: 10 * 60 * 1000,
-        interval: 2500,
+        interval: 800,
         label: 'new Download button (report finished generating)',
       });
 
@@ -723,6 +855,7 @@
     const PP_STATE_KEY = 'paycomBot.pp.state';
     const PP_TASKS_KEY = 'paycomBot.pp.tasks';
     const PP_INDEX_KEY = 'paycomBot.pp.index';
+    const PP_NAV_KEY = 'paycomBot.pp.navAttempts';
     const PP_STATES = {
       IDLE: 'IDLE',
       GO_TO_SCHEDULE: 'PP_GO_TO_SCHEDULE',
@@ -736,15 +869,44 @@
     const PP_CONFIG = {
       ytdReportId: 58,
     };
+    // The processing-schedules listing was migrated to a card-based "Mantle" UI.
+    // The old /paygrid/processingschedules/indexTable URL now redirects here.
+    const PP_MANTLE_SCHEDULE_PATH = '/payrollMantleApi/payrollSetup/processingSchedules';
+    // The per-schedule editor (Properties / Schedule Dates / Summary wizard).
+    // NOTE: this URL also CONTAINS PP_MANTLE_SCHEDULE_PATH as a substring, so the
+    // dispatcher must test for the editor path BEFORE the list path.
+    const PP_MANTLE_EDITOR_PATH = PP_MANTLE_SCHEDULE_PATH + '/editor/';
     const ppScheduleListUrl = () =>
-      'https://www.paycomonline.net/v4/cl/web.php/paygrid/processingschedules/indexTable';
+      'https://www.paycomonline.net/v4/cl/web.php' + PP_MANTLE_SCHEDULE_PATH;
+    // Legacy (pre-Mantle) table-based processing-schedules listing. Some Paycom
+    // clients are still on this UI; for them the Mantle URL above doesn't apply.
+    // The dispatcher detects whichever page it lands on and runs the matching
+    // handler (Mantle vs. legacy) — see dispatchPriorPayroll's AT_SCHEDULE state.
+    const PP_LEGACY_SCHEDULE_PATH = '/paygrid/processingschedules/indexTable';
+    const ppLegacyScheduleListUrl = () =>
+      'https://www.paycomonline.net/v4/cl/web.php' + PP_LEGACY_SCHEDULE_PATH;
     const ppYtdReportUrl = () =>
       `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${PP_CONFIG.ytdReportId}`;
 
+    // Loop guard: each time the dispatcher lands on an unrecognized page and has
+    // to re-navigate, this counter increments. Recognized pages reset it to 0.
+    // After PP_MAX_NAV_ATTEMPTS the flow stops with an alert instead of
+    // refreshing forever (e.g. when Paycom redirects somewhere unexpected).
+    const PP_MAX_NAV_ATTEMPTS = 4;
+    const getPpNavAttempts = () => parseInt(localStorage.getItem(PP_NAV_KEY) || '0', 10);
+    const setPpNavAttempts = (n) => {
+      if (n <= 0) localStorage.removeItem(PP_NAV_KEY);
+      else localStorage.setItem(PP_NAV_KEY, String(n));
+    };
+
     const getPpState = () => localStorage.getItem(PP_STATE_KEY) || PP_STATES.IDLE;
     const setPpState = (s) => {
-      if (s === PP_STATES.IDLE) localStorage.removeItem(PP_STATE_KEY);
-      else localStorage.setItem(PP_STATE_KEY, s);
+      if (s === PP_STATES.IDLE) {
+        localStorage.removeItem(PP_STATE_KEY);
+        setPpNavAttempts(0); // clear loop guard whenever the mode goes idle
+      } else {
+        localStorage.setItem(PP_STATE_KEY, s);
+      }
       refreshPanel();
       log('PP state →', s);
     };
@@ -760,39 +922,113 @@
       setState(STATES.IDLE);
       setPpTasks([]);
       setPpIndex(0);
+      setPpNavAttempts(0);
       setPpState(PP_STATES.GO_TO_SCHEDULE);
       dispatch();
     }
 
-    // Scrape the Schedule Dates table for the active year.
-    // Returns array of { quarter, payrollNum, status, periodStart, periodEnd, txStart, txSubmit, checkDate }.
-    // Skips hidden rows (e.g., other-year tabs that stay in DOM behind the active year).
-    function scrapePayrollSchedule() {
+    // ── Schedule Dates scraper (new card-based Mantle UI, legacy fallback) ──
+
+    // The six field labels shown on each pay-period card.
+    const PP_CARD_LABELS = [
+      'Start Date', 'End Date', 'Days In Period',
+      'Transaction Start Date', 'Transaction Submit Date', 'Check Date',
+    ];
+
+    // Read each field of one pay-period card. The Mantle markup per field is:
+    //   <div><span class="ui-typography-caption">Start Date</span>
+    //        <p class="ui-typography-body2">12/21/2025</p></div>
+    // i.e. the label is a <span> and the value is its sibling <p>.
+    function scrapeCardFields(cardEl) {
+      const out = {};
+      const norm = s => (s || '').replace(/ /g, ' ').trim();
+      for (const span of cardEl.querySelectorAll('span')) {
+        const label = norm(span.textContent);
+        const key = PP_CARD_LABELS.find(L => L.toLowerCase() === label.toLowerCase());
+        if (!key) continue;
+        let value = '';
+        const wrapper = span.parentElement;
+        if (wrapper) {
+          const p = wrapper.querySelector('p');
+          if (p) value = norm(p.textContent);
+        }
+        if (!value && span.nextElementSibling) value = norm(span.nextElementSibling.textContent);
+        if (value) out[key] = value;
+      }
+      return out;
+    }
+
+    // Calendar quarter (1-4) for an MM/DD/YYYY date string.
+    function quarterFromDate(dateStr) {
+      const m = (dateStr || '').match(/^(\d{1,2})\//);
+      if (!m) return 0;
+      const month = parseInt(m[1], 10);
+      if (month < 1 || month > 12) return 0;
+      return Math.floor((month - 1) / 3) + 1;
+    }
+
+    // Scrape the new card-based "Schedule Dates" view. Each pay-period card is a
+    // .uiLibListItemContainer holding a "Check N" heading and the date fields.
+    // The card title is nested malformed markup (<h4> inside <h3>), so we read
+    // the check number from the card's whole text rather than an exact element.
+    // The quarter is derived from the check date (Paycom groups cards the same
+    // way), so we don't depend on scraping the "Quarter N" section headers.
+    function scrapeMantleSchedule() {
+      const periods = [];
+      const cards = Array.from(document.querySelectorAll('.uiLibListItemContainer'))
+        .filter(card => {
+          if (!visible(card)) return false;
+          const txt = (card.textContent || '').replace(/ /g, ' ');
+          return /Check\s+\d+/i.test(txt) && /Check Date/i.test(txt)
+            && /Start Date/i.test(txt) && /End Date/i.test(txt);
+        });
+
+      for (const card of cards) {
+        const txt = (card.textContent || '').replace(/ /g, ' ');
+        const f = scrapeCardFields(card);
+        if (!f['Start Date'] || !f['End Date'] || !f['Check Date']) continue;
+
+        const checkM = txt.match(/Check\s+(\d+)/i);
+        const cycleM = txt.match(/(On-Cycle|Off-Cycle)/i);
+        // Status MUST come from the badge element, not card.textContent:
+        // textContent jams the badge against the next field ("ProcessedStart
+        // Date"), which breaks any word-boundary test. The badge is:
+        //   <div data-testid="label-text">Processed</div>
+        const badge = card.querySelector('[data-testid="label-text"]');
+        const status = badge ? (badge.textContent || '').trim() : 'Open';
+        periods.push({
+          quarter: quarterFromDate(f['Check Date']),
+          payrollNum: checkM ? parseInt(checkM[1], 10) : 0,
+          cycle: cycleM ? cycleM[1] : '',
+          status: status,
+          periodStart: f['Start Date'],
+          periodEnd: f['End Date'],
+          txStart: f['Transaction Start Date'] || '',
+          txSubmit: f['Transaction Submit Date'] || '',
+          checkDate: f['Check Date'],
+        });
+      }
+      return periods;
+    }
+
+    // Legacy <tr>-table scraper — kept as a fallback for un-migrated clients.
+    function scrapeLegacyTrSchedule() {
       const periods = [];
       const rows = Array.from(document.querySelectorAll('tr')).filter(visible);
       const qMap = { '1st': 1, '2nd': 2, '3rd': 3, '4th': 4 };
       let currentQuarter = 0;
-
       for (const row of rows) {
         const text = (row.innerText || '').trim();
-
         const qMatch = text.match(/^(1st|2nd|3rd|4th)\s+Quarter\b/i);
-        if (qMatch && text.length < 30) {
-          currentQuarter = qMap[qMatch[1].toLowerCase()];
-          continue;
-        }
+        if (qMatch && text.length < 30) { currentQuarter = qMap[qMatch[1].toLowerCase()]; continue; }
         if (currentQuarter === 0) continue;
-
         const cells = Array.from(row.querySelectorAll('td'));
         if (cells.length < 7) continue;
-
         const payrollNumText = (cells[1]?.innerText || '').trim();
         if (!/^\d+$/.test(payrollNumText)) continue;
-
         const dateInputs = Array.from(row.querySelectorAll('input[type="text"]'))
           .filter(inp => visible(inp) && /\d{2}\/\d{2}\/\d{4}/.test(inp.value || ''));
         if (dateInputs.length < 5) continue;
-
         periods.push({
           quarter: currentQuarter,
           payrollNum: parseInt(payrollNumText, 10),
@@ -805,36 +1041,77 @@
           checkDate: dateInputs[4].value,
         });
       }
-      log(`scrapePayrollSchedule found ${periods.length} visible rows:`,
-        periods.map(p => `Q${p.quarter} #${p.payrollNum} status="${p.status}" check=${p.checkDate}`));
       return periods;
     }
 
-    // From scraped periods, build the task list:
-    //  - completed quarter (all rows Processed) → 1 quarterly task with first→last check date
-    //  - active quarter (mix Processed + not) → 1 task per Processed row, single check date
-    //  - quarter with zero Processed → skip
+    // Scrape the Schedule Dates view for the active year. Returns array of
+    // { quarter, payrollNum, cycle, status, periodStart, periodEnd, txStart,
+    //   txSubmit, checkDate }. Tries the new Mantle card UI first, then the
+    // legacy table.
+    function scrapePayrollSchedule() {
+      let periods = scrapeMantleSchedule();
+      let source = 'Mantle cards';
+      if (!periods.length) { periods = scrapeLegacyTrSchedule(); source = 'legacy table'; }
+      log(`scrapePayrollSchedule (${source}) found ${periods.length}: ` +
+        periods.map(p => `[Q${p.quarter} #${p.payrollNum} "${p.status}" chk=${p.checkDate}]`).join(' '));
+      return periods;
+    }
+
+    // Calendar quarter the script is being run in (1-4). Drives the
+    // consolidated-vs-per-pay-period bucketing in generateTaskList.
+    function getCurrentCalendarQuarter() {
+      return Math.floor(new Date().getMonth() / 3) + 1;
+    }
+
+    // From scraped periods, build the task list using the current calendar quarter:
+    //  - q <  currentQuarter → 1 consolidated task from that quarter's Processed rows
+    //  - q == currentQuarter → 1 task per Processed row (per-pay-period)
+    //  - q >  currentQuarter → skip (future quarter)
+    //  - any quarter with zero Processed rows → skip
     function generateTaskList(periods) {
       const byQuarter = { 1: [], 2: [], 3: [], 4: [] };
       for (const p of periods) {
         if (byQuarter[p.quarter]) byQuarter[p.quarter].push(p);
       }
+      const currentQuarter = getCurrentCalendarQuarter();
+      log(`generateTaskList: current calendar quarter = Q${currentQuarter}`);
+      // Diagnostic: how periods bucketed per quarter + what statuses look like.
+      for (const q of [1, 2, 3, 4]) {
+        const arr = byQuarter[q];
+        const proc = arr.filter(p => /processed/i.test(p.status));
+        const statuses = [...new Set(arr.map(p => JSON.stringify(p.status)))].join(', ');
+        log(`  Q${q}: ${arr.length} periods, ${proc.length} processed | statuses: ${statuses || '(none)'}`);
+      }
+      const dropped = periods.filter(p => !byQuarter[p.quarter]);
+      if (dropped.length) {
+        log(`  WARNING: ${dropped.length} period(s) had an unrecognized quarter: ` +
+          dropped.map(p => `quarter=${JSON.stringify(p.quarter)} chk=${p.checkDate}`).join(', '));
+      }
       const tasks = [];
       for (const q of [1, 2, 3, 4]) {
+        if (q > currentQuarter) continue;
         const all = byQuarter[q];
         if (!all.length) continue;
         const processed = all.filter(p => /processed/i.test(p.status));
         if (!processed.length) continue;
 
-        if (processed.length === all.length) {
+        if (q < currentQuarter) {
+          // Past quarter → consolidated. If only partially processed, consolidate
+          // across whatever Processed rows are present (Processed rows only).
+          const last = processed[processed.length - 1];
           tasks.push({
             type: 'quarterly',
             quarter: q,
             from: processed[0].checkDate,
-            to: processed[processed.length - 1].checkDate,
-            label: `Q${q} quarterly: ${processed[0].checkDate} → ${processed[processed.length - 1].checkDate}`,
+            to: last.checkDate,
+            // For "Save Report as" filename: consolidated quarter window.
+            periodStart: processed[0].periodStart,
+            periodEnd: last.periodEnd,
+            checkDate: last.checkDate,
+            label: `Q${q} quarterly: ${processed[0].checkDate} → ${last.checkDate}`,
           });
         } else {
+          // q === currentQuarter → per pay period
           for (const p of processed) {
             tasks.push({
               type: 'individual',
@@ -842,6 +1119,10 @@
               payrollNum: p.payrollNum,
               from: p.checkDate,
               to: p.checkDate,
+              // For "Save Report as" filename: this row's own window.
+              periodStart: p.periodStart,
+              periodEnd: p.periodEnd,
+              checkDate: p.checkDate,
               label: `Q${q} payroll #${p.payrollNum}: ${p.checkDate}`,
             });
           }
@@ -931,8 +1212,9 @@
       box.appendChild(title);
 
       const processedCount = periods.filter(p => /processed/i.test(p.status)).length;
+      const currentQuarter = getCurrentCalendarQuarter();
       const subtitle = document.createElement('div');
-      subtitle.innerHTML = `Year: <b>${new Date().getFullYear()}</b> &nbsp; • &nbsp; ${periods.length} rows scraped (${processedCount} Processed) &nbsp; • &nbsp; ${tasks.length} task${tasks.length === 1 ? '' : 's'} planned`;
+      subtitle.innerHTML = `Year: <b>${new Date().getFullYear()}</b> &nbsp; • &nbsp; Current quarter: <b>Q${currentQuarter}</b> &nbsp; • &nbsp; ${periods.length} rows scraped (${processedCount} Processed) &nbsp; • &nbsp; ${tasks.length} task${tasks.length === 1 ? '' : 's'} planned`;
       subtitle.style.cssText = 'color:#666;font-size:12px;margin-bottom:14px;';
       box.appendChild(subtitle);
 
@@ -1013,7 +1295,14 @@
     // the active year's schedule (not whatever the page was last left on).
     async function ensureCurrentYearTab() {
       const currentYear = String(new Date().getFullYear());
-      const yearTab = findVisibleByExactText(currentYear);
+      // Legacy UI labels the tab just "2026"; the new Mantle UI labels it
+      // "2026 (Current)". Match either.
+      const yearTab = findVisibleByExactText(currentYear)
+        || findVisibleByExactText(currentYear + ' (Current)')
+        || Array.from(document.querySelectorAll('button, [role="tab"], a, div, span'))
+            .find(el => visible(el)
+              && new RegExp('^' + currentYear + '\\b').test((el.textContent || '').trim())
+              && (el.textContent || '').trim().length < 24);
       if (yearTab) {
         log(`Clicking year ${currentYear} tab`);
         clickEl(yearTab);
@@ -1101,9 +1390,116 @@
       document.body.appendChild(overlay);
     }
 
-    // On the schedule listing page (/processingschedules/indexTable), parse all
-    // schedule rows, filter to ones with processed periods > 0, then auto-pick
-    // (if 1 valid) or prompt the user (if multiple).
+    // ── New card-based "Mantle" Processing Schedules page ──
+    // Each schedule is a card anchored on a bold name div like
+    //   <div style="display:inline;font-weight:600;">Bi-Weekly [5293] </div>
+    // with an "Active" badge and a "Processed Periods  N of M" stat nearby.
+    function findMantleScheduleCards() {
+      // Bold name divs whose text ends with a "[<id>]" token.
+      const nameDivs = Array.from(document.querySelectorAll('div'))
+        .filter(d => {
+          if (!visible(d)) return false;
+          const t = (d.textContent || '').trim();
+          return /\[\d+\]\s*$/.test(t) && t.length > 0 && t.length < 80;
+        });
+      // Keep only innermost matches (drop ancestors that wrap a matched div).
+      const leaves = nameDivs.filter(d => !nameDivs.some(o => o !== d && d.contains(o)));
+
+      return leaves.map(nameDiv => {
+        const name = (nameDiv.textContent || '').trim();
+        const idMatch = name.match(/\[(\d+)\]/);
+        const scheduleId = idMatch ? idMatch[1] : '';
+        // Walk up to the smallest ancestor that also carries the period stats.
+        let container = nameDiv;
+        for (let i = 0; i < 8 && container.parentElement; i++) {
+          container = container.parentElement;
+          if (/Processed\s+Periods/i.test(container.innerText || '')) break;
+        }
+        const text = container.innerText || '';
+        const active = /\bActive\b/i.test(text);
+        const m = text.match(/Processed\s+Periods[\s\S]*?(\d+)\s+of\s+(\d+)/i);
+        const processed = m ? parseInt(m[1], 10) : 0;
+        const total = m ? parseInt(m[2], 10) : 0;
+        // Click target: a real anchor if present, else the name div itself
+        // (Paycom's React app attaches the handler to the bold name element).
+        const clickTarget = nameDiv.closest('a') || nameDiv;
+        return { name, scheduleId, active, processed, total, link: clickTarget };
+      });
+    }
+
+    // Handle the Mantle Processing Schedules page: pick the Active pay schedule.
+    async function ppHandleMantleScheduleList() {
+      log('On Mantle Processing Schedules page, parsing schedule cards');
+      await waitFor(
+        () => findMantleScheduleCards().length > 0,
+        { timeout: 60000, label: 'Mantle schedule cards' }
+      );
+
+      const schedules = findMantleScheduleCards();
+      log(`Found ${schedules.length} schedule card(s):`,
+        schedules.map(s => `${s.name} active=${s.active} processed=${s.processed}/${s.total}`));
+
+      // Per requirement: select the Active pay schedule (frequency varies per
+      // employer — weekly / bi-weekly / etc. — so match on Active, not name).
+      let usable = schedules.filter(s => s.active && s.processed > 0);
+      if (!usable.length) usable = schedules.filter(s => s.active); // Active but 0 processed
+      if (!usable.length) usable = schedules.filter(s => s.processed > 0); // last resort
+
+      if (!usable.length) {
+        throw new Error(
+          `Found ${schedules.length} schedule(s) but none are Active with processed periods. ` +
+          `Nothing to download for prior payroll yet.`
+        );
+      }
+
+      if (usable.length === 1) {
+        log(`Auto-picking the Active schedule: ${usable[0].name}`);
+        clickEl(usable[0].link);
+        await ppProceedAfterScheduleClick();
+        return;
+      }
+
+      // More than one Active schedule → let the user choose.
+      showSchedulePickDialog(
+        usable,
+        (chosen) => {
+          log(`User picked schedule: ${chosen.name}`);
+          clickEl(chosen.link);
+          ppProceedAfterScheduleClick().catch(err => {
+            if (err && err.aborted) { log('PP schedule aborted by user'); return; }
+            alert('Paycom Bot (PP, schedule): ' + ((err && err.message) || err));
+            setPpState(PP_STATES.IDLE);
+          });
+        },
+        () => { log('User cancelled schedule picker'); setPpState(PP_STATES.IDLE); }
+      );
+    }
+
+    // After clicking a schedule card, Mantle (a React SPA) may route to the
+    // editor client-side WITHOUT a full page reload — in which case dispatch()
+    // never re-fires on its own. Detect that and continue manually.
+    //  - SPA route   → this code keeps running; URL flips to the editor → we
+    //                  call ppHandleSchedulePage() ourselves.
+    //  - full reload → this JS context is destroyed mid-wait; the freshly
+    //                  loaded page's init()/dispatch() takes over instead.
+    // Either way the schedule editor gets handled exactly once.
+    async function ppProceedAfterScheduleClick() {
+      log('Waiting for schedule editor to open (SPA route or full reload)…');
+      await waitFor(
+        () => location.href.includes(PP_MANTLE_EDITOR_PATH),
+        { timeout: 20000, label: 'schedule editor page (after clicking schedule)' }
+      );
+      // Reaching here means it was an SPA route (a full reload would have torn
+      // down this context). Let the editor render, then handle it.
+      log('SPA route detected — schedule editor open, continuing');
+      setPpNavAttempts(0); // forward progress
+      await sleep(900);
+      await ppHandleSchedulePage();
+    }
+
+    // On the legacy schedule listing page (/processingschedules/indexTable),
+    // parse all schedule rows, filter to ones with processed periods > 0, then
+    // auto-pick (if 1 valid) or prompt the user (if multiple).
     async function ppHandleScheduleList() {
       log('On schedule listing page, parsing schedules table');
       await waitFor(
@@ -1170,20 +1566,54 @@
     }
 
     async function ppHandleSchedulePage() {
-      log('On schedule page, clicking "2. Schedule Dates" tab');
-      const datesTab = await waitFor(
-        () => findByText(['li', 'a', 'div', 'span', 'button'], 'Schedule Dates'),
-        { timeout: 15000, label: '"Schedule Dates" tab' }
-      );
-      clickEl(datesTab);
+      // Decide UI type by URL — the dispatcher already routed us here, and a
+      // text search is unreliable (Paycom keeps a HIDDEN <h2>/<div> "Schedule
+      // Dates" content heading in the DOM, which a text search wrongly grabs
+      // before the real stepper step renders).
+      const isMantleEditor = location.href.includes(PP_MANTLE_EDITOR_PATH);
+      log('On schedule editor (' + (isMantleEditor ? 'Mantle' : 'legacy') +
+        ') — opening Schedule Dates');
+      let clickDiag = '';
 
-      log('Waiting for schedule table to load');
-      await waitFor(
-        () => Array.from(document.querySelectorAll('tr'))
-          .filter(visible)
-          .some(r => /1st Quarter/i.test(r.innerText || '')),
-        { timeout: 30000, label: 'schedule dates table (visible 1st Quarter row)' }
-      );
+      if (isMantleEditor) {
+        // Mantle vertical-stepper wizard: wait specifically for the stepper
+        // <li data-testid="N-Step-Schedule Dates">. Then (1) fire a full
+        // pointer+mouse sequence on the inner label and (2) invoke the React
+        // handler directly — the stepper has no native clickable element.
+        const stepLi = await waitFor(
+          () => document.querySelector('li[data-testid*="Step-Schedule Dates" i]'),
+          { timeout: 20000, label: 'Mantle "Schedule Dates" stepper step' }
+        );
+        const target = Array.from(stepLi.querySelectorAll('p, span, div'))
+          .find(x => (x.textContent || '').trim() === 'Schedule Dates') || stepLi;
+        robustClick(target);
+        await sleep(150);
+        clickDiag = reactClick(stepLi);
+      } else {
+        // Legacy detail page: "Schedule Dates" is a normal clickable tab.
+        const tab = await waitFor(
+          () => findByText(['li', 'a', 'div', 'span', 'button'], 'Schedule Dates'),
+          { timeout: 15000, label: 'legacy "Schedule Dates" tab' }
+        );
+        clickEl(tab.closest('[role="button"], button, a, li') || tab);
+      }
+
+      log('Waiting for the Schedule Dates view to render');
+      // Wait for the actual thing we need: at least one scrapeable pay-period
+      // card (new Mantle UI) or a legacy "1st Quarter" row. If it times out,
+      // surface the click diagnostic in the error so we can see what happened.
+      try {
+        await waitFor(
+          () => scrapeMantleSchedule().length > 0
+            || Array.from(document.querySelectorAll('tr')).some(r =>
+                 visible(r) && /1st Quarter/i.test(r.innerText || '')),
+          { timeout: 30000, interval: 400, label: 'Schedule Dates view (pay-period cards)' }
+        );
+      } catch (err) {
+        if (err && err.aborted) throw err;
+        throw new Error('Timed out waiting for the Schedule Dates view. ' +
+          (clickDiag || '(legacy click path)'));
+      }
 
       await ensureCurrentYearTab();
 
@@ -1251,6 +1681,106 @@
       }
     }
 
+    // ───────────────── Prior Payroll: report file download ─────────────────
+
+    // MM/DD/YYYY → MMDDYYYY (filename-safe).
+    function stripSlashes(d) { return (d || '').replace(/\//g, ''); }
+
+    // Downloaded-file name: PriorPayroll_<periodStart>_<periodEnd>_<checkDate>.csv.
+    // For quarterly tasks these come from the first row's periodStart + the last
+    // row's periodEnd + the last row's checkDate (set in generateTaskList); for
+    // individual tasks all three are that one row's own values.
+    function downloadFileName(task) {
+      return `PriorPayroll_${stripSlashes(task.periodStart)}_${stripSlashes(task.periodEnd)}_${stripSlashes(task.checkDate)}.csv`;
+    }
+
+    // The per-session token Paycom embeds in its URLs (needed to build the
+    // report download URL). It appears in many links/forms on every page.
+    function getSessionNonce() {
+      const re = /session_nonce=([A-Za-z0-9._\-]+)/;
+      for (const el of document.querySelectorAll('a[href*="session_nonce="], form[action*="session_nonce="]')) {
+        const m = ((el.getAttribute('href') || '') + ' ' + (el.getAttribute('action') || '')).match(re);
+        if (m) return m[1];
+      }
+      const m = (document.documentElement.innerHTML || '').match(re);
+      return m ? m[1] : '';
+    }
+
+    // Download the report file OURSELVES so we control the filename.
+    // Clicking Paycom's Download button fires an XHR to
+    //   …/report-center/reportaction/one-time-password?…&transid=N
+    // and then Paycom navigates to rpt-generateproc.php to download the file
+    // (with its own default name). We hook that XHR to (a) capture the transid
+    // and (b) abort it so Paycom's success handler never runs — no Paycom-side
+    // download, hence no duplicate file. Then we fetch the file directly and
+    // save it as PriorPayroll_<dates>.csv. The fetch completing IS the
+    // "download done" signal, so the caller moves to the next task immediately.
+    async function ppDownloadReportFile(task, downloadBtn) {
+      const fileName = downloadFileName(task);
+      const nonce = getSessionNonce();
+      if (!nonce) throw new Error('Could not find session_nonce on the page');
+
+      let capturedTransid = '';
+      const proto = window.XMLHttpRequest.prototype;
+      const origOpen = proto.open;
+      const origSend = proto.send;
+      proto.open = function (method, url, ...rest) {
+        this.__ppUrl = url;
+        return origOpen.call(this, method, url, ...rest);
+      };
+      proto.send = function (...args) {
+        if (/one-time-password/i.test(this.__ppUrl || '')) {
+          const m = (this.__ppUrl || '').match(/transid=(\d+)/i);
+          if (m) capturedTransid = m[1];
+          log(`PP: captured transid=${capturedTransid} from one-time-password XHR; ` +
+            `aborting it to suppress Paycom's own (default-named) download`);
+          const r = origSend.apply(this, args);
+          try { this.abort(); } catch (_) {}
+          return r;
+        }
+        return origSend.apply(this, args);
+      };
+      const restore = () => { proto.open = origOpen; proto.send = origSend; };
+
+      try {
+        clickEl(downloadBtn); // fires Paycom's one-time-password XHR (intercepted)
+        await waitFor(() => !!capturedTransid,
+          { timeout: 10000, interval: 100, label: 'report transid (one-time-password XHR)' });
+      } finally {
+        restore();
+      }
+
+      const url = 'https://www.paycomonline.net/v4/cl/rpt-generateproc.php'
+        + `?session_nonce=${encodeURIComponent(nonce)}&download=1&transid=${encodeURIComponent(capturedTransid)}`;
+      log(`PP: fetching report file directly (transid=${capturedTransid})`);
+
+      const ctrl = new AbortController();
+      const killer = setTimeout(() => ctrl.abort(), 180000); // 3-min safety cap
+      let blob;
+      try {
+        const resp = await fetch(url, { credentials: 'include', signal: ctrl.signal });
+        if (!resp.ok) throw new Error(`Report download failed (HTTP ${resp.status})`);
+        blob = await resp.blob();
+      } finally {
+        clearTimeout(killer);
+      }
+      if (!blob || !blob.size) throw new Error('Report download returned an empty file');
+
+      // Save the blob under our filename. A blob URL is same-origin, so the
+      // <a download> name is always honored (and pre-fills the Save dialog if
+      // "ask where to save" is on).
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = fileName;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      log(`PP: saved "${fileName}" (${blob.size} bytes)`);
+    }
+
     async function ppHandleReportPage() {
       const tasks = getPpTasks();
       if (!tasks.length) throw new Error('No tasks in storage — re-run Prior Payroll from the start');
@@ -1294,16 +1824,20 @@
         log(`Waiting for Download button to appear (up to 10 min)...`);
         await waitFor(
           () => getDownloadButtons().length > initialDownloads,
-          { timeout: 10 * 60 * 1000, interval: 2500, label: `Download for task ${index + 1}` }
+          { timeout: 10 * 60 * 1000, interval: 800, label: `Download for task ${index + 1}` }
         );
 
         const downloads = getDownloadButtons();
         downloads.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-        log(`Clicking topmost (newest) Download button for task ${index + 1}`);
-        clickEl(downloads[0]);
+        log(`Task ${index + 1}: downloading report as ${downloadFileName(task)}`);
+        // Script-controlled download: captures the transid, suppresses Paycom's
+        // own download, fetches the file directly, saves it as PriorPayroll_*.csv.
+        // Resolves the instant the file is fully fetched.
+        await ppDownloadReportFile(task, downloads[0]);
 
+        // File downloaded — move straight to the next task in the lineup.
         setPpIndex(index + 1);
-        await sleep(2500); // brief settle before next task
+        await sleep(2000); // brief settle before next task
       }
     }
 
@@ -1315,13 +1849,43 @@
       log('PP dispatch on', location.pathname, 'state=', state);
 
       if (state === PP_STATES.GO_TO_SCHEDULE) {
+        setPpNavAttempts(0);
         setPpState(PP_STATES.AT_SCHEDULE);
         location.href = ppScheduleListUrl();
         return;
       }
 
       if (state === PP_STATES.AT_SCHEDULE) {
-        // Listing page → click first schedule link
+        // Mantle per-schedule EDITOR wizard (Properties / Schedule Dates /
+        // Summary). Must be tested BEFORE the list path below, because the
+        // editor URL contains the list path as a substring. Reaching this page
+        // IS forward progress, so reset the loop guard.
+        if (url.includes(PP_MANTLE_EDITOR_PATH)) {
+          setPpNavAttempts(0);
+          try {
+            await ppHandleSchedulePage();
+          } catch (err) {
+            if (err.aborted) { log('PP schedule aborted by user'); return; }
+            alert('Paycom Bot (PP, schedule): ' + err.message);
+            setPpState(PP_STATES.IDLE);
+          }
+          return;
+        }
+        // New card-based "Mantle" Processing Schedules list → pick Active schedule.
+        // NOTE: do NOT reset the loop guard here — the listing page is where a
+        // bounce loop returns to, so resetting here would defeat the guard.
+        // Only genuine forward progress (the editor page above) resets it.
+        if (url.includes(PP_MANTLE_SCHEDULE_PATH)) {
+          try {
+            await ppHandleMantleScheduleList();
+          } catch (err) {
+            if (err.aborted) { log('PP Mantle list aborted by user'); return; }
+            alert('Paycom Bot (PP, schedules): ' + err.message);
+            setPpState(PP_STATES.IDLE);
+          }
+          return;
+        }
+        // Legacy table listing page → click first schedule link
         if (url.includes('/processingschedules/indexTable')) {
           try {
             await ppHandleScheduleList();
@@ -1332,8 +1896,10 @@
           }
           return;
         }
-        // Detail page (schedule ID in path) → click Schedule Dates, scrape
+        // Detail page (schedule ID in path) → click Schedule Dates, scrape.
+        // Reaching this page IS forward progress, so reset the loop guard.
         if (/\/processingschedules\/index\/\d+/.test(url)) {
+          setPpNavAttempts(0);
           try {
             await ppHandleSchedulePage();
           } catch (err) {
@@ -1343,16 +1909,47 @@
           }
           return;
         }
-        // Wrong page → bounce back to listing
-        location.href = ppScheduleListUrl();
+        // Unrecognized page → bounce back to listing, but guard against an
+        // infinite redirect loop if Paycom keeps redirecting elsewhere.
+        const schedAttempts = getPpNavAttempts();
+        if (schedAttempts >= PP_MAX_NAV_ATTEMPTS) {
+          setPpState(PP_STATES.IDLE);
+          hideProgressBanner();
+          alert('Paycom Bot: stopped after ' + PP_MAX_NAV_ATTEMPTS +
+            ' navigation attempts — kept getting stuck on "' + location.pathname +
+            '". Open the Processing Schedules page (and the schedule) manually, ' +
+            'then click Run Prior Payroll again.');
+          return;
+        }
+        // Alternate between the legacy table URL and the new Mantle URL so the
+        // script auto-detects whichever UI this client is on. Once it lands on a
+        // recognized page, the branches above run the matching handler.
+        const tryLegacy = (schedAttempts % 2 === 0);
+        const nextUrl = tryLegacy ? ppLegacyScheduleListUrl() : ppScheduleListUrl();
+        log(`Unrecognized schedule page — bounce attempt ${schedAttempts + 1}/` +
+          `${PP_MAX_NAV_ATTEMPTS} (trying ${tryLegacy ? 'legacy table' : 'Mantle'} UI)`);
+        setPpNavAttempts(schedAttempts + 1);
+        location.href = nextUrl;
         return;
       }
 
       if (state === PP_STATES.AT_REPORT) {
         if (!url.includes('/rpt-generate.php')) {
+          const rptAttempts = getPpNavAttempts();
+          if (rptAttempts >= PP_MAX_NAV_ATTEMPTS) {
+            setPpState(PP_STATES.IDLE);
+            hideProgressBanner();
+            alert('Paycom Bot: could not reach the report page after ' +
+              PP_MAX_NAV_ATTEMPTS + ' attempts (kept landing on "' + location.pathname +
+              '"). Re-run Prior Payroll once you are logged in to the client.');
+            return;
+          }
+          log(`Not on report page — bounce attempt ${rptAttempts + 1}/${PP_MAX_NAV_ATTEMPTS}`);
+          setPpNavAttempts(rptAttempts + 1);
           location.href = ppYtdReportUrl();
           return;
         }
+        setPpNavAttempts(0); // on the report page — reset loop guard
         try {
           await ppHandleReportPage();
         } catch (err) {
@@ -1389,6 +1986,7 @@
     function startScheduledDeductions() {
       setState(STATES.IDLE);
       setPpState(PP_STATES.IDLE);
+      setTpState(TP_STATES.IDLE);
       setSdState(SD_STATES.AT_REPORT);
       dispatch();
     }
@@ -1437,7 +2035,7 @@
       log('SD: waiting for Download button (up to 10 min)');
       await waitFor(
         () => getDownloadButtons().length > initialDownloads,
-        { timeout: 10 * 60 * 1000, interval: 2500, label: 'Scheduled Deductions Download' }
+        { timeout: 10 * 60 * 1000, interval: 800, label: 'Scheduled Deductions Download' }
       );
 
       const downloads = getDownloadButtons();
@@ -1476,12 +2074,139 @@
       }
     }
 
+    // ───────────────── Tax Profile Report (rpt_id=15) ─────────────────
+
+    const TP_STATE_KEY = 'paycomBot.tp.state';
+    const TP_STATES = {
+      IDLE: 'IDLE',
+      AT_REPORT: 'TP_AT_REPORT',
+    };
+    const TP_CONFIG = {
+      reportId: 15,
+    };
+    const tpReportUrl = () =>
+      `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${TP_CONFIG.reportId}`;
+
+    const getTpState = () => localStorage.getItem(TP_STATE_KEY) || TP_STATES.IDLE;
+    const setTpState = (s) => {
+      if (s === TP_STATES.IDLE) localStorage.removeItem(TP_STATE_KEY);
+      else localStorage.setItem(TP_STATE_KEY, s);
+      refreshPanel();
+      log('TP state →', s);
+    };
+    const isTpRunning = () => getTpState() !== TP_STATES.IDLE;
+
+    function startTaxProfile() {
+      setState(STATES.IDLE);
+      setPpState(PP_STATES.IDLE);
+      setSdState(SD_STATES.IDLE);
+      setTpState(TP_STATES.AT_REPORT);
+      // Immediate feedback so the button doesn't look unresponsive while the
+      // report page loads (the banner is re-shown on the loaded page below).
+      showProgressBanner('Tax Profile Report: opening…');
+      dispatch();
+    }
+
+    async function tpHandleReportPage() {
+      showProgressBanner('Tax Profile Report: loading report form…');
+      log('TP: waiting for report form');
+      await waitFor(
+        () => findRadioByLabel('Excel') || findGenerateReportButton(),
+        { timeout: 20000, label: 'Tax Profile Report form' }
+      );
+
+      // The Excel/XLSX format option's label text varies between Paycom
+      // reports — try the common spellings.
+      const excelRadio = findRadioByLabel('XLSX')
+        || findRadioByLabel('Excel')
+        || findRadioByLabel('MS Excel')
+        || findRadioByLabel('Excel (XLSX)')
+        || findRadioByLabel('Excel (xlsx)');
+      if (excelRadio && !excelRadio.checked) {
+        log('TP: selecting Excel/XLSX');
+        clickEl(excelRadio);
+      } else if (excelRadio) {
+        log('TP: Excel/XLSX already selected');
+      } else {
+        log('TP: Warning — Excel/XLSX radio not found, using default format');
+      }
+      await sleep(200);
+
+      const selectAll = findEmployeeSelectAllCheckbox();
+      if (selectAll) {
+        if (!selectAll.checked) {
+          log('TP: clicking Employee Select All');
+          clickEl(selectAll);
+          await sleep(2000); // employee list takes a moment to load
+        } else {
+          log('TP: Employee Select All already checked');
+        }
+      } else {
+        log('TP: Warning — Employee Select All checkbox not found');
+      }
+      await sleep(400);
+
+      const initialDownloads = getDownloadButtons().length;
+      log(`TP: initial Download buttons before generate: ${initialDownloads}`);
+
+      const genBtn = findGenerateReportButton();
+      if (!genBtn) throw new Error('TP: Generate Report button not found');
+      log('TP: clicking Generate Report');
+      showProgressBanner('Tax Profile Report: generating…');
+      clickEl(genBtn);
+
+      log('TP: waiting for Download button (up to 10 min)');
+      await waitFor(
+        () => getDownloadButtons().length > initialDownloads,
+        { timeout: 10 * 60 * 1000, interval: 800, label: 'Tax Profile Report Download' }
+      );
+
+      const downloads = getDownloadButtons();
+      downloads.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      log('TP: clicking newest Download button');
+      clickEl(downloads[0]);
+
+      await sleep(1500);
+      hideProgressBanner();
+      showSuccessBanner('✓ Tax Profile Report downloaded');
+      setTpState(TP_STATES.IDLE);
+    }
+
+    async function dispatchTaxProfile() {
+      if (!isTpRunning()) return;
+      dismissPrivacyBanner();
+      // Re-show the banner the instant this page's script runs — the previous
+      // page's banner was destroyed by the navigation.
+      showProgressBanner('Tax Profile Report: opening report page…');
+      const url = location.href;
+      log('TP dispatch on', location.pathname);
+
+      // Distinguish from the other rpt-generate reports by rpt_id.
+      const onTpReport = url.includes('/rpt-generate.php') &&
+        /[?&]rpt_id=15(?:[&#]|$)/.test(url);
+
+      if (!onTpReport) {
+        location.href = tpReportUrl();
+        return;
+      }
+
+      try {
+        await tpHandleReportPage();
+      } catch (err) {
+        if (err.aborted) { log('TP aborted by user'); hideProgressBanner(); return; }
+        hideProgressBanner();
+        alert('Paycom Bot (Tax Profile Report): ' + err.message);
+        setTpState(TP_STATES.IDLE);
+      }
+    }
+
     // ───────────────── Page-router state machine ─────────────────
 
     async function dispatch() {
       if (isRunning()) return await dispatchCensus();
       if (isPpRunning()) return await dispatchPriorPayroll();
       if (isSdRunning()) return await dispatchScheduledDeductions();
+      if (isTpRunning()) return await dispatchTaxProfile();
     }
 
     async function dispatchCensus() {
@@ -1558,41 +2283,58 @@
       panelEl.innerHTML = `
         <style>
           #paycom-bot-panel{position:fixed;bottom:20px;right:20px;z-index:2147483647;background:#fff;border:2px solid #008f3e;border-radius:8px;padding:12px;font:13px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.18);width:240px}
-          #paycom-bot-panel h4{margin:0 0 6px;color:#008f3e;font-size:14px}
+          #paycom-bot-panel.minimized{width:auto;padding:6px 10px}
+          #paycom-bot-panel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px}
+          #paycom-bot-panel h4{margin:0;color:#008f3e;font-size:14px;white-space:nowrap}
           #paycom-bot-panel .status{margin:6px 0;color:#444;font-size:12px}
           #paycom-bot-panel button{display:block;width:100%;margin-top:6px;padding:7px 10px;border:0;border-radius:4px;font-size:13px;cursor:pointer}
+          #paycom-bot-panel .min-btn{display:inline-block;width:24px;height:24px;margin:0;padding:0;background:#fff;color:#008f3e;border:1px solid #008f3e;border-radius:4px;font-size:16px;font-weight:bold;line-height:1;cursor:pointer;flex:none}
           #paycom-bot-panel .start{background:#008f3e;color:#fff}
           #paycom-bot-panel .stop{background:#888;color:#fff}
+          #paycom-bot-panel.minimized .body{display:none}
         </style>
-        <h4>Paycom Bot</h4>
-        <div class="status">URL: <span class="url"></span></div>
-        <div class="status">Census: <span class="state"></span></div>
-        <div class="status">Prior Payroll: <span class="pp-state"></span></div>
-        <div class="status">Sched Deductions: <span class="sd-state"></span></div>
-        <button class="start">Start Census Report</button>
-        <button class="start-pp" style="background:#0b7dda;color:#fff">Run Prior Payroll</button>
-        <button class="start-sd" style="background:#e67e22;color:#fff">Run Scheduled Deductions</button>
-        <button class="stop">Stop / reset</button>
+        <div class="hdr">
+          <h4>Paycom Bot</h4>
+          <button class="min-btn" title="Minimize panel">–</button>
+        </div>
+        <div class="body">
+          <div class="status">URL: <span class="url"></span></div>
+          <div class="status">Census: <span class="state"></span></div>
+          <div class="status">Prior Payroll: <span class="pp-state"></span></div>
+          <div class="status">Sched Deductions: <span class="sd-state"></span></div>
+          <div class="status">Tax Profile: <span class="tp-state"></span></div>
+          <button class="start">Start Census Report</button>
+          <button class="start-pp" style="background:#0b7dda;color:#fff">Run Prior Payroll</button>
+          <button class="start-sd" style="background:#e67e22;color:#fff">Run Scheduled Deductions</button>
+          <button class="start-tp" style="background:#6f42c1;color:#fff">Run Tax Profile Report</button>
+          <button class="stop">Stop / reset</button>
+        </div>
       `;
       document.body.appendChild(panelEl);
       panelEl.querySelector('.start').addEventListener('click', () => {
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
+        setTpState(TP_STATES.IDLE);
         setState(STATES.RUNNING);
         dispatch();
       });
       panelEl.querySelector('.start-pp').addEventListener('click', () => {
         setSdState(SD_STATES.IDLE);
+        setTpState(TP_STATES.IDLE);
         startPriorPayroll();
       });
       panelEl.querySelector('.start-sd').addEventListener('click', () => {
         startScheduledDeductions();
+      });
+      panelEl.querySelector('.start-tp').addEventListener('click', () => {
+        startTaxProfile();
       });
       panelEl.querySelector('.stop').addEventListener('click', () => {
         log('Stop / reset clicked — clearing state and tearing down UI');
         setState(STATES.IDLE);
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
+        setTpState(TP_STATES.IDLE);
         // Close any modal dialogs the user might be looking at.
         document.getElementById('paycom-bot-confirm')?.remove();
         document.getElementById('paycom-bot-schedule-pick')?.remove();
@@ -1600,8 +2342,26 @@
         // Hide banners.
         hideProgressBanner();
       });
+      panelEl.querySelector('.min-btn').addEventListener('click', () => {
+        setPanelMinimized(!panelEl.classList.contains('minimized'));
+      });
+      // Restore the minimize state chosen on a previous page load.
+      setPanelMinimized(localStorage.getItem('paycomBot.panelMinimized') === '1');
       refreshPanel();
       return panelEl;
+    }
+
+    // Collapse/expand the panel body. Persisted so it stays minimized across the
+    // page reloads that Paycom triggers on every click.
+    function setPanelMinimized(min) {
+      if (!panelEl) return;
+      panelEl.classList.toggle('minimized', min);
+      const btn = panelEl.querySelector('.min-btn');
+      if (btn) {
+        btn.textContent = min ? '+' : '–';
+        btn.title = min ? 'Expand panel' : 'Minimize panel';
+      }
+      try { localStorage.setItem('paycomBot.panelMinimized', min ? '1' : '0'); } catch (_) {}
     }
 
     function refreshPanel() {
@@ -1612,12 +2372,14 @@
       if (ppEl) ppEl.textContent = getPpState();
       const sdEl = panelEl.querySelector('.sd-state');
       if (sdEl) sdEl.textContent = getSdState();
+      const tpEl = panelEl.querySelector('.tp-state');
+      if (tpEl) tpEl.textContent = getTpState();
     }
 
     function init() {
       if (location.href.includes('cl-login.php') || location.href.includes('two-factor')) return;
       ensurePanel();
-      if (isRunning() || isPpRunning() || isSdRunning()) setTimeout(dispatch, 800);
+      if (isRunning() || isPpRunning() || isSdRunning() || isTpRunning()) setTimeout(dispatch, 800);
     }
 
     if (document.readyState === 'complete') init();
