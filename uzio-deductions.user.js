@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UZIO Setup Auto-Create (Earnings + Deductions + Contributions from Payroll Setup Helper xlsx)
 // @namespace    https://uzio.com/
-// @version      0.33.0
+// @version      0.34.0
 // @description  Reads the Earnings, Deductions and Contributions tabs of the Payroll Setup Helper .xlsx and auto-creates each in UZIO. Buttons: Start Earnings / Deductions / Contributions. Each save is positively verified (form must reset/close) so silent failures pause instead of being skipped. On failure: pause with Save & Continue / Resume / Skip, or skip & continue; manual Pause; end-of-run reconciliation.
 // @match        https://app.uzio.com/*
 // @run-at       document-idle
@@ -1435,9 +1435,12 @@
       if (!rr.ok && !rr.skipped) warn(`rate: ${rr.reason}`);
     }
 
-    // Disposable / Workers' Comp / Taxability / W-2: only editable for "Other"
-    // (mapped types auto-fill + lock them).
-    if (lc(etype) === 'other') {
+    // Disposable income / Workers' Comp: editable for "Other" AND a few named
+    // types (Reimbursements, DA Recognition - TWA) where UZIO leaves them open.
+    // setRadioByName self-skips a locked/disabled radio, so attempting this is
+    // safe for every type.
+    const DISP_WC_TYPES = new Set(['other', 'reimbursements', 'da recognition - twa']);
+    if (DISP_WC_TYPES.has(etl)) {
       step(`disposable = ${row[C.disposable]}`);
       r = await setRadioByName(R.disposable, row[C.disposable]);
       if (!r.ok && !r.skipped) warn(`disposable: ${r.reason}`);
@@ -1445,7 +1448,10 @@
       step(`workers-comp = ${row[C.workersComp]}`);
       r = await setRadioByName(R.workersComp, row[C.workersComp]);
       if (!r.ok && !r.skipped) warn(`workers-comp: ${r.reason}`);
+    }
 
+    // Taxability / W-2: only editable for "Other" (mapped types auto-fill+lock).
+    if (lc(etype) === 'other') {
       step(`taxability = ${row[C.taxability]}`);
       r = await setSelectMenuByName(SN.taxability, row[C.taxability]);
       if (!r.ok && !r.skipped) warn(`taxability: ${r.reason}`);
@@ -1616,7 +1622,7 @@
     ].join(';');
     wrap.innerHTML = `
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-        <span style="font-weight:700;color:#6c2bd9">UZIO Setup Bot <span style="font-weight:400;color:#888">v0.33.0</span></span>
+        <span style="font-weight:700;color:#6c2bd9">UZIO Setup Bot <span style="font-weight:400;color:#888">v0.34.0</span></span>
         <button id="uziobot-min" title="Minimize / expand" style="border:1px solid #ccc;background:#f7f7f7;border-radius:6px;cursor:pointer;width:26px;height:22px;line-height:1;font-weight:700">–</button>
       </div>
       <div id="uziobot-body">
