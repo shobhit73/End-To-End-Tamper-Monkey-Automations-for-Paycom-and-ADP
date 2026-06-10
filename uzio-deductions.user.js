@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UZIO Setup Auto-Create (Earnings + Deductions + Contributions from Payroll Setup Helper xlsx)
 // @namespace    https://uzio.com/
-// @version      0.34.0
+// @version      0.36.0
 // @description  Reads the Earnings, Deductions and Contributions tabs of the Payroll Setup Helper .xlsx and auto-creates each in UZIO. Buttons: Start Earnings / Deductions / Contributions. Each save is positively verified (form must reset/close) so silent failures pause instead of being skipped. On failure: pause with Save & Continue / Resume / Skip, or skip & continue; manual Pause; end-of-run reconciliation.
 // @match        https://app.uzio.com/*
 // @run-at       document-idle
@@ -145,6 +145,7 @@
       rateFactor: 'Rate Determination Factor',
       rate:       'Rate',
       includeOT:  'Include Bonus in Overtime Calculation',
+      timeoffPolicy: 'Time Off Policy',
       disposable: 'Subject to garnishment disposable income',
       workersComp:'Subject to Workers Compensation',
       taxability: 'Taxability Type',
@@ -421,6 +422,46 @@
     if (!option) return { ok: false, reason: `dropdown option "${value}" not found for "${labelText}"` };
     clickEl(option);
     await sleep(CONFIG.afterTypeMs);
+    return { ok: true };
+  }
+
+  // "Time Off Policies" is a jQuery multiple-select widget (.ms-parent / .ms-choice
+  // button / .ms-drop with checkboxes) backing a hidden <select id="policyIdentifiers">
+  // — NOT a plain/selectmenu dropdown. So we OPEN it and TICK a checkbox: value
+  // "All" -> the ".ms-select-all" checkbox; otherwise the item whose label matches.
+  async function setTimeOffPolicies(value) {
+    if (shouldSkipValue(value)) return { ok: true, skipped: true };
+    const want = lc(value);
+    const sel = deepQueryAll('#policyIdentifiers, select[name="policyIdentifiers"]')[0];
+    if (!sel) return { ok: false, reason: 'Time Off Policies field (policyIdentifiers) not shown' };
+    const ms = (sel.parentElement && sel.parentElement.querySelector('.ms-parent'))
+            || deepQueryAll('.ms-parent').find(p => p.parentElement && p.parentElement.contains(sel));
+    if (!ms) return { ok: false, reason: 'multiple-select widget (.ms-parent) not found' };
+    const drop = ms.querySelector('.ms-drop');
+    const choice = ms.querySelector('.ms-choice');
+    // Open the dropdown if it's closed (checkboxes only respond while visible).
+    if (drop && !visible(drop) && choice) { clickEl(choice); await sleep(CONFIG.afterClickMs); }
+    const isChecked = (inp) => {
+      if (!inp) return false;
+      if (inp.checked) return true;
+      const lbl = inp.closest('label');
+      return !!(lbl && lbl.classList.contains('active'));
+    };
+    let target;
+    if (want === 'all') {
+      target = ms.querySelector('.ms-select-all input[type="checkbox"]')
+            || ms.querySelector('input[name="selectAllpolicyIdentifiers"]');
+      if (!target) return { ok: false, reason: 'Select-All checkbox not found' };
+    } else {
+      const li = Array.from(ms.querySelectorAll('li:not(.ms-select-all):not(.ms-no-results)'))
+        .find(l => lc(l.textContent).includes(want));
+      if (!li) return { ok: false, reason: `policy "${value}" not in the list` };
+      target = li.querySelector('input[type="checkbox"]');
+      if (!target) return { ok: false, reason: `checkbox for "${value}" not found` };
+    }
+    if (!isChecked(target)) { clickEl(target); await sleep(CONFIG.afterTypeMs); }
+    // Close the dropdown so it doesn't overlap the Save buttons.
+    if (choice && drop && visible(drop)) { clickEl(choice); await sleep(CONFIG.afterTypeMs); }
     return { ok: true };
   }
 
@@ -1388,9 +1429,13 @@
       const rr = await setRadioByName(R.includeInOT, incOT);
       if (!rr.ok && !rr.skipped) warn(`include-in-overtime: ${rr.reason}`);
     }
-    if (etl === 'vacation') {
-      step('time off policies = All');
-      const rr = await setDropdown('time off polic', 'All', { contains: true });
+    // Time Off Policies dropdown (shown for Vacation / Unpaid Time Off). The xlsx
+    // "Time Off Policy" column says which to pick — Vacation -> "Paid PTO",
+    // Unpaid Time Off -> "All"; "NA"/blank no-ops (field absent for other types).
+    const timeoffPolicy = norm(row[C.timeoffPolicy]);
+    if (!shouldSkipValue(timeoffPolicy)) {
+      step(`time off policies = ${timeoffPolicy}`);
+      const rr = await setTimeOffPolicies(timeoffPolicy);
       if (!rr.ok && !rr.skipped) warn(`time-off-policies: ${rr.reason}`);
     }
 
@@ -1622,7 +1667,7 @@
     ].join(';');
     wrap.innerHTML = `
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-        <span style="font-weight:700;color:#6c2bd9">UZIO Setup Bot <span style="font-weight:400;color:#888">v0.34.0</span></span>
+        <span style="font-weight:700;color:#6c2bd9">UZIO Setup Bot <span style="font-weight:400;color:#888">v0.36.0</span></span>
         <button id="uziobot-min" title="Minimize / expand" style="border:1px solid #ccc;background:#f7f7f7;border-radius:6px;cursor:pointer;width:26px;height:22px;line-height:1;font-weight:700">–</button>
       </div>
       <div id="uziobot-body">
