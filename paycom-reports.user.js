@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.8.0
+  // @version      0.12.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -2274,11 +2274,66 @@
     }
 
     // ───────────────── Documents: Download All (fetch + blob) ─────────────────
+    // The Doc Dashboard URL the "Download All Documents" button navigates to.
+    const DOC_DASHBOARD_URL = 'https://www.paycomonline.net/v4/cl/web.php/Doc/Dashboard';
+    // Set by setupDocDownloader() once its controls mount on the Doc Dashboard.
+    let docsStartFresh = null;   // start a fresh document download run
+    let docsResume = null;       // resume an interrupted run
+
+    // Poll until the Doc Dashboard DataTables grid has rendered rows (or time out).
+    function waitForDocTable(cb) {
+      const start = Date.now();
+      (function poll() {
+        const rows = document.querySelectorAll('#ee-doc-table tbody tr[role="row"]');
+        if (rows.length || Date.now() - start > 20000) return cb();
+        setTimeout(poll, 300);
+      })();
+    }
+
+    // Ask the user which year to START from. The END date is always Dec 31 of
+    // the current year (auto-updates each year). Returns
+    // { from:'MM/DD/YYYY', to:'MM/DD/YYYY' } or null if the user cancels.
+    function computeFilterRange() {
+      const currentYear = new Date().getFullYear();
+      const toStr = `12/31/${currentYear}`;
+      const def = String(Math.max(1990, currentYear - 4));
+      while (true) {
+        const raw = window.prompt(
+          'Download All Documents — enter the START YEAR for the "Last Modified" filter.\n' +
+          `From = 01/01/<year>, To = 12/31/${currentYear} (end of the current year).`,
+          def
+        );
+        if (raw === null) return null; // cancelled
+        const n = parseInt(String(raw).trim(), 10);
+        if (Number.isInteger(n) && n >= 1990 && n <= currentYear) {
+          return { from: `01/01/${n}`, to: toStr };
+        }
+        alert(`Please enter a 4-digit year between 1990 and ${currentYear}.`);
+      }
+    }
+
+    // Entry point for the panel's "Download All Documents" button. Prompts for
+    // the start year first, then: if already on the Doc Dashboard, start
+    // immediately; otherwise flag an auto-start and navigate there — init()
+    // picks up the flag (and the stored range) after the page loads.
+    function startDocs() {
+      const range = computeFilterRange();
+      if (!range) return; // user cancelled
+      try { localStorage.setItem('paycomBot.docs.range', JSON.stringify(range)); } catch (_) {}
+      if (/\/Doc\/Dashboard/i.test(location.href)) {
+        waitForDocTable(() => { if (docsStartFresh) docsStartFresh(); });
+      } else {
+        try { localStorage.setItem('paycomBot.docs.autostart', '1'); } catch (_) {}
+        location.href = DOC_DASHBOARD_URL;
+      }
+    }
+
     // Self-contained module: its own state key (`paycom_dl_state`) and its own
     // helpers (dlSleep, loadDlState, …) so nothing collides with the census /
     // prior-payroll state machine. Bulk-downloads every document on the Doc
     // Dashboard by fetch()→Blob→save (no browser-queue drops), paginating the
-    // DataTables grid. Mounted into the panel only on /Doc/Dashboard.
+    // DataTables grid. The Start trigger is the panel's "Download All Documents"
+    // button; this section shows status + pause/resume while a run is active.
     function setupDocDownloader(container) {
       if (!container || container.dataset.docDlMounted) return;
       container.dataset.docDlMounted = '1';
@@ -2587,7 +2642,80 @@
         document.body.appendChild(ov);
       }
 
-      // ── UI (mounted into the Paycom Bot panel) ──
+      // ── pre-download filter: set the Last Modified date range ──
+      // Open the Doc Dashboard "Filters" panel, set Last Modified From/To, and
+      // click Apply so the download covers the whole window (not just the
+      // default recent range). Best-effort — logs and continues if the UI
+      // differs. Reuses the outer helpers (visible, clickEl, setInputValue,
+      // findByText, findVisibleByExactText).
+      function findFiltersButton() {
+        const cands = Array.from(document.querySelectorAll('button, a, [role="button"], div, span'))
+          .filter(el => visible(el) && (el.textContent || '').trim() === 'Filters');
+        cands.sort((a, b) => {
+          const rank = t => (t === 'BUTTON' || t === 'A' ? 0 : 1);
+          return rank(a.tagName) - rank(b.tagName);
+        });
+        return cands[0] || null;
+      }
+
+      function findFilterDateInputs() {
+        const dateRe = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
+        const label = findVisibleByExactText('Last Modified Date Range');
+        if (label) {
+          let c = label;
+          for (let i = 0; i < 6 && c; i++) {
+            c = c.parentElement;
+            if (!c) break;
+            const ins = Array.from(c.querySelectorAll('input'))
+              .filter(inp => visible(inp) && dateRe.test((inp.value || '').trim()));
+            if (ins.length >= 2) return { from: ins[0], to: ins[1] };
+          }
+        }
+        const all = Array.from(document.querySelectorAll('input'))
+          .filter(inp => visible(inp) && dateRe.test((inp.value || '').trim()));
+        if (all.length >= 2) return { from: all[0], to: all[1] };
+        return null;
+      }
+
+      async function applyLastModifiedFilter(fromStr, toStr) {
+        try {
+          const btn = findFiltersButton();
+          if (!btn) { console.warn('[DL] "Filters" button not found — skipping date filter'); return; }
+          statusEl.textContent = 'Docs: opening filter…';
+          clickEl(btn);
+
+          let inputs = null;
+          for (let i = 0; i < 40 && !inputs; i++) { inputs = findFilterDateInputs(); if (!inputs) await dlSleep(250); }
+          if (!inputs) { console.warn('[DL] Filter date inputs not found — skipping date filter'); return; }
+
+          statusEl.textContent = `Docs: date range ${fromStr} → ${toStr}…`;
+          setInputValue(inputs.from, fromStr);
+          setInputValue(inputs.to, toStr);
+          await dlSleep(300);
+
+          const prevInfo = getInfoText();
+          const applyBtn = findByText(['button', 'a'], 'Apply Filters');
+          if (applyBtn) clickEl(applyBtn);
+          else console.warn('[DL] "Apply Filters" button not found — filter may not be applied');
+
+          // Wait for the grid to reload (info text changes), then settle.
+          for (let i = 0; i < 60; i++) {
+            await dlSleep(250);
+            const cur = getInfoText();
+            if (cur && cur !== prevInfo) break;
+          }
+          await dlSleep(800);
+          console.log(`[DL] Applied Last Modified filter ${fromStr} → ${toStr}`);
+        } catch (e) {
+          console.warn('[DL] applyLastModifiedFilter error (continuing without filter):', e);
+        }
+      }
+
+      // ── UI: status + pause/resume in the panel section. The Start trigger is
+      //    the main-list "Download All Documents" button (see startDocs()), so
+      //    this section has no Start of its own. ──
+      let running = false;
+
       const statusEl = document.createElement('div');
       statusEl.className = 'status';
       statusEl.textContent = 'Documents: idle';
@@ -2599,12 +2727,10 @@
         b.style.color = '#fff';
         return b;
       };
-      const startBtn = mkBtn('Download All Documents', '#0b7dda');
       const resumeBtn = mkBtn('', '#e67e22'); resumeBtn.style.display = 'none';
       const pauseBtn = mkBtn('⏸  Pause', '#7f8c8d'); pauseBtn.style.display = 'none';
 
       container.appendChild(statusEl);
-      container.appendChild(startBtn);
       container.appendChild(resumeBtn);
       container.appendChild(pauseBtn);
 
@@ -2614,16 +2740,21 @@
         pauseBtn.style.background = paused ? '#27ae60' : '#7f8c8d';
       });
 
-      const saved = loadDlState();
-      if (saved && !saved.isComplete) {
-        resumeBtn.textContent = `Resume from page ${saved.currentPage} (✓${saved.downloadedDocIds.size} ✗${saved.skippedDocs.length})`;
-        resumeBtn.style.display = 'block';
-      }
+      const refreshResume = () => {
+        const saved = loadDlState();
+        if (saved && !saved.isComplete) {
+          resumeBtn.textContent = `Resume docs from page ${saved.currentPage} (✓${saved.downloadedDocIds.size} ✗${saved.skippedDocs.length})`;
+          resumeBtn.style.display = 'block';
+        } else {
+          resumeBtn.style.display = 'none';
+        }
+      };
+      refreshResume();
 
-      const runWith = async (state, activeBtn, bg) => {
-        if (startBtn.disabled) return;
-        [startBtn, resumeBtn].forEach(b => { b.disabled = true; });
-        activeBtn.style.background = '#777';
+      const runWith = async (state) => {
+        if (running) return;
+        running = true;
+        resumeBtn.disabled = true;
         paused = false;
         pauseBtn.textContent = '⏸  Pause';
         pauseBtn.style.background = '#7f8c8d';
@@ -2634,24 +2765,54 @@
           console.error('[DL] Fatal:', e);
           alert('Document download error: ' + (e?.message || String(e)));
         } finally {
-          [startBtn, resumeBtn].forEach(b => { b.disabled = false; });
-          activeBtn.style.background = bg;
-          resumeBtn.style.display = 'none';
+          running = false;
+          resumeBtn.disabled = false;
           pauseBtn.style.display = 'none';
           paused = false;
+          refreshResume();
         }
       };
 
-      startBtn.addEventListener('click', () => {
-        clearDlState();
-        const state = freshDlState();
-        saveDlState(state);
-        runWith(state, startBtn, '#0b7dda');
-      });
-      resumeBtn.addEventListener('click', () => {
-        const state = loadDlState() || freshDlState();
-        runWith(state, resumeBtn, '#e67e22');
-      });
+      // The date range chosen by startDocs() (persisted so it survives the
+      // navigation to the Doc Dashboard). Falls back to prompting if absent.
+      const readStoredRange = () => {
+        try {
+          const r = JSON.parse(localStorage.getItem('paycomBot.docs.range') || 'null');
+          if (r && r.from && r.to) return r;
+        } catch (_) {}
+        return null;
+      };
+
+      // Expose start/resume so the panel's "Download All Documents" button and
+      // the post-navigation auto-start can trigger a run on this page. Both
+      // apply the Last Modified date filter first, then run.
+      let starting = false;
+      docsStartFresh = async () => {
+        if (running || starting) return;
+        starting = true;
+        try {
+          const range = readStoredRange() || computeFilterRange();
+          if (!range) { statusEl.textContent = 'Documents: cancelled'; return; }
+          clearDlState();
+          await applyLastModifiedFilter(range.from, range.to);
+          const s = freshDlState();
+          saveDlState(s);
+          runWith(s);
+        } finally { starting = false; }
+      };
+      docsResume = async () => {
+        if (running || starting) return;
+        starting = true;
+        try {
+          const range = computeFilterRange(); // ask fresh on a manual resume
+          if (!range) { statusEl.textContent = 'Documents: cancelled'; return; }
+          await applyLastModifiedFilter(range.from, range.to);
+          const s = loadDlState() || freshDlState();
+          runWith(s);
+        } finally { starting = false; }
+      };
+
+      resumeBtn.addEventListener('click', () => docsResume());
 
       console.log('[Paycom DL] doc-downloader mounted on Doc Dashboard.');
     }
@@ -2665,15 +2826,22 @@
       panelEl.id = 'paycom-bot-panel';
       panelEl.innerHTML = `
         <style>
-          #paycom-bot-panel{position:fixed;bottom:20px;right:20px;z-index:2147483647;background:#fff;border:2px solid #008f3e;border-radius:8px;padding:12px;font:13px sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.18);width:240px}
+          /* Palette: #FDEB9E (yellow) #7AE2CF (mint) #077A7D (teal) #06202B (navy) */
+          #paycom-bot-panel{position:fixed;bottom:20px;right:20px;z-index:2147483647;background:#06202B;border:2px solid #077A7D;border-radius:10px;padding:12px;font:13px sans-serif;box-shadow:0 6px 22px rgba(0,0,0,.45);width:240px;color:#7AE2CF}
           #paycom-bot-panel.minimized{width:auto;padding:6px 10px}
-          #paycom-bot-panel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px}
-          #paycom-bot-panel h4{margin:0;color:#008f3e;font-size:14px;white-space:nowrap}
-          #paycom-bot-panel .status{margin:6px 0;color:#444;font-size:12px}
-          #paycom-bot-panel button{display:block;width:100%;margin-top:6px;padding:7px 10px;border:0;border-radius:4px;font-size:13px;cursor:pointer}
-          #paycom-bot-panel .min-btn{display:inline-block;width:24px;height:24px;margin:0;padding:0;background:#fff;color:#008f3e;border:1px solid #008f3e;border-radius:4px;font-size:16px;font-weight:bold;line-height:1;cursor:pointer;flex:none}
-          #paycom-bot-panel .start{background:#008f3e;color:#fff}
-          #paycom-bot-panel .stop{background:#888;color:#fff}
+          #paycom-bot-panel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:move;user-select:none}
+          #paycom-bot-panel h4{margin:0;color:#FDEB9E;font-size:14px;white-space:nowrap}
+          #paycom-bot-panel .status{margin:6px 0;color:#7AE2CF;font-size:12px}
+          #paycom-bot-panel .status span{color:#FDEB9E}
+          #paycom-bot-panel button{display:block;width:100%;margin-top:6px;padding:7px 10px;border:0;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer;background:#077A7D;color:#FDEB9E}
+          #paycom-bot-panel button:hover{filter:brightness(1.12)}
+          #paycom-bot-panel .min-btn{display:inline-block;width:24px;height:24px;margin:0;padding:0;background:#077A7D;color:#FDEB9E;border:1px solid #7AE2CF;border-radius:4px;font-size:16px;font-weight:bold;line-height:1;cursor:pointer;flex:none}
+          #paycom-bot-panel .start{background:#077A7D;color:#FDEB9E}
+          #paycom-bot-panel .start-pp{background:#7AE2CF;color:#06202B}
+          #paycom-bot-panel .start-sd{background:#FDEB9E;color:#06202B}
+          #paycom-bot-panel .start-tp{background:#077A7D;color:#7AE2CF}
+          #paycom-bot-panel .start-docs{background:#7AE2CF;color:#06202B}
+          #paycom-bot-panel .stop{background:transparent;color:#FDEB9E;border:1px solid #FDEB9E}
           #paycom-bot-panel.minimized .body{display:none}
         </style>
         <div class="hdr">
@@ -2687,14 +2855,25 @@
           <div class="status">Sched Deductions: <span class="sd-state"></span></div>
           <div class="status">Tax Profile: <span class="tp-state"></span></div>
           <button class="start">Start Census Report</button>
-          <button class="start-pp" style="background:#0b7dda;color:#fff">Run Prior Payroll</button>
-          <button class="start-sd" style="background:#e67e22;color:#fff">Run Scheduled Deductions</button>
-          <button class="start-tp" style="background:#6f42c1;color:#fff">Run Tax Profile Report</button>
+          <button class="start-pp">Run Prior Payroll</button>
+          <button class="start-sd">Run Scheduled Deductions</button>
+          <button class="start-tp">Run Tax Profile Report</button>
+          <button class="start-docs">Download All Documents</button>
           <button class="stop">Stop / reset</button>
-          <div class="doc-dl-section" style="display:none;border-top:1px solid #ddd;margin-top:10px;padding-top:4px"></div>
+          <div class="doc-dl-section" style="display:none;border-top:1px solid #077A7D;margin-top:10px;padding-top:4px"></div>
         </div>
       `;
       document.body.appendChild(panelEl);
+      // Restore a position the user dragged the panel to on a previous page load.
+      try {
+        const pos = JSON.parse(localStorage.getItem('paycomBot.panelPos') || 'null');
+        if (pos && pos.left && pos.top) {
+          panelEl.style.left = pos.left;
+          panelEl.style.top = pos.top;
+          panelEl.style.right = 'auto';
+          panelEl.style.bottom = 'auto';
+        }
+      } catch (_) {}
       panelEl.querySelector('.start').addEventListener('click', () => {
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
@@ -2713,6 +2892,15 @@
       panelEl.querySelector('.start-tp').addEventListener('click', () => {
         startTaxProfile();
       });
+      panelEl.querySelector('.start-docs').addEventListener('click', () => {
+        // Clear the other modes (this isn't part of their state machine) and
+        // either start now (on Doc Dashboard) or navigate there + auto-start.
+        setState(STATES.IDLE);
+        setPpState(PP_STATES.IDLE);
+        setSdState(SD_STATES.IDLE);
+        setTpState(TP_STATES.IDLE);
+        startDocs();
+      });
       panelEl.querySelector('.stop').addEventListener('click', () => {
         log('Stop / reset clicked — clearing state and tearing down UI');
         setState(STATES.IDLE);
@@ -2729,6 +2917,42 @@
       panelEl.querySelector('.min-btn').addEventListener('click', () => {
         setPanelMinimized(!panelEl.classList.contains('minimized'));
       });
+      // Drag the panel by its header. Position is persisted so it stays put
+      // across the page reloads Paycom triggers on every click. Clicks on the
+      // minimize button are excluded so it still toggles.
+      (function makeDraggable() {
+        const hdr = panelEl.querySelector('.hdr');
+        let dragging = false, dx = 0, dy = 0;
+        hdr.addEventListener('mousedown', (e) => {
+          if (e.target.closest('.min-btn')) return;
+          dragging = true;
+          const r = panelEl.getBoundingClientRect();
+          dx = e.clientX - r.left;
+          dy = e.clientY - r.top;
+          panelEl.style.right = 'auto';
+          panelEl.style.bottom = 'auto';
+          panelEl.style.left = r.left + 'px';
+          panelEl.style.top = r.top + 'px';
+          e.preventDefault();
+        });
+        document.addEventListener('mousemove', (e) => {
+          if (!dragging) return;
+          let left = e.clientX - dx;
+          let top = e.clientY - dy;
+          left = Math.max(0, Math.min(left, window.innerWidth - panelEl.offsetWidth));
+          top = Math.max(0, Math.min(top, window.innerHeight - panelEl.offsetHeight));
+          panelEl.style.left = left + 'px';
+          panelEl.style.top = top + 'px';
+        });
+        document.addEventListener('mouseup', () => {
+          if (!dragging) return;
+          dragging = false;
+          try {
+            localStorage.setItem('paycomBot.panelPos',
+              JSON.stringify({ left: panelEl.style.left, top: panelEl.style.top }));
+          } catch (_) {}
+        });
+      })();
       // Mount the Documents downloader only on the Doc Dashboard page.
       const docSection = panelEl.querySelector('.doc-dl-section');
       if (docSection && /\/Doc\/Dashboard/i.test(location.href)) {
@@ -2770,6 +2994,11 @@
       if (location.href.includes('cl-login.php') || location.href.includes('two-factor')) return;
       ensurePanel();
       if (isRunning() || isPpRunning() || isSdRunning() || isTpRunning()) setTimeout(dispatch, 800);
+      // Auto-start the document download after navigating here from the panel button.
+      if (/\/Doc\/Dashboard/i.test(location.href) && localStorage.getItem('paycomBot.docs.autostart') === '1') {
+        localStorage.removeItem('paycomBot.docs.autostart');
+        waitForDocTable(() => { if (docsStartFresh) docsStartFresh(); });
+      }
     }
 
     if (document.readyState === 'complete') init();
