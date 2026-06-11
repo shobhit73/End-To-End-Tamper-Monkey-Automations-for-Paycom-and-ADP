@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.15.0
+  // @version      0.16.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -834,7 +834,7 @@
       hideProgressBanner();
       progressBannerEl = document.createElement('div');
       progressBannerEl.textContent = msg;
-      progressBannerEl.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#0b7dda;color:#fff;padding:10px 16px;border-radius:6px;font:13px sans-serif;z-index:2147483647;box-shadow:0 4px 12px rgba(0,0,0,.2)';
+      progressBannerEl.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#0a2c39,#06202B);color:#7AE2CF;border:1px solid rgba(122,226,207,.5);padding:10px 18px;border-radius:999px;font:600 13px "Segoe UI",system-ui,sans-serif;z-index:2147483647;box-shadow:0 8px 24px rgba(0,0,0,.45),0 0 12px rgba(122,226,207,.15)';
       document.body.appendChild(progressBannerEl);
     }
     function hideProgressBanner() {
@@ -844,7 +844,7 @@
     function showSuccessBanner(msg) {
       const b = document.createElement('div');
       b.textContent = msg;
-      b.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#27ae60;color:#fff;padding:10px 16px;border-radius:6px;font:14px sans-serif;z-index:2147483647;box-shadow:0 4px 12px rgba(0,0,0,.2)';
+      b.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#8fefdd,#7AE2CF);color:#06202B;padding:10px 18px;border-radius:999px;font:600 14px "Segoe UI",system-ui,sans-serif;z-index:2147483647;box-shadow:0 8px 24px rgba(0,0,0,.35),0 0 14px rgba(122,226,207,.35)';
       document.body.appendChild(b);
       setTimeout(() => b.remove(), 6000);
     }
@@ -3029,22 +3029,51 @@
       panelEl.innerHTML = `
         <style>
           /* Palette: #FDEB9E (yellow) #7AE2CF (mint) #077A7D (teal) #06202B (navy) */
-          #paycom-bot-panel{position:fixed;bottom:20px;right:20px;z-index:2147483647;background:#06202B;border:2px solid #077A7D;border-radius:10px;padding:12px;font:13px sans-serif;box-shadow:0 6px 22px rgba(0,0,0,.45);width:240px;color:#7AE2CF}
-          #paycom-bot-panel.minimized{width:auto;padding:6px 10px}
-          #paycom-bot-panel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:move;user-select:none}
-          #paycom-bot-panel h4{margin:0;color:#FDEB9E;font-size:14px;white-space:nowrap}
-          #paycom-bot-panel .status{margin:6px 0;color:#7AE2CF;font-size:12px}
-          #paycom-bot-panel .status span{color:#FDEB9E}
-          #paycom-bot-panel button{display:block;width:100%;margin-top:6px;padding:7px 10px;border:0;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer;background:#077A7D;color:#FDEB9E}
-          #paycom-bot-panel button:hover{filter:brightness(1.12)}
-          #paycom-bot-panel .min-btn{display:inline-block;width:24px;height:24px;margin:0;padding:0;background:#077A7D;color:#FDEB9E;border:1px solid #7AE2CF;border-radius:4px;font-size:16px;font-weight:bold;line-height:1;cursor:pointer;flex:none}
-          #paycom-bot-panel .start{background:#077A7D;color:#FDEB9E}
-          #paycom-bot-panel .start-pp{background:#7AE2CF;color:#06202B}
-          #paycom-bot-panel .start-sd{background:#FDEB9E;color:#06202B}
-          #paycom-bot-panel .start-tp{background:#077A7D;color:#7AE2CF}
-          #paycom-bot-panel .start-docs{background:#7AE2CF;color:#06202B}
-          #paycom-bot-panel .stop{background:transparent;color:#FDEB9E;border:1px solid #FDEB9E}
-          #paycom-bot-panel .inspect-html{background:transparent;color:#7AE2CF;border:1px dashed #7AE2CF}
+          #paycom-bot-panel{position:fixed;bottom:20px;right:20px;z-index:2147483647;width:268px;padding:0;color:#7AE2CF;
+            font:13px/1.45 'Segoe UI',system-ui,sans-serif;
+            background:linear-gradient(160deg,#0a2c39 0%,#06202B 55%,#04161f 100%);
+            border:1px solid rgba(122,226,207,.35);border-radius:16px;overflow:hidden;
+            box-shadow:0 14px 40px rgba(0,0,0,.55),0 0 0 1px rgba(7,122,125,.25),inset 0 1px 0 rgba(122,226,207,.12)}
+          #paycom-bot-panel.minimized{width:auto}
+          #paycom-bot-panel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:move;user-select:none;
+            padding:12px 14px;background:linear-gradient(135deg,#077A7D 0%,#045b5e 100%);
+            border-bottom:1px solid rgba(122,226,207,.25)}
+          #paycom-bot-panel.minimized .hdr{padding:8px 12px;border-bottom:0}
+          #paycom-bot-panel h4{margin:0;color:#FDEB9E;font-size:14px;font-weight:700;letter-spacing:.4px;white-space:nowrap;
+            display:flex;align-items:center;gap:8px}
+          #paycom-bot-panel h4::before{content:'';flex:none;width:9px;height:9px;border-radius:50%;
+            background:#FDEB9E;box-shadow:0 0 8px rgba(253,235,158,.9)}
+          #paycom-bot-panel.running h4::before{background:#7AE2CF;box-shadow:0 0 10px #7AE2CF;
+            animation:pcb-pulse 1.1s ease-in-out infinite}
+          @keyframes pcb-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.5}}
+          #paycom-bot-panel .body{padding:12px 14px 14px}
+          #paycom-bot-panel .status{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 6px;
+            color:rgba(122,226,207,.7);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.6px}
+          #paycom-bot-panel .status span{color:#FDEB9E;font-weight:600;font-size:11px;text-transform:none;letter-spacing:0;
+            background:rgba(253,235,158,.07);border:1px solid rgba(253,235,158,.22);padding:2px 9px;border-radius:999px;
+            max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:all .25s ease}
+          #paycom-bot-panel .status span.on{color:#7AE2CF;background:rgba(122,226,207,.12);border-color:rgba(122,226,207,.5);
+            box-shadow:0 0 8px rgba(122,226,207,.25)}
+          #paycom-bot-panel button{display:block;width:100%;margin-top:8px;padding:9px 12px;border:0;border-radius:9px;
+            font-size:13px;font-weight:600;letter-spacing:.2px;cursor:pointer;
+            transition:transform .12s ease,box-shadow .12s ease,filter .12s ease}
+          #paycom-bot-panel button:hover{transform:translateY(-1px);filter:brightness(1.1);box-shadow:0 7px 16px rgba(0,0,0,.4)}
+          #paycom-bot-panel button:active{transform:translateY(0) scale(.98)}
+          #paycom-bot-panel .min-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
+            margin:0;padding:0;flex:none;background:rgba(6,32,43,.4);color:#FDEB9E;
+            border:1px solid rgba(253,235,158,.45);border-radius:7px;font-size:15px;font-weight:700;line-height:1;cursor:pointer}
+          #paycom-bot-panel .min-btn:hover{transform:none;box-shadow:none;background:rgba(6,32,43,.7)}
+          #paycom-bot-panel .start{background:linear-gradient(135deg,#0a9396 0%,#077A7D 100%);color:#FDEB9E;margin-top:12px}
+          #paycom-bot-panel .start-pp{background:linear-gradient(135deg,#8fefdd 0%,#7AE2CF 100%);color:#06202B}
+          #paycom-bot-panel .start-sd{background:linear-gradient(135deg,#FDEB9E 0%,#f3d97e 100%);color:#06202B}
+          #paycom-bot-panel .start-tp{background:linear-gradient(135deg,#077A7D 0%,#055254 100%);color:#7AE2CF}
+          #paycom-bot-panel .start-docs{background:linear-gradient(135deg,#7AE2CF 0%,#4ecdb4 100%);color:#06202B}
+          #paycom-bot-panel .inspect-html{background:transparent;color:#7AE2CF;border:1px dashed rgba(122,226,207,.6)}
+          #paycom-bot-panel .inspect-html:hover{background:rgba(122,226,207,.08)}
+          #paycom-bot-panel .stop{background:transparent;color:#FDEB9E;border:1px solid rgba(253,235,158,.55)}
+          #paycom-bot-panel .stop:hover{background:rgba(253,235,158,.1)}
+          #paycom-bot-panel .doc-dl-section{border-top:1px dashed rgba(122,226,207,.3)!important;margin-top:12px!important;padding-top:8px!important}
+          #paycom-bot-panel .doc-dl-section .status{display:block;text-transform:none;letter-spacing:0;font-size:12px;color:#7AE2CF;font-weight:500}
           #paycom-bot-panel.minimized .body{display:none}
         </style>
         <div class="hdr">
@@ -3052,19 +3081,19 @@
           <button class="min-btn" title="Minimize panel">–</button>
         </div>
         <div class="body">
-          <div class="status">URL: <span class="url"></span></div>
-          <div class="status">Census: <span class="state"></span></div>
-          <div class="status">Prior Payroll: <span class="pp-state"></span></div>
-          <div class="status">Sched Deductions: <span class="sd-state"></span></div>
-          <div class="status">Tax Profile: <span class="tp-state"></span></div>
-          <button class="start">Start Census Report</button>
-          <button class="start-pp">Run Prior Payroll</button>
-          <button class="start-sd">Run Scheduled Deductions</button>
-          <button class="start-tp">Run Tax Profile Report</button>
-          <button class="start-docs">Download All Documents</button>
-          <button class="inspect-html" title="Click this, then click any element on the page — its HTML is copied to the clipboard">Inspect Element HTML</button>
-          <button class="stop">Stop / reset</button>
-          <div class="doc-dl-section" style="display:none;border-top:1px solid #077A7D;margin-top:10px;padding-top:4px"></div>
+          <div class="status">URL <span class="url"></span></div>
+          <div class="status">Census <span class="state"></span></div>
+          <div class="status">Prior Payroll <span class="pp-state"></span></div>
+          <div class="status">Sched Deductions <span class="sd-state"></span></div>
+          <div class="status">Tax Profile <span class="tp-state"></span></div>
+          <button class="start">📊 Start Census Report</button>
+          <button class="start-pp">🗓️ Run Prior Payroll</button>
+          <button class="start-sd">💸 Run Scheduled Deductions</button>
+          <button class="start-tp">🧾 Run Tax Profile Report</button>
+          <button class="start-docs">📥 Download All Documents</button>
+          <button class="inspect-html" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
+          <button class="stop">⏹ Stop / reset</button>
+          <div class="doc-dl-section" style="display:none"></div>
         </div>
       `;
       document.body.appendChild(panelEl);
@@ -3196,14 +3225,25 @@
 
     function refreshPanel() {
       if (!panelEl) return;
-      panelEl.querySelector('.url').textContent = location.pathname;
-      panelEl.querySelector('.state').textContent = getState();
-      const ppEl = panelEl.querySelector('.pp-state');
-      if (ppEl) ppEl.textContent = getPpState();
-      const sdEl = panelEl.querySelector('.sd-state');
-      if (sdEl) sdEl.textContent = getSdState();
-      const tpEl = panelEl.querySelector('.tp-state');
-      if (tpEl) tpEl.textContent = getTpState();
+      const urlEl = panelEl.querySelector('.url');
+      if (urlEl) {
+        urlEl.textContent = location.pathname;
+        urlEl.title = location.pathname; // full path on hover (chip ellipsizes)
+      }
+      // State chips light up (mint glow) whenever a mode is not IDLE.
+      const setChip = (sel, val) => {
+        const el = panelEl.querySelector(sel);
+        if (!el) return;
+        el.textContent = val;
+        el.classList.toggle('on', val !== STATES.IDLE);
+      };
+      setChip('.state', getState());
+      setChip('.pp-state', getPpState());
+      setChip('.sd-state', getSdState());
+      setChip('.tp-state', getTpState());
+      // Pulsing header dot while anything is running.
+      panelEl.classList.toggle('running',
+        isRunning() || isPpRunning() || isSdRunning() || isTpRunning());
     }
 
     function init() {
