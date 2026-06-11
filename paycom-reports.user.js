@@ -1,8 +1,8 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.7.10
-  // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15)
+  // @version      0.8.0
+  // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
   // @grant        none
@@ -2273,6 +2273,389 @@
       location.href = CONFIG.arwSavedReportsUrl;
     }
 
+    // ───────────────── Documents: Download All (fetch + blob) ─────────────────
+    // Self-contained module: its own state key (`paycom_dl_state`) and its own
+    // helpers (dlSleep, loadDlState, …) so nothing collides with the census /
+    // prior-payroll state machine. Bulk-downloads every document on the Doc
+    // Dashboard by fetch()→Blob→save (no browser-queue drops), paginating the
+    // DataTables grid. Mounted into the panel only on /Doc/Dashboard.
+    function setupDocDownloader(container) {
+      if (!container || container.dataset.docDlMounted) return;
+      container.dataset.docDlMounted = '1';
+
+      const CFG = {
+        DELAY_BETWEEN_ROWS: 100,   // short — no queue pressure with fetch+blob
+        POLL_MS: 150,
+        MAX_PAGE_WAIT: 60000,
+        FETCH_TIMEOUT: 15000,      // 15s per file download
+        MAX_RETRIES: 2,            // retry failed fetches
+        STATE_KEY: 'paycom_dl_state',
+      };
+
+      const dlSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      let paused = false;
+      async function waitWhilePaused() { while (paused) await dlSleep(200); }
+
+      // ── state (persisted to localStorage after every row) ──
+      function loadDlState() {
+        try {
+          const raw = localStorage.getItem(CFG.STATE_KEY);
+          if (!raw) return null;
+          const s = JSON.parse(raw);
+          s.downloadedDocIds = new Set(s.downloadedDocIds || []);
+          return s;
+        } catch (_) { return null; }
+      }
+      function saveDlState(s) {
+        try {
+          localStorage.setItem(CFG.STATE_KEY, JSON.stringify({
+            ...s, downloadedDocIds: [...s.downloadedDocIds],
+          }));
+        } catch (e) { console.warn('[DL] saveState failed', e); }
+      }
+      function clearDlState() { localStorage.removeItem(CFG.STATE_KEY); }
+      function freshDlState() {
+        return {
+          currentPage: getCurrentPage(),
+          totalAttempted: 0,
+          downloadedDocIds: new Set(),
+          skippedDocs: [],
+          isComplete: false,
+        };
+      }
+
+      // ── DOM helpers ──
+      const getNextBtn = () => document.getElementById('ee-doc-table_next');
+      const isNextDisabled = () => { const b = getNextBtn(); return !b || b.classList.contains('disabled'); };
+      const getInfoText = () => { const e = document.getElementById('ee-doc-table_info'); return e ? e.textContent.trim() : ''; };
+      const getCurrentPage = () => {
+        const el = document.querySelector('#ee-doc-table_paginate .paginate_button.current');
+        return el ? parseInt(el.textContent, 10) : 1;
+      };
+      function escHtml(s) {
+        return String(s ?? '')
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      }
+      async function waitForPageChange(prev) {
+        const end = Date.now() + CFG.MAX_PAGE_WAIT;
+        while (Date.now() < end) {
+          await dlSleep(CFG.POLL_MS);
+          const cur = getInfoText();
+          if (cur && cur !== prev) return true;
+        }
+        return false;
+      }
+
+      // ── row info extraction ──
+      function getRowInfo(row) {
+        const empLink = row.querySelector('td:nth-child(2) a');
+        const empFull = empLink ? empLink.textContent.trim() : 'Unknown';
+        const codeM = empFull.match(/\(([^)]+)\)\s*$/);
+        const empCode = codeM ? codeM[1] : '';
+
+        const docLink = row.querySelector('td:nth-child(5) a[target="_self"]');
+        const docName = docLink ? docLink.textContent.trim() : 'Unknown Document';
+
+        const ftCell = row.querySelector('td:nth-child(6)');
+        const fileTemplate = ftCell ? ftCell.textContent.trim() : '';
+
+        let docId = null;
+        const dlHidden = row.querySelector('a.ddbMenuItemLink[href*="downloadfile=1"]');
+        if (dlHidden) { const m = dlHidden.href.match(/docid=(\d+)/); if (m) docId = m[1]; }
+        if (!docId) {
+          const cb = row.querySelector('input[type="checkbox"]');
+          if (cb) { const m = cb.value.match(/\[(\d+)\]$/); if (m) docId = m[1]; }
+        }
+
+        const dlUrl = dlHidden ? dlHidden.href : null;
+
+        return {
+          empName: empFull,
+          empCode,
+          docName,
+          fileTemplate,
+          docId: docId || `noid-${Math.random().toString(36).slice(2)}`,
+          dlUrl,
+        };
+      }
+
+      // ── core: fetch() file → Blob → save to disk ──
+      function extractFilename(response, fallback) {
+        const cd = response.headers.get('Content-Disposition');
+        if (cd) {
+          const m = cd.match(/filename\*?=(?:UTF-8''|"?)([^";]+)"?/i);
+          if (m) return decodeURIComponent(m[1].trim());
+        }
+        return fallback;
+      }
+      async function fetchAndSave(url, fallbackFilename) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), CFG.FETCH_TIMEOUT);
+        try {
+          const res = await fetch(url, { credentials: 'include', signal: ctrl.signal });
+          clearTimeout(timer);
+          if (!res.ok) return { ok: false, reason: `HTTP ${res.status} ${res.statusText}` };
+          const blob = await res.blob();
+          if (blob.size === 0) return { ok: false, reason: 'Server returned empty file (0 bytes)' };
+          const filename = extractFilename(res, fallbackFilename);
+          const blobUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = filename;
+          a.style.display = 'none';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+          return { ok: true, filename, size: blob.size, type: blob.type || res.headers.get('Content-Type') || 'unknown' };
+        } catch (e) {
+          clearTimeout(timer);
+          if (e.name === 'AbortError') return { ok: false, reason: `Timeout after ${CFG.FETCH_TIMEOUT / 1000}s` };
+          return { ok: false, reason: `Network error: ${e.message}` };
+        }
+      }
+
+      // ── process one table page ──
+      async function processPage(state, statusEl) {
+        const rows = Array.from(document.querySelectorAll('#ee-doc-table tbody tr[role="row"]'));
+        console.log(`[DL] Page ${state.currentPage} — ${rows.length} rows`);
+
+        for (let i = 0; i < rows.length; i++) {
+          const info = getRowInfo(rows[i]);
+          await waitWhilePaused();
+
+          statusEl.textContent =
+            `Docs: p${state.currentPage} row ${i + 1}/${rows.length}` +
+            ` | ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`;
+
+          if (state.downloadedDocIds.has(info.docId)) {
+            console.log(`[DL] Skip (already done): ${info.empName}`);
+            continue;
+          }
+
+          state.totalAttempted++;
+
+          if (!info.dlUrl) {
+            state.skippedDocs.push({ ...info, reason: 'No download URL found in row DOM', page: state.currentPage });
+            saveDlState(state);
+            continue;
+          }
+
+          const fallbackName = info.fileTemplate && info.fileTemplate !== 'N/A'
+            ? `${info.empCode}_${info.fileTemplate}`
+            : `${info.empCode}_${info.docName.replace(/\s+/g, '_')}.pdf`;
+
+          let result = null;
+          for (let attempt = 0; attempt <= CFG.MAX_RETRIES; attempt++) {
+            if (attempt > 0) {
+              console.log(`[DL] Retry ${attempt}/${CFG.MAX_RETRIES} for ${info.empName}`);
+              statusEl.textContent = `Docs: p${state.currentPage} row ${i + 1}/${rows.length} | RETRY ${attempt}`;
+              await dlSleep(2000 * attempt);
+            }
+            result = await fetchAndSave(info.dlUrl, fallbackName);
+            if (result.ok) break;
+          }
+
+          if (result.ok) {
+            state.downloadedDocIds.add(info.docId);
+            saveDlState(state);
+            console.log(`[DL] ✓ ${info.empName} → ${result.filename} (${(result.size / 1024).toFixed(0)} KB, ${result.type})`);
+          } else {
+            console.warn(`[DL] ✗ ${info.empName}: ${result.reason}`);
+            state.skippedDocs.push({ ...info, reason: result.reason, page: state.currentPage });
+            saveDlState(state);
+          }
+
+          await dlSleep(CFG.DELAY_BETWEEN_ROWS);
+        }
+      }
+
+      // ── pagination ──
+      async function gotoPage(target) {
+        if (getCurrentPage() === target) return;
+        const goInput = document.querySelector('#ee-doc-table_goToPage input[type="number"]');
+        if (goInput) {
+          const prev = getInfoText();
+          goInput.focus();
+          goInput.value = String(target);
+          ['input', 'change'].forEach(t => goInput.dispatchEvent(new Event(t, { bubbles: true })));
+          ['keydown', 'keypress', 'keyup'].forEach(t =>
+            goInput.dispatchEvent(new KeyboardEvent(t, { key: 'Enter', keyCode: 13, which: 13, charCode: 13, bubbles: true })));
+          const changed = await waitForPageChange(prev);
+          if (changed && getCurrentPage() === target) return;
+        }
+        while (getCurrentPage() < target && !isNextDisabled()) {
+          const prev = getInfoText();
+          getNextBtn().click();
+          await waitForPageChange(prev);
+        }
+      }
+
+      // ── orchestrator ──
+      async function run(state, statusEl) {
+        if (state.currentPage > 1) {
+          statusEl.textContent = `Navigating to page ${state.currentPage}…`;
+          await gotoPage(state.currentPage);
+          await dlSleep(800);
+        }
+
+        await processPage(state, statusEl);
+
+        await dlSleep(500);
+        while (!isNextDisabled()) {
+          const prevInfo = getInfoText();
+          getNextBtn().click();
+          const moved = await waitForPageChange(prevInfo);
+          if (!moved) {
+            console.warn('[DL] Pagination stuck — timed out waiting for page change. Stopping.');
+            break;
+          }
+          state.currentPage = getCurrentPage();
+          saveDlState(state);
+          await processPage(state, statusEl);
+          await dlSleep(500);
+        }
+        state.isComplete = true;
+        saveDlState(state);
+        showSummary(state);
+        clearDlState();
+        statusEl.textContent = `Docs done: ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`;
+      }
+
+      // ── summary overlay ──
+      function showSummary(state) {
+        const dl = state.downloadedDocIds.size;
+        const sk = state.skippedDocs.length;
+        const tot = state.totalAttempted;
+
+        console.log(`[DL] ══ COMPLETE ══  attempted:${tot}  saved:${dl}  skipped:${sk}`);
+        if (sk) {
+          console.group('[DL] Skipped:');
+          state.skippedDocs.forEach((d, i) =>
+            console.warn(`  ${i + 1}. [p${d.page}] ${d.empName} – "${d.docName}"\n     ↳ ${d.reason}`));
+          console.groupEnd();
+        }
+
+        document.getElementById('paycom_dl_summary')?.remove();
+
+        const ov = document.createElement('div');
+        ov.id = 'paycom_dl_summary';
+        Object.assign(ov.style, {
+          position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
+          background: '#fff', border: '2px solid #0b7dda', borderRadius: '12px', padding: '24px 28px',
+          zIndex: '9999999', maxWidth: '580px', width: '92%', maxHeight: '80vh', overflowY: 'auto',
+          boxShadow: '0 8px 32px rgba(0,0,0,.45)', fontFamily: 'system-ui,sans-serif', fontSize: '14px', lineHeight: '1.6',
+        });
+        ov.innerHTML = `
+          <h3 style="margin:0 0 16px;color:#0b7dda;font-size:18px">Download Summary</h3>
+          <table style="width:100%;border-collapse:collapse;margin-bottom:16px;font-size:14px">
+            <tr style="border-bottom:1px solid #eee"><td style="padding:6px 0;color:#555">Rows attempted</td><td style="padding:6px 0;font-weight:700">${tot}</td></tr>
+            <tr style="border-bottom:1px solid #eee"><td style="padding:6px 0;color:#555">Files fetched + saved</td><td style="padding:6px 0;font-weight:700;color:#27ae60">${dl}</td></tr>
+            <tr><td style="padding:6px 0;color:#555">Skipped / Failed</td><td style="padding:6px 0;font-weight:700;color:#e74c3c">${sk}</td></tr>
+          </table>
+          <p style="font-size:11px;color:#999;margin:0 0 14px">Each file was fully downloaded into memory via fetch() and verified (status + size) before being saved — no browser queue drops possible.</p>
+        `;
+
+        if (sk > 0) {
+          const h = document.createElement('p');
+          h.innerHTML = '<strong>Skipped / Failed Documents:</strong>';
+          h.style.marginBottom = '8px';
+          ov.appendChild(h);
+          const ul = document.createElement('ul');
+          ul.style.cssText = 'margin:0 0 16px;padding-left:20px;';
+          state.skippedDocs.forEach(d => {
+            const li = document.createElement('li');
+            li.style.marginBottom = '10px';
+            li.innerHTML =
+              `<strong>${escHtml(d.empName)}</strong> — "<span style="color:#333">${escHtml(d.docName)}</span>"` +
+              ` <span style="color:#999;font-size:12px">(page ${d.page})</span><br>` +
+              `<span style="color:#c0392b;font-size:12px">Reason: ${escHtml(d.reason)}</span>`;
+            ul.appendChild(li);
+          });
+          ov.appendChild(ul);
+        }
+
+        const close = document.createElement('button');
+        close.textContent = 'Close';
+        Object.assign(close.style, {
+          padding: '9px 24px', background: '#0b7dda', color: '#fff', border: '0',
+          borderRadius: '7px', cursor: 'pointer', fontWeight: '600', fontSize: '14px',
+        });
+        close.onclick = () => ov.remove();
+        ov.appendChild(close);
+        document.body.appendChild(ov);
+      }
+
+      // ── UI (mounted into the Paycom Bot panel) ──
+      const statusEl = document.createElement('div');
+      statusEl.className = 'status';
+      statusEl.textContent = 'Documents: idle';
+
+      const mkBtn = (text, bg) => {
+        const b = document.createElement('button');
+        b.textContent = text;
+        b.style.background = bg;
+        b.style.color = '#fff';
+        return b;
+      };
+      const startBtn = mkBtn('Download All Documents', '#0b7dda');
+      const resumeBtn = mkBtn('', '#e67e22'); resumeBtn.style.display = 'none';
+      const pauseBtn = mkBtn('⏸  Pause', '#7f8c8d'); pauseBtn.style.display = 'none';
+
+      container.appendChild(statusEl);
+      container.appendChild(startBtn);
+      container.appendChild(resumeBtn);
+      container.appendChild(pauseBtn);
+
+      pauseBtn.addEventListener('click', () => {
+        paused = !paused;
+        pauseBtn.textContent = paused ? '▶  Resume' : '⏸  Pause';
+        pauseBtn.style.background = paused ? '#27ae60' : '#7f8c8d';
+      });
+
+      const saved = loadDlState();
+      if (saved && !saved.isComplete) {
+        resumeBtn.textContent = `Resume from page ${saved.currentPage} (✓${saved.downloadedDocIds.size} ✗${saved.skippedDocs.length})`;
+        resumeBtn.style.display = 'block';
+      }
+
+      const runWith = async (state, activeBtn, bg) => {
+        if (startBtn.disabled) return;
+        [startBtn, resumeBtn].forEach(b => { b.disabled = true; });
+        activeBtn.style.background = '#777';
+        paused = false;
+        pauseBtn.textContent = '⏸  Pause';
+        pauseBtn.style.background = '#7f8c8d';
+        pauseBtn.style.display = 'block';
+        try {
+          await run(state, statusEl);
+        } catch (e) {
+          console.error('[DL] Fatal:', e);
+          alert('Document download error: ' + (e?.message || String(e)));
+        } finally {
+          [startBtn, resumeBtn].forEach(b => { b.disabled = false; });
+          activeBtn.style.background = bg;
+          resumeBtn.style.display = 'none';
+          pauseBtn.style.display = 'none';
+          paused = false;
+        }
+      };
+
+      startBtn.addEventListener('click', () => {
+        clearDlState();
+        const state = freshDlState();
+        saveDlState(state);
+        runWith(state, startBtn, '#0b7dda');
+      });
+      resumeBtn.addEventListener('click', () => {
+        const state = loadDlState() || freshDlState();
+        runWith(state, resumeBtn, '#e67e22');
+      });
+
+      console.log('[Paycom DL] doc-downloader mounted on Doc Dashboard.');
+    }
+
     // ───────────────── Floating panel ─────────────────
 
     let panelEl;
@@ -2308,6 +2691,7 @@
           <button class="start-sd" style="background:#e67e22;color:#fff">Run Scheduled Deductions</button>
           <button class="start-tp" style="background:#6f42c1;color:#fff">Run Tax Profile Report</button>
           <button class="stop">Stop / reset</button>
+          <div class="doc-dl-section" style="display:none;border-top:1px solid #ddd;margin-top:10px;padding-top:4px"></div>
         </div>
       `;
       document.body.appendChild(panelEl);
@@ -2345,6 +2729,12 @@
       panelEl.querySelector('.min-btn').addEventListener('click', () => {
         setPanelMinimized(!panelEl.classList.contains('minimized'));
       });
+      // Mount the Documents downloader only on the Doc Dashboard page.
+      const docSection = panelEl.querySelector('.doc-dl-section');
+      if (docSection && /\/Doc\/Dashboard/i.test(location.href)) {
+        docSection.style.display = 'block';
+        setupDocDownloader(docSection);
+      }
       // Restore the minimize state chosen on a previous page load.
       setPanelMinimized(localStorage.getItem('paycomBot.panelMinimized') === '1');
       refreshPanel();
