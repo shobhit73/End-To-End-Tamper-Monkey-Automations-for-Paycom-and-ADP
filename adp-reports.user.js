@@ -1,13 +1,17 @@
 // ==UserScript==
-// @name         ADP Census + SIT/FIT + License/EC Report Automation
-// @namespace    https://workforcenow.adp.com/
-// @version      0.7.1
-// @description  Seven-button automation: Download All (runs everything), plus individual Census, SIT/FIT, License/EC, Payroll History (quarterly), Deduction, and Direct Deposit reports.
-// @match        https://workforcenow.adp.com/theme/admin.html*
-// @run-at       document-end
+// @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
+// @namespace    adp-doc-export-tools
+// @version      1.0.0
+// @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
+// @match        https://workforcenow.adp.com/*
+// @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
+// =====================================================================
+// MODULE 1 of 2 — Reports automation (Census / SIT-FIT / License-EC /
+// Payroll History / Deduction / Direct Deposit). Self-contained IIFE.
+// =====================================================================
 (function () {
   'use strict';
 
@@ -206,11 +210,11 @@
   // ───────────────── logging ─────────────────
 
   const LOG_LEVELS = {
-    info:    { color: '#444', prefix: 'INFO ' },
-    warn:    { color: '#b8860b', prefix: 'WARN ' },
-    error:   { color: '#c0392b', prefix: 'ERROR' },
-    success: { color: '#28a745', prefix: 'OK   ' },
-    debug:   { color: '#888', prefix: 'DEBUG' },
+    info: { color: '#a8c6ec', prefix: 'INFO ' },
+    warn: { color: '#ffc66d', prefix: 'WARN ' },
+    error: { color: '#ff8080', prefix: 'ERROR' },
+    success: { color: '#4ade80', prefix: 'OK   ' },
+    debug: { color: '#6b82a6', prefix: 'DEBUG' },
   };
 
   let logEl;
@@ -228,11 +232,11 @@
     console.log('%c[ADPBot]%c ' + ts + ' ' + LOG_LEVELS[level].prefix, 'color:#d40511;font-weight:bold', 'color:' + LOG_LEVELS[level].color, ...parts);
     appendLogLine(level, ts, text);
   }
-  const logInfo    = (...p) => log('info',    ...p);
-  const logWarn    = (...p) => log('warn',    ...p);
-  const logError   = (...p) => log('error',   ...p);
+  const logInfo = (...p) => log('info', ...p);
+  const logWarn = (...p) => log('warn', ...p);
+  const logError = (...p) => log('error', ...p);
   const logSuccess = (...p) => log('success', ...p);
-  const logDebug   = (...p) => log('debug',   ...p);
+  const logDebug = (...p) => log('debug', ...p);
 
   function appendLogLine(level, ts, text) {
     const entry = { level, ts, text };
@@ -240,7 +244,7 @@
     const line = document.createElement('div');
     line.style.cssText = 'color:' + LOG_LEVELS[level].color + ';white-space:pre-wrap;word-break:break-word;line-height:1.3;padding:1px 0;';
     const tsSpan = document.createElement('span');
-    tsSpan.style.cssText = 'color:#aaa;';
+    tsSpan.style.cssText = 'color:#52749e;';
     tsSpan.textContent = ts + ' ';
     const lvlSpan = document.createElement('span');
     lvlSpan.style.cssText = 'font-weight:bold;';
@@ -276,7 +280,7 @@
       try {
         const matches = node.querySelectorAll(selector);
         for (const m of matches) out.push(m);
-      } catch (_) {}
+      } catch (_) { }
       let all;
       try { all = node.querySelectorAll('*'); } catch (_) { all = []; }
       for (const el of all) {
@@ -338,22 +342,22 @@
     ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(ev => {
       try {
         el.dispatchEvent(new MouseEventCtor(ev, { bubbles: true, cancelable: true, view: ownerWin, button: 0, buttons: 1 }));
-      } catch (_) {}
+      } catch (_) { }
     });
     // Native click — single fire. Also follows hrefs on <a>.
-    try { el.click(); } catch (_) {}
+    try { el.click(); } catch (_) { }
     // Dojo dijit click event for legacy widgets.
     try {
       const Ev = ownerWin.Event || Event;
       el.dispatchEvent(new Ev('dijitclick', { bubbles: true, cancelable: true }));
-    } catch (_) {}
+    } catch (_) { }
   }
 
   function dblClickEl(el) {
     if (!el) return;
     try {
       el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1 }));
-    } catch (_) {}
+    } catch (_) { }
   }
 
   function normalize(s) {
@@ -367,7 +371,7 @@
     try {
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') return false;
-    } catch (_) {}
+    } catch (_) { }
     return true;
   }
 
@@ -746,7 +750,7 @@
         searchInput.dispatchEvent(new Event('input', { bubbles: true }));
         searchInput.dispatchEvent(new Event('change', { bubbles: true }));
       }
-    } catch (_) {}
+    } catch (_) { }
 
     // Also try setting via the Dojo widget API if available
     try {
@@ -771,13 +775,13 @@
     if (searchBtn) {
       logInfo('Found search button by ID, clicking');
       // Use el.click() directly — Dojo's attach-event responds to native click
-      try { searchBtn.click(); } catch (_) {}
+      try { searchBtn.click(); } catch (_) { }
       // Also dispatch dijitclick for good measure
       try {
         const ownerDoc = searchBtn.ownerDocument || document;
         const ownerWin = ownerDoc.defaultView || window;
         searchBtn.dispatchEvent(new (ownerWin.Event || Event)('dijitclick', { bubbles: true, cancelable: true }));
-      } catch (_) {}
+      } catch (_) { }
     } else {
       logWarn('Search button not found by ID — trying Enter key');
       searchInput.dispatchEvent(new KeyboardEvent('keydown', {
@@ -846,8 +850,8 @@
       for (const el of clickables) {
         const text = normalize(el.textContent || el.value);
         if (text.includes("what's displayed on the report") ||
-            text.includes("what\u2019s displayed on the report") ||
-            text === 'run as excel' || text === 'save my settings') {
+          text.includes("what’s displayed on the report") ||
+          text === 'run as excel' || text === 'save my settings') {
           logSuccess('Run Report page loaded');
           return true;
         }
@@ -867,7 +871,7 @@
       const clickables = deepQueryAll('a, button, [role="button"], [role="link"]').filter(visible);
       for (const el of clickables) {
         const text = (el.textContent || '').trim();
-        if (text.includes("What's Displayed on the Report") || text.includes("What\u2019s Displayed on the Report")) {
+        if (text.includes("What's Displayed on the Report") || text.includes("What’s Displayed on the Report")) {
           target = el;
           break;
         }
@@ -878,7 +882,7 @@
         const allEls = deepQueryAll('span, div, a, h3, h4, p').filter(visible);
         for (const el of allEls) {
           const text = (el.textContent || '').trim();
-          if (text.startsWith("What's Displayed") || text.startsWith("What\u2019s Displayed")) {
+          if (text.startsWith("What's Displayed") || text.startsWith("What’s Displayed")) {
             // Look for an SVG (pencil icon) inside or next to this element
             const parent = el.parentElement;
             if (parent) {
@@ -1065,7 +1069,7 @@
         searchInput.dispatchEvent(new Event('input', { bubbles: true }));
         searchInput.dispatchEvent(new Event('change', { bubbles: true }));
       }
-    } catch (_) {}
+    } catch (_) { }
 
     try {
       const ownerDoc = searchInput.ownerDocument || document;
@@ -1077,17 +1081,17 @@
           logInfo('Set value via Dojo widget API');
         }
       }
-    } catch (_) {}
+    } catch (_) { }
 
     await sleep(300);
 
     let searchBtn = deepQueryAll('#RevSearchInput_searchboxButton')[0];
     if (searchBtn) {
       logInfo('Clicking search button');
-      try { searchBtn.click(); } catch (_) {}
+      try { searchBtn.click(); } catch (_) { }
       try {
         searchBtn.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true }));
-      } catch (_) {}
+      } catch (_) { }
     }
 
     await sleep(3000);
@@ -2073,8 +2077,8 @@
           if (!visible(c)) continue;
           const aria = c.getAttribute('aria-label');
           if (aria === 'Tax ID (SSN)' ||
-              (c.parentElement && c.parentElement.parentElement &&
-               (c.parentElement.parentElement.textContent || '').includes('Tax ID (SSN)'))) {
+            (c.parentElement && c.parentElement.parentElement &&
+              (c.parentElement.parentElement.textContent || '').includes('Tax ID (SSN)'))) {
             actionBtn = c;
             break;
           }
@@ -2085,7 +2089,7 @@
     if (!actionBtn) { logError('SSN: field-actions trigger not found'); return false; }
 
     try { actionBtn.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }); }
-    catch (_) { try { actionBtn.scrollIntoView(); } catch (_) {} }
+    catch (_) { try { actionBtn.scrollIntoView(); } catch (_) { } }
     await sleep(150);
     clickEl(actionBtn);
 
@@ -2476,7 +2480,7 @@
     logInfo('Top-level iframes:', iframes.length);
     iframes.forEach((f, i) => {
       let ok = false;
-      try { ok = !!f.contentDocument; } catch (_) {}
+      try { ok = !!f.contentDocument; } catch (_) { }
       logDebug('iframe[' + i + ']: src=' + (f.src || '(none)') + ' sameOrigin=' + ok);
     });
 
@@ -2491,35 +2495,113 @@
 
   // ───────────────── panel ─────────────────
 
+  // Inject the panel stylesheet once — modern "AI assistant" look on the
+  // cobalt-blue palette: glassmorphism, glow, micro-animations.
+  function injectStyles() {
+    if (document.getElementById('adp-bot-style')) return;
+    const css = document.createElement('style');
+    css.id = 'adp-bot-style';
+    css.textContent = [
+      '#adp-bot-panel{position:fixed;bottom:24px;right:24px;z-index:2147483646;width:324px;',
+      " font:13px/1.45 'Segoe UI',system-ui,-apple-system,sans-serif;color:#dce9ff;",
+      ' background:linear-gradient(165deg,rgba(2,20,46,.97) 0%,rgba(0,36,86,.95) 55%,rgba(0,24,57,.97) 100%);',
+      ' border:1px solid rgba(90,159,255,.28);border-radius:18px;overflow:hidden;',
+      ' box-shadow:0 8px 40px rgba(0,12,30,.6),0 0 24px rgba(0,100,241,.18);backdrop-filter:blur(14px);}',
+      '#adp-bot-panel *{box-sizing:border-box;font-family:inherit;}',
+      '.adpbot-head{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:move;user-select:none;',
+      ' background:linear-gradient(90deg,rgba(0,71,171,.38),rgba(0,100,241,.10));border-bottom:1px solid rgba(90,159,255,.15);}',
+      '.adpbot-avatar{width:34px;height:34px;border-radius:11px;flex:0 0 34px;display:flex;align-items:center;justify-content:center;',
+      ' background:linear-gradient(135deg,#0064f1,#00a4cc);font-size:17px;color:#fff;',
+      ' box-shadow:0 0 14px rgba(0,100,241,.55);animation:adpbot-breathe 3.2s ease-in-out infinite;}',
+      '@keyframes adpbot-breathe{0%,100%{box-shadow:0 0 10px rgba(0,100,241,.45)}50%{box-shadow:0 0 22px rgba(0,164,204,.75)}}',
+      '.adpbot-titlebox{flex:1;min-width:0;}',
+      '.adpbot-title{margin:0;font-size:14px;font-weight:700;color:#fff;letter-spacing:.3px;}',
+      '.adpbot-sub{font-size:9.5px;color:#7db3ff;letter-spacing:1px;text-transform:uppercase;}',
+      '.adpbot-ver{font-size:9px;color:#8fb9ff;background:rgba(0,71,171,.35);padding:2px 7px;border-radius:999px;border:1px solid rgba(90,159,255,.22);}',
+      '.adpbot-chev{background:rgba(125,179,255,.1);border:1px solid rgba(125,179,255,.25);border-radius:8px;cursor:pointer;',
+      ' width:26px;height:26px;color:#a0c7ff;font-size:11px;transition:all .25s;display:flex;align-items:center;justify-content:center;}',
+      '.adpbot-chev:hover{background:rgba(125,179,255,.22);color:#fff;}',
+      '.adpbot-chev.min{transform:rotate(180deg);}',
+      '.adpbot-statuschip{display:flex;align-items:center;gap:8px;margin:10px 14px 8px;padding:7px 11px;border-radius:10px;',
+      ' background:rgba(0,71,171,.18);border:1px solid rgba(90,159,255,.14);font-size:11px;color:#a8cbff;min-height:30px;}',
+      '.adpbot-dot{width:8px;height:8px;border-radius:50%;background:#4ade80;flex:0 0 8px;',
+      ' box-shadow:0 0 8px rgba(74,222,128,.8);animation:adpbot-pulse 2s ease-in-out infinite;}',
+      '@keyframes adpbot-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.78)}}',
+      '#adp-bot-btnrow{display:grid;grid-template-columns:1fr;gap:7px;padding:2px 14px 6px;}',
+      '.adpbot-hero{position:relative;border:none;border-radius:12px;padding:13px 14px;cursor:pointer;',
+      ' background:linear-gradient(120deg,#0055ce,#0064f1 45%,#00a4cc);background-size:220% 100%;',
+      ' color:#fff;font-weight:700;font-size:13.5px;letter-spacing:.2px;',
+      ' box-shadow:0 4px 18px rgba(0,100,241,.4);transition:all .3s;}',
+      '.adpbot-hero:hover{background-position:95% 0;transform:translateY(-1px);box-shadow:0 6px 26px rgba(0,120,241,.6);}',
+      '.adpbot-hero:active{transform:translateY(0);}',
+      '.adpbot-item{display:flex;align-items:center;gap:10px;text-align:left;border:1px solid rgba(125,179,255,.16);',
+      ' border-radius:11px;padding:9px 12px;cursor:pointer;background:rgba(0,71,171,.22);color:#d6e6ff;',
+      ' font-weight:600;font-size:12.5px;transition:all .22s;}',
+      '.adpbot-item:hover{background:rgba(0,100,241,.38);border-color:rgba(125,179,255,.45);transform:translateX(3px);color:#fff;}',
+      '.adpbot-ico{width:26px;height:26px;border-radius:8px;flex:0 0 26px;display:flex;align-items:center;justify-content:center;',
+      ' background:rgba(0,100,241,.28);font-size:13px;}',
+      '.adpbot-doc{border-color:rgba(0,164,204,.45);background:rgba(0,130,210,.26);}',
+      '.adpbot-doc:hover{background:rgba(0,164,204,.42);border-color:rgba(126,231,255,.6);}',
+      '.adpbot-util{display:grid;grid-template-columns:1fr 1fr;gap:7px;}',
+      '.adpbot-ghost{border:1px solid rgba(125,179,255,.3);background:transparent;border-radius:10px;padding:8px;color:#8fb9ff;',
+      ' cursor:pointer;font-weight:600;font-size:11.5px;transition:all .22s;}',
+      '.adpbot-ghost.stop:hover{border-color:rgba(255,120,120,.55);color:#ff9d9d;background:rgba(255,99,99,.1);}',
+      '.adpbot-ghost.diag:hover{border-color:rgba(0,164,204,.55);color:#7ee7ff;background:rgba(0,164,204,.1);}',
+      '.adpbot-logrow{display:flex;align-items:center;justify-content:space-between;margin:4px 14px 4px;}',
+      '.adpbot-loglabel{font-size:9.5px;color:#6f9fe0;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;}',
+      '.adpbot-mini{padding:3px 9px;border:1px solid rgba(125,179,255,.25);background:rgba(0,71,171,.25);color:#bcd6ff;',
+      ' border-radius:7px;cursor:pointer;font-size:10px;transition:all .2s;margin-left:4px;}',
+      '.adpbot-mini:hover{background:rgba(0,100,241,.45);color:#fff;}',
+      "#adp-bot-log{height:130px;overflow-y:auto;margin:0 14px 14px;background:rgba(0,8,22,.55);",
+      " border:1px solid rgba(90,159,255,.14);border-radius:11px;padding:8px 10px;font:10.5px/1.45 'Cascadia Code',Consolas,monospace;}",
+      '#adp-bot-log::-webkit-scrollbar,#adp-bot-content::-webkit-scrollbar{width:6px;}',
+      '#adp-bot-log::-webkit-scrollbar-thumb,#adp-bot-content::-webkit-scrollbar-thumb{background:rgba(90,159,255,.35);border-radius:3px;}',
+      '#adp-bot-log::-webkit-scrollbar-track,#adp-bot-content::-webkit-scrollbar-track{background:transparent;}',
+      '#adp-bot-content{max-height:calc(100vh - 110px);overflow-y:auto;overflow-x:hidden;}',
+    ].join('\n');
+    document.head.appendChild(css);
+  }
+
   function buildPanel() {
     if (document.getElementById('adp-bot-panel')) return;
+    injectStyles();
 
     const wrapper = document.createElement('div');
     wrapper.id = 'adp-bot-panel';
-    wrapper.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:2147483646;background:#fff;border:2px solid #d40511;padding:10px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font:12px sans-serif;width:340px;';
 
+    // ── Header: glowing avatar + title/subtitle + version + collapse ──
     const titleRow = document.createElement('div');
-    titleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;cursor:pointer;';
-    const title = document.createElement('h4');
-    title.textContent = 'ADP Bot';
-    title.style.cssText = 'margin:0;color:#d40511;font-size:14px;';
-    titleRow.appendChild(title);
+    titleRow.className = 'adpbot-head';
 
-    const titleRight = document.createElement('div');
-    titleRight.style.cssText = 'display:flex;align-items:center;gap:8px;';
+    const avatar = document.createElement('div');
+    avatar.className = 'adpbot-avatar';
+    avatar.textContent = '🤖';
+    titleRow.appendChild(avatar);
+
+    const titleBox = document.createElement('div');
+    titleBox.className = 'adpbot-titlebox';
+    const title = document.createElement('div');
+    title.className = 'adpbot-title';
+    title.textContent = 'ADP Bot';
+    const sub = document.createElement('div');
+    sub.className = 'adpbot-sub';
+    sub.textContent = 'AI Automation Assistant';
+    titleBox.appendChild(title);
+    titleBox.appendChild(sub);
+    titleRow.appendChild(titleBox);
+
     const versionTag = document.createElement('span');
-    versionTag.textContent = 'v0.7.0';
-    versionTag.style.cssText = 'color:#888;font-size:10px;';
-    titleRight.appendChild(versionTag);
+    versionTag.className = 'adpbot-ver';
+    versionTag.textContent = 'v1.0';
+    titleRow.appendChild(versionTag);
 
     const toggleBtn = document.createElement('button');
-    toggleBtn.textContent = '▼';
-    toggleBtn.style.cssText = 'background:none;border:1px solid #ccc;border-radius:3px;cursor:pointer;font-size:12px;padding:1px 6px;color:#666;';
-    titleRight.appendChild(toggleBtn);
-    titleRow.appendChild(titleRight);
+    toggleBtn.className = 'adpbot-chev';
+    toggleBtn.textContent = '▾';
+    titleRow.appendChild(toggleBtn);
     wrapper.appendChild(titleRow);
 
-    // Content wrapper — everything below the title goes here so we can toggle it
+    // Content wrapper — everything below the header goes here so we can toggle it
     const contentDiv = document.createElement('div');
     contentDiv.id = 'adp-bot-content';
 
@@ -2527,20 +2609,76 @@
     function togglePanel() {
       minimized = !minimized;
       contentDiv.style.display = minimized ? 'none' : 'block';
-      toggleBtn.textContent = minimized ? '▲' : '▼';
-      wrapper.style.width = minimized ? 'auto' : '340px';
-      wrapper.style.padding = minimized ? '6px 10px' : '10px';
+      toggleBtn.classList.toggle('min', minimized);
+      wrapper.style.width = minimized ? 'auto' : '324px';
     }
     toggleBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePanel(); });
-    titleRow.addEventListener('click', togglePanel);
 
-    const status = document.createElement('div');
-    status.style.cssText = 'font-size:11px;color:#555;margin-bottom:6px;min-height:14px;';
-    status.textContent = 'Idle';
-    contentDiv.appendChild(status);
+    // ---- Drag the panel by its title bar (position persists across reloads) ----
+    let dragMoved = false;
+    (function makeDraggable() {
+      let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+      try {
+        const p = JSON.parse(localStorage.getItem('adpBot.pos') || 'null');
+        if (p && typeof p.left === 'number') {
+          wrapper.style.left = p.left + 'px';
+          wrapper.style.top = p.top + 'px';
+          wrapper.style.right = 'auto';
+          wrapper.style.bottom = 'auto';
+        }
+      } catch (_) { }
+
+      titleRow.addEventListener('mousedown', (e) => {
+        if (e.target === toggleBtn) return; // don't drag when hitting the collapse button
+        dragging = true; dragMoved = false;
+        const r = wrapper.getBoundingClientRect();
+        wrapper.style.left = r.left + 'px';
+        wrapper.style.top = r.top + 'px';
+        wrapper.style.right = 'auto';
+        wrapper.style.bottom = 'auto';
+        sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - sx, dy = e.clientY - sy;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved = true;
+        let nl = Math.max(0, Math.min(ox + dx, window.innerWidth - wrapper.offsetWidth));
+        let nt = Math.max(0, Math.min(oy + dy, window.innerHeight - wrapper.offsetHeight));
+        wrapper.style.left = nl + 'px';
+        wrapper.style.top = nt + 'px';
+      });
+      document.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        if (dragMoved) {
+          const r = wrapper.getBoundingClientRect();
+          try { localStorage.setItem('adpBot.pos', JSON.stringify({ left: r.left, top: r.top })); } catch (_) { }
+        }
+      });
+    })();
+
+    // A real click on the title (not a drag) toggles collapse.
+    titleRow.addEventListener('click', () => {
+      if (dragMoved) { dragMoved = false; return; }
+      togglePanel();
+    });
+
+    // Status chip: pulsing dot + live status text (the dot sits OUTSIDE the
+    // #adp-bot-status span, which gets textContent overwritten by both modules).
+    const statusChip = document.createElement('div');
+    statusChip.className = 'adpbot-statuschip';
+    const statusDot = document.createElement('span');
+    statusDot.className = 'adpbot-dot';
+    statusChip.appendChild(statusDot);
+    const status = document.createElement('span');
+    status.id = 'adp-bot-status';
+    status.textContent = 'Idle — ready to automate';
+    statusChip.appendChild(status);
+    contentDiv.appendChild(statusChip);
 
     const btnRow = document.createElement('div');
-    btnRow.style.cssText = 'display:grid;grid-template-columns:1fr;gap:4px;margin-bottom:6px;';
+    btnRow.id = 'adp-bot-btnrow';
 
     let running = false;
     function withRunGuard(fn) {
@@ -2564,55 +2702,43 @@
       };
     }
 
+    // Hero action: runs everything.
     const downloadAllBtn = document.createElement('button');
-    downloadAllBtn.textContent = '⬇ Download All Reports';
-    downloadAllBtn.style.cssText = 'padding:12px;border:none;border-radius:4px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;font-weight:bold;cursor:pointer;font-size:14px;';
+    downloadAllBtn.className = 'adpbot-hero';
+    downloadAllBtn.textContent = '⚡ Download All Reports';
     downloadAllBtn.addEventListener('click', withRunGuard(downloadAll));
     btnRow.appendChild(downloadAllBtn);
 
-    const censusBtn = document.createElement('button');
-    censusBtn.textContent = 'Download Census';
-    censusBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#28a745;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
-    censusBtn.addEventListener('click', withRunGuard(downloadCensus));
-    btnRow.appendChild(censusBtn);
+    // Report rows: icon chip + label, hover slide.
+    function mkItem(icon, label, handler) {
+      const b = document.createElement('button');
+      b.className = 'adpbot-item';
+      const ico = document.createElement('span');
+      ico.className = 'adpbot-ico';
+      ico.textContent = icon;
+      b.appendChild(ico);
+      b.appendChild(document.createTextNode(label));
+      b.addEventListener('click', handler);
+      btnRow.appendChild(b);
+      return b;
+    }
+    mkItem('👥', 'Census', withRunGuard(downloadCensus));
+    mkItem('🧾', 'SIT / FIT', withRunGuard(downloadSitFit));
+    mkItem('📜', 'License / EC', withRunGuard(downloadLicenseEC));
+    mkItem('💰', 'Payroll History', withRunGuard(downloadPayrollHistory));
+    mkItem('🧮', 'Deduction', withRunGuard(downloadDeductionReport));
+    mkItem('🏦', 'Direct Deposit', withRunGuard(downloadDirectDeposit));
 
-    const sitFitBtn = document.createElement('button');
-    sitFitBtn.textContent = 'Download SIT/FIT';
-    sitFitBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#0056b3;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
-    sitFitBtn.addEventListener('click', withRunGuard(downloadSitFit));
-    btnRow.appendChild(sitFitBtn);
-
-    const licenseEcBtn = document.createElement('button');
-    licenseEcBtn.textContent = 'Download License/EC';
-    licenseEcBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#e67e22;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
-    licenseEcBtn.addEventListener('click', withRunGuard(downloadLicenseEC));
-    btnRow.appendChild(licenseEcBtn);
-
-    const payrollBtn = document.createElement('button');
-    payrollBtn.textContent = 'Download Payroll History';
-    payrollBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#8e44ad;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
-    payrollBtn.addEventListener('click', withRunGuard(downloadPayrollHistory));
-    btnRow.appendChild(payrollBtn);
-
-    const deductionBtn = document.createElement('button');
-    deductionBtn.textContent = 'Download Deduction';
-    deductionBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#2c3e50;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
-    deductionBtn.addEventListener('click', withRunGuard(downloadDeductionReport));
-    btnRow.appendChild(deductionBtn);
-
-    const directDepositBtn = document.createElement('button');
-    directDepositBtn.textContent = 'Download Direct Deposit';
-    directDepositBtn.style.cssText = 'padding:10px;border:none;border-radius:4px;background:#16a085;color:#fff;font-weight:bold;cursor:pointer;font-size:13px;';
-    directDepositBtn.addEventListener('click', withRunGuard(downloadDirectDeposit));
-    btnRow.appendChild(directDepositBtn);
-
+    // Utility row: Stop + diagnostic as quiet ghost buttons.
+    const utilRow = document.createElement('div');
+    utilRow.className = 'adpbot-util';
     const stopBtn = document.createElement('button');
-    stopBtn.textContent = 'Stop / reset';
-    stopBtn.style.cssText = 'padding:8px;border:none;border-radius:4px;background:#c0392b;color:#fff;font-weight:bold;cursor:pointer;font-size:12px;';
+    stopBtn.className = 'adpbot-ghost stop';
+    stopBtn.textContent = '⏹ Stop / reset';
     stopBtn.addEventListener('click', () => {
       if (!running) {
         logInfo('Stop / reset clicked — nothing running');
-        status.textContent = 'Idle';
+        status.textContent = 'Idle — ready to automate';
         resetAbort();
         return;
       }
@@ -2620,33 +2746,34 @@
       logWarn('Stop requested — aborting at next opportunity (≤100ms)');
       status.textContent = 'Stopping…';
     });
-    btnRow.appendChild(stopBtn);
+    utilRow.appendChild(stopBtn);
 
     const diagBtn = document.createElement('button');
-    diagBtn.textContent = 'Run diagnostic';
-    diagBtn.style.cssText = 'padding:6px;border:none;border-radius:4px;background:#6c5ce7;color:#fff;font-weight:bold;cursor:pointer;font-size:11px;';
+    diagBtn.className = 'adpbot-ghost diag';
+    diagBtn.textContent = '🩺 Diagnostic';
     diagBtn.addEventListener('click', dumpDiagnostic);
-    btnRow.appendChild(diagBtn);
+    utilRow.appendChild(diagBtn);
+    btnRow.appendChild(utilRow);
 
     wrapper.appendChild(contentDiv); // add contentDiv to wrapper before filling it
 
     contentDiv.appendChild(btnRow);
 
     const logRow = document.createElement('div');
-    logRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:2px;';
+    logRow.className = 'adpbot-logrow';
     const logLabel = document.createElement('span');
-    logLabel.textContent = 'Log';
-    logLabel.style.cssText = 'font-size:10px;color:#888;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px;';
+    logLabel.textContent = '⌁ Activity Log';
+    logLabel.className = 'adpbot-loglabel';
     logRow.appendChild(logLabel);
     const logActions = document.createElement('div');
     const clearBtn = document.createElement('button');
     clearBtn.textContent = 'Clear';
-    clearBtn.style.cssText = 'padding:2px 6px;border:1px solid #ccc;background:#f7f7f7;border-radius:3px;cursor:pointer;font-size:10px;margin-right:3px;';
+    clearBtn.className = 'adpbot-mini';
     clearBtn.addEventListener('click', () => { if (logEl) logEl.innerHTML = ''; });
     logActions.appendChild(clearBtn);
     const copyBtn = document.createElement('button');
     copyBtn.textContent = 'Copy';
-    copyBtn.style.cssText = 'padding:2px 6px;border:1px solid #ccc;background:#f7f7f7;border-radius:3px;cursor:pointer;font-size:10px;';
+    copyBtn.className = 'adpbot-mini';
     copyBtn.addEventListener('click', () => {
       if (!logEl) return;
       const text = Array.from(logEl.children).map(c => c.textContent).join('\n');
@@ -2660,7 +2787,7 @@
     contentDiv.appendChild(logRow);
 
     logEl = document.createElement('div');
-    logEl.style.cssText = 'height:200px;overflow-y:auto;background:#fafafa;border:1px solid #e0e0e0;border-radius:4px;padding:6px;font:10px/1.3 monospace;';
+    logEl.id = 'adp-bot-log';
     contentDiv.appendChild(logEl);
 
     document.body.appendChild(wrapper);
@@ -2677,4 +2804,700 @@
   }
 
   init();
+})();
+
+// =====================================================================
+// MODULE 2 of 2 — Export Documents bot. Self-contained IIFE below.
+// Adds one "Start Export All" button into the panel above (#adp-bot-btnrow)
+// and shares its single log box (#adp-bot-log) and status line.
+// =====================================================================
+
+(function () {
+  'use strict';
+
+  // Only run in the top window (ADP loads helper iframes we must ignore).
+  if (window.top !== window.self) return;
+
+  // ======================================================================
+  // CONFIG
+  // ======================================================================
+  const ROUTE = 'pracExportDocuments';        // hash route of the Export Documents page
+  const ROUTE_HASH = '#/pracSetup/pracExportDocuments'; // full hash to navigate to
+  const STORAGE_KEY = 'adpExportBot.v1';
+  const SUBCATEGORY_LABEL = 'All';            // we always request the "All" subcategory
+  const AUTO_DOWNLOAD = true;                 // after a category completes, download its files
+  const FILE_DOWNLOAD_GAP_MS = 1500;          // stagger between file downloads
+  const POLL_RELOAD_MS = 60000;               // how often to reload the page to refresh grid status while waiting
+  const STEP_TIMEOUT_MS = 25000;              // max wait for any single UI step (dialog open, dropdown, etc.)
+  const MAX_WAIT_PER_CATEGORY_MS = 40 * 60 * 1000; // safety: give up waiting on one category after 40 min
+
+  // Categories differ per client, so nothing is hard-coded — they are detected
+  // at runtime by reading the dialog's <sdf-select-item> options on Start.
+
+  // ======================================================================
+  // SHADOW-DOM-PIERCING QUERY HELPERS
+  // ADP renders everything inside nested shadow roots, so normal
+  // document.querySelector cannot reach the controls. We walk shadow roots.
+  // ======================================================================
+  function* walk(root) {
+    const nodes = root.querySelectorAll('*');
+    for (const el of nodes) {
+      yield el;
+      if (el.shadowRoot) yield* walk(el.shadowRoot);
+    }
+  }
+  function deepFind(predicate) {
+    for (const el of walk(document)) {
+      try { if (predicate(el)) return el; } catch (e) { /* ignore */ }
+    }
+    return null;
+  }
+  function deepFindAll(predicate) {
+    const out = [];
+    for (const el of walk(document)) {
+      try { if (predicate(el)) out.push(el); } catch (e) { /* ignore */ }
+    }
+    return out;
+  }
+  function isVisible(el) {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  // ======================================================================
+  // GENERIC ASYNC HELPERS
+  // ======================================================================
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+  // Poll `fn` until it returns a truthy value or we time out.
+  async function waitFor(fn, { timeout = STEP_TIMEOUT_MS, interval = 200, label = 'condition' } = {}) {
+    const start = Date.now();
+    for (; ;) {
+      let v;
+      try { v = fn(); } catch (e) { v = null; }
+      if (v) return v;
+      if (Date.now() - start > timeout) {
+        throw new Error('Timed out waiting for: ' + label);
+      }
+      await sleep(interval);
+    }
+  }
+
+  // ======================================================================
+  // ROUTE
+  // ======================================================================
+  const onExportPage = () => location.hash.indexOf(ROUTE) !== -1;
+
+  // Navigate the SPA to the Export Documents page (hash routing, no reload).
+  function navigateToExport() {
+    if (!onExportPage()) {
+      log('Navigating to Export Documents…');
+      location.hash = ROUTE_HASH;
+    }
+  }
+
+  // ======================================================================
+  // STATE (persisted so we survive page reloads during the long waits)
+  // ======================================================================
+  function loadState() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || null; }
+    catch (e) { return null; }
+  }
+  function saveState(s) { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); }
+  function clearState() { localStorage.removeItem(STORAGE_KEY); }
+
+  function newState(selected) {
+    return {
+      active: true,
+      phase: 'submit',            // 'submit' | 'waiting'
+      queue: selected.slice(),    // categories left to do (incl. current at [0])
+      done: [],                   // labels completed
+      current: selected[0] || null,
+      baselineInProgress: 0,      // # of in-progress rows measured right before we submitted current
+      submittedAt: 0,
+      startedAt: Date.now(),
+      lastError: '',
+    };
+  }
+
+  // ======================================================================
+  // GRID READING
+  // ======================================================================
+  function getRows() {
+    // AG Grid data rows.
+    const rows = deepFindAll((el) =>
+      el.getAttribute &&
+      el.getAttribute('role') === 'row' &&
+      el.classList && el.classList.contains('ag-row')
+    );
+    return rows.map((row) => {
+      const statusCell = row.querySelector('[col-id="status"]');
+      const actionsCell = row.querySelector('[col-id="actions"]');
+      const badge = statusCell ? statusCell.querySelector('sdf-badge') : null;
+      const statusAttr = badge ? (badge.getAttribute('status') || '') : '';
+      const statusText = (statusCell ? statusCell.textContent : '').trim();
+      const downloadLink = actionsCell
+        ? actionsCell.querySelector('sdf-link, a')
+        : null;
+      const hasDownload = /download/i.test(actionsCell ? actionsCell.textContent : '');
+      return { row, statusAttr, statusText, hasDownload, downloadLink };
+    });
+  }
+  function gridReady() {
+    return getRows().length > 0;
+  }
+  function isInProgress(r) {
+    // Robust: match by text or badge status attribute, not a single hard-coded value.
+    return /in\s*progress|pending|processing|queued|requested/i.test(r.statusText) ||
+      /progress|pending|processing|queued|requested/i.test(r.statusAttr);
+  }
+  function countInProgress() {
+    return getRows().filter(isInProgress).length;
+  }
+
+  // ======================================================================
+  // DIALOG INTERACTION
+  // ======================================================================
+  function clickEl(el) {
+    if (!el) return false;
+    el.scrollIntoView({ block: 'center' });
+    el.click();
+    return true;
+  }
+
+  async function openDialog() {
+    const btn = await waitFor(
+      () => deepFind((el) =>
+        el.tagName === 'SDF-BUTTON' &&
+        el.getAttribute('aria-label') === 'Request New Export'),
+      { label: 'Request New Export button' }
+    );
+    clickEl(btn);
+    // Dialog open == the #category select is present and visible.
+    await waitFor(
+      () => {
+        const c = deepFind((el) => el.id === 'category' && el.tagName === 'SDF-SELECT-SIMPLE');
+        return c && isVisible(c) ? c : null;
+      },
+      { label: 'export dialog (category field)' }
+    );
+    await sleep(400);
+  }
+
+  // Open an sdf-select-simple and click the option matching value or label.
+  async function selectSimple(hostId, { value, label }) {
+    const host = await waitFor(
+      () => deepFind((el) => el.id === hostId && el.tagName === 'SDF-SELECT-SIMPLE'),
+      { label: hostId + ' select' }
+    );
+
+    // Open the dropdown via its inner trigger-button (falls back to the host).
+    const trigger = (host.shadowRoot && host.shadowRoot.querySelector('.trigger-button')) || host;
+    clickEl(trigger);
+
+    // Wait for the matching, visible option to appear, then click it.
+    const item = await waitFor(
+      () => {
+        const items = deepFindAll((el) =>
+          el.tagName === 'SDF-SELECT-ITEM' && isVisible(el));
+        return items.find((el) => {
+          if (value != null) return el.getAttribute('value') === value;
+          const al = (el.getAttribute('aria-label') || el.textContent || '').trim();
+          return al.toLowerCase() === String(label).toLowerCase();
+        }) || null;
+      },
+      { label: hostId + ' option ' + (value || label) }
+    );
+    clickEl(item);
+    await sleep(400);
+  }
+
+  function confirmBtn() {
+    return deepFind((el) =>
+      el.id === 'confirm' && el.tagName === 'SDF-BUTTON' &&
+      (el.getAttribute('aria-label') === 'Request export'));
+  }
+  function confirmEnabled() {
+    const b = confirmBtn();
+    return b && !b.hasAttribute('disabled') && b.getAttribute('aria-disabled') !== 'true';
+  }
+  function subcategoryEnabled() {
+    const s = deepFind((el) => el.id === 'subcategory' && el.tagName === 'SDF-SELECT-SIMPLE');
+    if (!s) return false;
+    return !s.classList.contains('is-disabled');
+  }
+
+  // Close the dialog without submitting.
+  async function cancelDialog() {
+    const c = deepFind((el) => el.id === 'cancel' && el.tagName === 'SDF-BUTTON');
+    if (c) clickEl(c);
+    await waitFor(
+      () => {
+        const cat = deepFind((el) => el.id === 'category' && el.tagName === 'SDF-SELECT-SIMPLE');
+        return !cat || !isVisible(cat);
+      },
+      { label: 'dialog to close', timeout: 8000 }
+    ).catch(() => { });
+  }
+
+  // Discover the available categories by opening the dialog and reading the
+  // Category dropdown's options. Navigates to the Export page first if needed.
+  async function detectCategories() {
+    if (!onExportPage()) {
+      navigateToExport();
+      await waitFor(onExportPage, { label: 'Export route', timeout: STEP_TIMEOUT_MS });
+    }
+    await waitFor(gridReady, { label: 'grid to load', timeout: STEP_TIMEOUT_MS });
+    await sleep(800);
+
+    await openDialog();
+
+    const host = await waitFor(
+      () => deepFind((el) => el.id === 'category' && el.tagName === 'SDF-SELECT-SIMPLE'),
+      { label: 'category select' }
+    );
+    const trigger = (host.shadowRoot && host.shadowRoot.querySelector('.trigger-button')) || host;
+    clickEl(trigger);
+
+    await waitFor(
+      () => deepFindAll((el) => el.tagName === 'SDF-SELECT-ITEM' && isVisible(el)).length > 0,
+      { label: 'category options' }
+    );
+
+    const seen = new Set();
+    const cats = [];
+    deepFindAll((el) => el.tagName === 'SDF-SELECT-ITEM' && isVisible(el)).forEach((el) => {
+      const value = el.getAttribute('value');
+      const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+      const disabled = el.getAttribute('aria-disabled') === 'true';
+      if (value && label && !disabled && !seen.has(value)) {
+        seen.add(value);
+        cats.push({ label, value });
+      }
+    });
+
+    clickEl(trigger);        // close the dropdown
+    await sleep(300);
+    await cancelDialog();    // close the dialog
+
+    return cats;
+  }
+
+  // ======================================================================
+  // DOWNLOAD FLOW
+  // ======================================================================
+  function downloadPanelOpen() {
+    // The "Download Document" panel has a file grid with a fileName column.
+    const hdr = deepFind((el) =>
+      el.getAttribute && el.getAttribute('col-id') === 'fileName' &&
+      el.getAttribute('role') === 'columnheader');
+    return hdr && isVisible(hdr);
+  }
+  function getDownloadFileLinks() {
+    // Each file row's actions cell: <sdf-link> containing <sdf-icon icon="action-download">.
+    return deepFindAll((el) =>
+      el.tagName === 'SDF-LINK' && isVisible(el) &&
+      el.querySelector && el.querySelector('sdf-icon[icon="action-download"]'));
+  }
+  function findBackButton() {
+    return deepFind((el) =>
+      el.tagName === 'SDF-BUTTON' &&
+      (el.id === 'back-button-with-label' || el.getAttribute('aria-label') === 'Back'));
+  }
+
+  // After a category completes, click Download on the newest (top) completed row,
+  // download every file in the panel, then go back to the grid.
+  async function downloadTopCompletedRow() {
+    const target = getRows().find((r) => !isInProgress(r) && r.hasDownload && r.downloadLink);
+    if (!target) { log('No completed row with a Download link found.'); return; }
+
+    clickEl(target.downloadLink);             // open the Download Document panel
+    await waitFor(downloadPanelOpen, { label: 'Download Document panel', timeout: STEP_TIMEOUT_MS });
+    await sleep(900);
+
+    const links = getDownloadFileLinks();
+    log('Downloading ' + links.length + ' file(s)…');
+    for (const link of links) {
+      clickEl(link);
+      await sleep(FILE_DOWNLOAD_GAP_MS);
+    }
+    await sleep(800);
+
+    const back = findBackButton();
+    if (back) clickEl(back);
+    await waitFor(() => !downloadPanelOpen() && gridReady(),
+      { label: 'return to grid', timeout: 12000 }).catch(() => { });
+    await sleep(600);
+  }
+
+  // Fill the dialog for one category and submit it.
+  async function submitCategory(cat) {
+    await openDialog();
+    await selectSimple('category', { value: cat.value });
+
+    // Subcategory may auto-default to "All". Only set it if submit isn't enabled yet.
+    await waitFor(() => subcategoryEnabled() || confirmEnabled(),
+      { label: 'subcategory to enable', timeout: STEP_TIMEOUT_MS });
+
+    if (!confirmEnabled()) {
+      try {
+        await selectSimple('subcategory', { label: SUBCATEGORY_LABEL });
+      } catch (e) {
+        log('Subcategory "' + SUBCATEGORY_LABEL + '" not selectable: ' + e.message);
+      }
+    }
+
+    const btn = await waitFor(() => (confirmEnabled() ? confirmBtn() : null),
+      { label: 'Request export button to enable', timeout: STEP_TIMEOUT_MS });
+    clickEl(btn);
+
+    // Confirm submission: dialog closes (category field disappears) within timeout.
+    await waitFor(
+      () => {
+        const c = deepFind((el) => el.id === 'category' && el.tagName === 'SDF-SELECT-SIMPLE');
+        return !c || !isVisible(c);
+      },
+      { label: 'dialog to close after submit', timeout: STEP_TIMEOUT_MS }
+    ).catch(() => log('Dialog did not visibly close; continuing.'));
+  }
+
+  // ======================================================================
+  // HTML INSPECTOR (Shadow-DOM-piercing dump, same as the standalone tool)
+  // ======================================================================
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function openTagStr(el) {
+    let t = '<' + el.tagName.toLowerCase();
+    for (const a of el.attributes) t += ` ${a.name}="${esc(a.value)}"`;
+    return t + '>';
+  }
+  function serializeNode(node, depth) {
+    const pad = '  '.repeat(depth);
+    if (node.nodeType === Node.TEXT_NODE) {
+      const txt = node.textContent.trim();
+      return txt ? `${pad}${esc(txt)}\n` : '';
+    }
+    if (node.nodeType === Node.COMMENT_NODE) return `${pad}<!-- ${esc(node.textContent.trim())} -->\n`;
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+    const tag = node.tagName.toLowerCase();
+    if (node.id === 'adp-export-bot') return ''; // skip our own panel
+    if (tag === 'script' || tag === 'style' || tag === 'svg') {
+      return `${pad}${openTagStr(node)} …(${tag} omitted)…\n`;
+    }
+    let out = `${pad}${openTagStr(node)}\n`;
+    if (node.shadowRoot) {
+      out += `${pad}  #shadow-root (open)\n`;
+      for (const ch of node.shadowRoot.childNodes) out += serializeNode(ch, depth + 2);
+    }
+    for (const ch of node.childNodes) out += serializeNode(ch, depth + 1);
+    if (tag === 'iframe' || tag === 'frame') {
+      try {
+        const d = node.contentDocument || (node.contentWindow && node.contentWindow.document);
+        if (d) {
+          out += `${pad}  ===== IFRAME (${node.src || 'no src'}) =====\n`;
+          out += serializeNode(d.documentElement, depth + 2);
+        }
+      } catch (e) {
+        out += `${pad}  --- CROSS-ORIGIN iframe: src=${node.src} ---\n`;
+      }
+    }
+    return out;
+  }
+  function tstamp() {
+    const d = new Date(), p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+  async function dumpHTML() {
+    let dump = 'ADP DOM dump\nCaptured: ' + new Date().toString() + '\nURL: ' + location.href + '\n';
+    dump += '='.repeat(56) + '\n';
+    dump += serializeNode(document.documentElement, 0);
+    const blob = new Blob([dump], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'adp-dump_' + tstamp() + '.html';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    try { await navigator.clipboard.writeText(dump); } catch (e) { }
+    console.log('[ADP Export Bot] HTML dump:\n', dump);
+    log('Saved HTML dump (' + Math.round(dump.length / 1024) + ' KB) + copied to clipboard.');
+  }
+
+  // ======================================================================
+  // CONTROL PANEL UI — one button injected into the shared "ADP Bot" panel,
+  // reusing its single log box and status line (no separate section/log).
+  // ======================================================================
+  let startBtn;
+  const sharedLog = () => document.getElementById('adp-bot-log');
+  const sharedStatus = () => document.getElementById('adp-bot-status');
+
+  function log(msg) {
+    console.log('[ADP Export] ' + msg);
+    const box = sharedLog();
+    if (!box) return;
+    const line = document.createElement('div');
+    const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+    line.style.cssText = 'color:#2dd4a7;white-space:pre-wrap;word-break:break-word;line-height:1.3;padding:1px 0;';
+    line.textContent = ts + ' EXPORT ' + msg;
+    box.appendChild(line);
+    while (box.children.length > 200) box.removeChild(box.firstChild);
+    box.scrollTop = box.scrollHeight;
+  }
+  function setStatus(msg) { const s = sharedStatus(); if (s) s.textContent = msg; }
+
+  // Add a single "Start Export All" button to the shared button row. If the
+  // Reports panel isn't present, create a minimal own panel as a fallback.
+  function buildPanel() {
+    if (startBtn) return;
+    let grid = document.getElementById('adp-bot-btnrow');
+
+    if (!grid) {
+      const wrap = document.createElement('div');
+      wrap.id = 'adp-export-bot';
+      wrap.style.cssText = 'position:fixed;bottom:24px;left:24px;z-index:2147483647;background:linear-gradient(165deg,rgba(2,20,46,.97),rgba(0,36,86,.95));color:#dce9ff;border:1px solid rgba(90,159,255,.28);border-radius:16px;box-shadow:0 8px 40px rgba(0,12,30,.6);font:12px "Segoe UI",system-ui,sans-serif;width:300px;padding:12px;';
+      const s = document.createElement('div'); s.id = 'adp-bot-status'; s.style.cssText = 'font-size:11px;color:#a8cbff;margin-bottom:6px;'; s.textContent = 'Export: idle';
+      grid = document.createElement('div'); grid.id = 'adp-bot-btnrow'; grid.style.cssText = 'display:grid;gap:6px;margin-bottom:6px;';
+      const lg = document.createElement('div'); lg.id = 'adp-bot-log'; lg.style.cssText = 'height:100px;overflow-y:auto;background:rgba(0,8,22,.55);border:1px solid rgba(90,159,255,.14);border-radius:10px;padding:6px;font:10px/1.4 Consolas,monospace;color:#a8c6ec;';
+      wrap.appendChild(s); wrap.appendChild(grid); wrap.appendChild(lg);
+      document.body.appendChild(wrap);
+    }
+
+    startBtn = document.createElement('button');
+    startBtn.id = 'adp-export-start';
+    startBtn.className = 'adpbot-item adpbot-doc';
+    setIdleLabel();
+    startBtn.addEventListener('click', onToggle);
+
+    // Sit just above the utility row holding "Stop / reset" when present.
+    const stopRef = Array.from(grid.children).find(b => (b.textContent || '').includes('Stop / reset'));
+    if (stopRef) grid.insertBefore(startBtn, stopRef); else grid.appendChild(startBtn);
+  }
+
+  // Compose the icon-chip + label content to match the report rows' style.
+  function setBtnContent(icon, label) {
+    startBtn.innerHTML = '';
+    const ico = document.createElement('span');
+    ico.className = 'adpbot-ico';
+    ico.textContent = icon;
+    startBtn.appendChild(ico);
+    startBtn.appendChild(document.createTextNode(label));
+  }
+  function setIdleLabel() { setBtnContent('📁', 'Download Documents'); }
+  function setRunningLabel() { setBtnContent('⏹', 'Stop Download'); }
+
+  // Update the button label, and the shared status line only while active
+  // (so we don't clobber the Reports module's status when the export is idle).
+  function renderPanel(state) {
+    if (!startBtn) return;
+    const running = state && state.active;
+    const wasRunning = startBtn.dataset.running === '1';
+    if (running !== wasRunning) {
+      startBtn.dataset.running = running ? '1' : '0';
+      if (running) setRunningLabel(); else setIdleLabel();
+      startBtn.style.background = running ? 'rgba(255,99,99,.22)' : '';
+      startBtn.style.borderColor = running ? 'rgba(255,120,120,.5)' : '';
+    }
+    if (!running) return;
+
+    if (!onExportPage()) { setStatus('Export: opening Export Documents…'); return; }
+    const total = state.done.length + state.queue.length;
+    const cur = state.current ? state.current.label : '(none)';
+    if (state.phase === 'waiting') {
+      const mins = Math.floor((Date.now() - state.submittedAt) / 60000);
+      const secs = Math.floor(((Date.now() - state.submittedAt) % 60000) / 1000);
+      setStatus('Export: waiting for ' + cur + ' (' + mins + 'm ' + secs + 's) — done ' + state.done.length + '/' + total);
+    } else {
+      setStatus('Export: submitting ' + cur + ' — done ' + state.done.length + '/' + total);
+    }
+  }
+
+  function onToggle() {
+    const st = loadState();
+    if (st && st.active) onStopExport();
+    else onStartExport();
+  }
+
+  let starting = false;
+  async function onStartExport() {
+    if (starting) return;
+    starting = true;
+    try {
+      log('Detecting categories…');
+      setBtnContent('🔍', 'Detecting categories…');
+      let cats;
+      try {
+        cats = await detectCategories();
+      } catch (e) {
+        log('Detect failed: ' + e.message);
+        alert('Could not detect categories: ' + e.message);
+        return;
+      }
+      if (!cats.length) { alert('No categories found.'); return; }
+      log('Found ' + cats.length + ': ' + cats.map((c) => c.label).join(', '));
+
+      const s = newState(cats);
+      saveState(s);
+      log('Started. Queue: ' + cats.map((c) => c.label).join(', '));
+      renderPanel(s);
+      tick(); // we are already on the Export page after detection
+    } finally {
+      starting = false;
+      const st = loadState();
+      if (!(st && st.active)) setIdleLabel(); // restore label if detect failed
+      renderPanel(st);
+    }
+  }
+
+  function onStopExport() {
+    clearState();
+    log('Export stopped by user.');
+    setStatus('Export: stopped');
+    renderPanel(null);
+  }
+
+  // ======================================================================
+  // MAIN STATE-MACHINE TICK
+  // ======================================================================
+  let ticking = false;
+  let reloadTimer = null;
+
+  function scheduleReload() {
+    if (reloadTimer) return;
+    log('Will refresh in ' + Math.round(POLL_RELOAD_MS / 1000) + 's to check status…');
+    reloadTimer = setTimeout(() => location.reload(), POLL_RELOAD_MS);
+  }
+
+  async function tick() {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const state = loadState();
+      renderPanel(state);
+      if (!state || !state.active) return;
+      if (!onExportPage()) { return; } // wait until user is on the page
+
+      // Make sure the grid has loaded before reading/counting anything.
+      await waitFor(gridReady, { label: 'grid to load', timeout: STEP_TIMEOUT_MS });
+      await sleep(1200); // settle
+
+      if (state.phase === 'submit') {
+        // Measure baseline BEFORE submitting so we can detect our new request finishing.
+        state.baselineInProgress = countInProgress();
+        log('Submitting "' + state.current.label + '" (baseline in-progress=' + state.baselineInProgress + ')');
+        saveState(state);
+
+        await submitCategory(state.current);
+
+        state.phase = 'waiting';
+        state.submittedAt = Date.now();
+        state.lastError = '';
+        saveState(state);
+        log('Submitted "' + state.current.label + '". Waiting for it to complete…');
+        renderPanel(state);
+        scheduleReload();
+
+      } else if (state.phase === 'waiting') {
+        const now = countInProgress();
+        const elapsed = Date.now() - state.submittedAt;
+        const finished = now <= state.baselineInProgress;
+        const timedOut = elapsed > MAX_WAIT_PER_CATEGORY_MS;
+
+        if (finished || timedOut) {
+          log((timedOut ? '⚠️ Timeout on "' : '✅ Completed "') + state.current.label + '".');
+
+          // Download the freshly-completed export (its row is newest = on top).
+          if (AUTO_DOWNLOAD && !timedOut) {
+            try {
+              await downloadTopCompletedRow();
+            } catch (e) {
+              log('⚠️ Download step failed for "' + state.current.label + '": ' + e.message);
+            }
+          }
+
+          state.done.push(state.current.label);
+          state.queue.shift(); // remove current
+
+          if (state.queue.length === 0) {
+            state.active = false;
+            state.phase = 'idle';
+            saveState(state);
+            renderPanel(state);
+            log('🎉 All done: ' + state.done.join(', '));
+            alert('ADP Export-All finished.\nCompleted: ' + state.done.join(', '));
+          } else {
+            state.current = state.queue[0];
+            state.phase = 'submit';
+            saveState(state);
+            renderPanel(state);
+            ticking = false;
+            return tick(); // immediately submit the next category (no reload needed)
+          }
+        } else {
+          log('Still in progress (' + now + ' in-progress rows; baseline ' + state.baselineInProgress + '). Elapsed ' + Math.round(elapsed / 60000) + 'm.');
+          renderPanel(state);
+          scheduleReload();
+        }
+      }
+    } catch (e) {
+      const state = loadState();
+      log('❌ Error: ' + e.message);
+      if (state && state.active) {
+        state.lastError = e.message;
+        saveState(state);
+        // Back off and retry via a reload rather than getting stuck.
+        scheduleReload();
+      }
+    } finally {
+      ticking = false;
+    }
+  }
+
+  // ======================================================================
+  // BOOT
+  // ======================================================================
+  // When the SPA route changes (e.g. after navigateToExport), resume if needed.
+  function onRouteChange() {
+    const state = loadState();
+    renderPanel(state);
+    if (state && state.active && onExportPage()) {
+      setTimeout(tick, 2000); // let the grid mount
+    }
+  }
+
+  function boot() {
+    const state = loadState();
+    // Wait briefly for the Reports panel so we can dock into it; otherwise stand alone.
+    let tries = 0;
+    (function waitHost() {
+      if (document.getElementById('adp-export-start')) return; // already built
+      if (document.getElementById('adp-bot-btnrow') || tries++ > 12) { afterHost(); }
+      else setTimeout(waitHost, 150);
+    })();
+
+    function afterHost() {
+      buildPanel();
+      renderPanel(state);
+      // Keep the elapsed timer ticking in the panel.
+      setInterval(() => renderPanel(loadState()), 1000);
+      // Resume on SPA navigations without a full reload.
+      window.addEventListener('hashchange', onRouteChange);
+
+      if (state && state.active) {
+        if (onExportPage()) {
+          // Give ADP's SPA a moment to mount the grid after a (re)load.
+          setTimeout(tick, 2500);
+        } else {
+          // Active run but landed off-route (e.g. opened on Home) -> go there.
+          setTimeout(navigateToExport, 1200);
+        }
+      }
+    }
+  }
+
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(boot, 800);
+  } else {
+    window.addEventListener('DOMContentLoaded', () => setTimeout(boot, 800));
+  }
 })();
