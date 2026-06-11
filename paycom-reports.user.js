@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.12.0
+  // @version      0.15.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -2277,8 +2277,10 @@
     // The Doc Dashboard URL the "Download All Documents" button navigates to.
     const DOC_DASHBOARD_URL = 'https://www.paycomonline.net/v4/cl/web.php/Doc/Dashboard';
     // Set by setupDocDownloader() once its controls mount on the Doc Dashboard.
-    let docsStartFresh = null;   // start a fresh document download run
-    let docsResume = null;       // resume an interrupted run
+    let docsStartFresh = null;     // start a fresh document download run
+    let docsResume = null;         // resume an interrupted run
+    let docsRunAfterReload = null; // continue a run after Apply Filters reloaded the page
+    let docsStop = null;           // abort an in-flight run (wired to Stop / reset)
 
     // Poll until the Doc Dashboard DataTables grid has rendered rows (or time out).
     function waitForDocTable(cb) {
@@ -2349,7 +2351,10 @@
 
       const dlSleep = (ms) => new Promise((r) => setTimeout(r, ms));
       let paused = false;
-      async function waitWhilePaused() { while (paused) await dlSleep(200); }
+      // Set by docsStop() (the panel's Stop / reset button). Every loop in the
+      // run checks it so an in-flight download halts within a row or two.
+      let stopRequested = false;
+      async function waitWhilePaused() { while (paused && !stopRequested) await dlSleep(200); }
 
       // ── state (persisted to localStorage after every row) ──
       function loadDlState() {
@@ -2395,6 +2400,7 @@
       async function waitForPageChange(prev) {
         const end = Date.now() + CFG.MAX_PAGE_WAIT;
         while (Date.now() < end) {
+          if (stopRequested) return false;
           await dlSleep(CFG.POLL_MS);
           const cur = getInfoText();
           if (cur && cur !== prev) return true;
@@ -2477,8 +2483,10 @@
         console.log(`[DL] Page ${state.currentPage} — ${rows.length} rows`);
 
         for (let i = 0; i < rows.length; i++) {
+          if (stopRequested) { console.log('[DL] Stop requested — halting at row ' + (i + 1)); return; }
           const info = getRowInfo(rows[i]);
           await waitWhilePaused();
+          if (stopRequested) { console.log('[DL] Stop requested — halting at row ' + (i + 1)); return; }
 
           statusEl.textContent =
             `Docs: p${state.currentPage} row ${i + 1}/${rows.length}` +
@@ -2503,6 +2511,7 @@
 
           let result = null;
           for (let attempt = 0; attempt <= CFG.MAX_RETRIES; attempt++) {
+            if (stopRequested) return;
             if (attempt > 0) {
               console.log(`[DL] Retry ${attempt}/${CFG.MAX_RETRIES} for ${info.empName}`);
               statusEl.textContent = `Docs: p${state.currentPage} row ${i + 1}/${rows.length} | RETRY ${attempt}`;
@@ -2558,18 +2567,23 @@
         await processPage(state, statusEl);
 
         await dlSleep(500);
-        while (!isNextDisabled()) {
+        while (!isNextDisabled() && !stopRequested) {
           const prevInfo = getInfoText();
           getNextBtn().click();
           const moved = await waitForPageChange(prevInfo);
           if (!moved) {
-            console.warn('[DL] Pagination stuck — timed out waiting for page change. Stopping.');
+            if (!stopRequested) console.warn('[DL] Pagination stuck — timed out waiting for page change. Stopping.');
             break;
           }
           state.currentPage = getCurrentPage();
           saveDlState(state);
           await processPage(state, statusEl);
           await dlSleep(500);
+        }
+        if (stopRequested) {
+          console.log(`[DL] Stopped by user: ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`);
+          statusEl.textContent = 'Documents: stopped';
+          return;
         }
         state.isComplete = true;
         saveDlState(state);
@@ -2643,12 +2657,17 @@
       }
 
       // ── pre-download filter: set the Last Modified date range ──
-      // Open the Doc Dashboard "Filters" panel, set Last Modified From/To, and
-      // click Apply so the download covers the whole window (not just the
-      // default recent range). Best-effort — logs and continues if the UI
-      // differs. Reuses the outer helpers (visible, clickEl, setInputValue,
-      // findByText, findVisibleByExactText).
-      function findFiltersButton() {
+      // The CORRECT trigger is the funnel icon (with a "(N)" badge) in the
+      // table-controls row above the document grid — it opens the
+      // "Filter Document View" modal. The page-level "Filters" text button is
+      // a DIFFERENT (global) filter and must not be used; it's kept only as a
+      // last-resort candidate. We click candidates in priority order and
+      // verify the modal actually opened before touching any inputs.
+      function filterModalOpen() {
+        return findVisibleByExactText('Filter Document View');
+      }
+
+      function findGlobalFiltersButton() {
         const cands = Array.from(document.querySelectorAll('button, a, [role="button"], div, span'))
           .filter(el => visible(el) && (el.textContent || '').trim() === 'Filters');
         cands.sort((a, b) => {
@@ -2658,20 +2677,83 @@
         return cands[0] || null;
       }
 
+      function docFilterCandidates() {
+        const out = [];
+        const seen = new Set();
+        const push = (el) => {
+          if (!el || seen.has(el) || !visible(el)) return;
+          seen.add(el);
+          out.push(el);
+        };
+        // 1) The funnel control showing a "(N)" applied-filter badge.
+        for (const el of document.querySelectorAll('button, a, [role="button"], span, div')) {
+          if (!visible(el)) continue;
+          const txt = (el.textContent || '').replace(/\s+/g, '');
+          if (/^\(\d+\)$/.test(txt)) push(el.closest('button, a, [role="button"]') || el);
+        }
+        // 2) Small controls labeled/classed/id'd like a filter — excluding the
+        //    global "Filters" text button and big containers.
+        for (const el of document.querySelectorAll(
+          '[aria-label*="filter" i], [title*="filter" i], [id*="filter" i], [class*="filter" i]'
+        )) {
+          if (!visible(el)) continue;
+          if ((el.textContent || '').trim() === 'Filters') continue;
+          const r = el.getBoundingClientRect();
+          if (r.width > 160 || r.height > 80) continue;
+          push(el.closest('button, a, [role="button"]') || el);
+        }
+        // 3) Last resort: the global "Filters" button.
+        push(findGlobalFiltersButton());
+        return out;
+      }
+
+      async function openFilterModal() {
+        if (filterModalOpen()) return true;
+        const cands = docFilterCandidates();
+        console.log(`[DL] Filter trigger candidates: ${cands.length}`);
+        for (const el of cands) {
+          clickEl(el);
+          for (let i = 0; i < 10; i++) { // ~2.5s per candidate
+            await dlSleep(250);
+            if (filterModalOpen()) return true;
+          }
+        }
+        return !!filterModalOpen();
+      }
+
+      // The modal element that contains the "Filter Document View" heading —
+      // all input searches are scoped inside it so we never touch page inputs.
+      function getFilterModalRoot() {
+        const heading = filterModalOpen();
+        if (!heading) return null;
+        let c = heading;
+        for (let i = 0; i < 10 && c; i++) {
+          if (c.querySelectorAll('select, input').length >= 4) return c;
+          c = c.parentElement;
+        }
+        return heading.parentElement || document.body;
+      }
+
       function findFilterDateInputs() {
+        const root = getFilterModalRoot();
+        if (!root) return null;
         const dateRe = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
-        const label = findVisibleByExactText('Last Modified Date Range');
-        if (label) {
-          let c = label;
-          for (let i = 0; i < 6 && c; i++) {
+        // Prefer inputs under the "Last Modified Date Range" label inside the modal.
+        for (const span of root.querySelectorAll('label, span, div, p, h4, h5, strong, b')) {
+          const txt = (span.textContent || '').replace(/\s+/g, ' ').trim();
+          if (txt !== 'Last Modified Date Range') continue;
+          let c = span;
+          for (let i = 0; i < 6 && c && root.contains(c); i++) {
             c = c.parentElement;
             if (!c) break;
             const ins = Array.from(c.querySelectorAll('input'))
               .filter(inp => visible(inp) && dateRe.test((inp.value || '').trim()));
             if (ins.length >= 2) return { from: ins[0], to: ins[1] };
           }
+          break;
         }
-        const all = Array.from(document.querySelectorAll('input'))
+        // Fallback: the only two MM/DD/YYYY inputs inside the modal.
+        const all = Array.from(root.querySelectorAll('input'))
           .filter(inp => visible(inp) && dateRe.test((inp.value || '').trim()));
         if (all.length >= 2) return { from: all[0], to: all[1] };
         return null;
@@ -2679,14 +2761,17 @@
 
       async function applyLastModifiedFilter(fromStr, toStr) {
         try {
-          const btn = findFiltersButton();
-          if (!btn) { console.warn('[DL] "Filters" button not found — skipping date filter'); return; }
           statusEl.textContent = 'Docs: opening filter…';
-          clickEl(btn);
+          const opened = await openFilterModal();
+          if (!opened) {
+            console.warn('[DL] Could not open the "Filter Document View" modal — skipping date filter. ' +
+              'Use the panel\'s "Inspect Element HTML" button on the funnel icon and share the HTML.');
+            return;
+          }
 
           let inputs = null;
           for (let i = 0; i < 40 && !inputs; i++) { inputs = findFilterDateInputs(); if (!inputs) await dlSleep(250); }
-          if (!inputs) { console.warn('[DL] Filter date inputs not found — skipping date filter'); return; }
+          if (!inputs) { console.warn('[DL] Last Modified date inputs not found in the modal — skipping date filter'); return; }
 
           statusEl.textContent = `Docs: date range ${fromStr} → ${toStr}…`;
           setInputValue(inputs.from, fromStr);
@@ -2694,15 +2779,37 @@
           await dlSleep(300);
 
           const prevInfo = getInfoText();
-          const applyBtn = findByText(['button', 'a'], 'Apply Filters');
-          if (applyBtn) clickEl(applyBtn);
-          else console.warn('[DL] "Apply Filters" button not found — filter may not be applied');
+          const root = getFilterModalRoot() || document;
+          const applyBtn = Array.from(root.querySelectorAll('button, a'))
+            .find(el => visible(el) && (el.textContent || '').trim() === 'Apply Filters')
+            || findByText(['button', 'a'], 'Apply Filters');
+          if (applyBtn) {
+            // Applying the filter may trigger a FULL PAGE RELOAD on some Paycom
+            // builds, killing this script before the download loop starts. Set
+            // a flag first so init() restarts the run on the fresh page.
+            try { localStorage.setItem('paycomBot.docs.postFilterStart', '1'); } catch (_) {}
+            clickEl(applyBtn);
+          } else {
+            console.warn('[DL] "Apply Filters" button not found — filter may not be applied');
+          }
 
-          // Wait for the grid to reload (info text changes), then settle.
-          for (let i = 0; i < 60; i++) {
+          // Wait for the modal to close; a plain .click() sometimes doesn't
+          // register on this React button — retry with the full event sequence.
+          let closed = false;
+          for (let i = 0; i < 16; i++) { // ~4s
+            await dlSleep(250);
+            if (!filterModalOpen()) { closed = true; break; }
+          }
+          if (!closed && applyBtn) {
+            console.warn('[DL] Modal still open after Apply click — retrying with full pointer/mouse sequence');
+            robustClick(applyBtn);
+          }
+
+          // Wait for the grid to reload (modal closed + info text changed), then settle.
+          for (let i = 0; i < 50; i++) {
             await dlSleep(250);
             const cur = getInfoText();
-            if (cur && cur !== prevInfo) break;
+            if (!filterModalOpen() && cur && cur !== prevInfo) break;
           }
           await dlSleep(800);
           console.log(`[DL] Applied Last Modified filter ${fromStr} → ${toStr}`);
@@ -2790,11 +2897,16 @@
       docsStartFresh = async () => {
         if (running || starting) return;
         starting = true;
+        stopRequested = false;
         try {
           const range = readStoredRange() || computeFilterRange();
           if (!range) { statusEl.textContent = 'Documents: cancelled'; return; }
           clearDlState();
           await applyLastModifiedFilter(range.from, range.to);
+          if (stopRequested) { statusEl.textContent = 'Documents: stopped'; return; }
+          // Still here → Apply did NOT reload the page; clear the reload flag
+          // and run inline.
+          try { localStorage.removeItem('paycomBot.docs.postFilterStart'); } catch (_) {}
           const s = freshDlState();
           saveDlState(s);
           runWith(s);
@@ -2803,18 +2915,108 @@
       docsResume = async () => {
         if (running || starting) return;
         starting = true;
+        stopRequested = false;
         try {
           const range = computeFilterRange(); // ask fresh on a manual resume
           if (!range) { statusEl.textContent = 'Documents: cancelled'; return; }
           await applyLastModifiedFilter(range.from, range.to);
+          if (stopRequested) { statusEl.textContent = 'Documents: stopped'; return; }
+          try { localStorage.removeItem('paycomBot.docs.postFilterStart'); } catch (_) {}
           const s = loadDlState() || freshDlState();
           runWith(s);
         } finally { starting = false; }
+      };
+      // Called by init() when Apply Filters caused a full page reload: the
+      // filter is already applied, so start/resume the run WITHOUT reopening
+      // the filter modal.
+      docsRunAfterReload = () => {
+        if (running || starting) return;
+        stopRequested = false;
+        const s = loadDlState() || freshDlState();
+        saveDlState(s);
+        runWith(s);
+      };
+      // Wired to the panel's Stop / reset button: abort any in-flight run
+      // (within a row or two), clear the saved doc state, and tidy the UI.
+      docsStop = () => {
+        stopRequested = true;
+        paused = false;
+        clearDlState();
+        statusEl.textContent = 'Documents: stopped';
+        pauseBtn.style.display = 'none';
+        refreshResume();
       };
 
       resumeBtn.addEventListener('click', () => docsResume());
 
       console.log('[Paycom DL] doc-downloader mounted on Doc Dashboard.');
+    }
+
+    // ───────────────── Inspect: capture any element's outerHTML ─────────────────
+    // One-shot capture mode for debugging selectors: click the panel button,
+    // then click any element on the page. The click is intercepted (so it
+    // doesn't trigger the page), and the element's outerHTML + a parent
+    // container's outerHTML are copied to the clipboard and logged to the
+    // console — paste the result to Claude to fix selectors. Esc cancels.
+    let inspectActive = false;
+    function startInspectCapture() {
+      if (inspectActive) return;
+      inspectActive = true;
+      showProgressBanner('Inspect: click any element to copy its HTML (Esc cancels)');
+
+      const clip = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) + ' …[+' + (s.length - n) + ' chars]' : s; };
+
+      const finish = () => {
+        inspectActive = false;
+        document.removeEventListener('click', onClick, true);
+        document.removeEventListener('keydown', onKey, true);
+        hideProgressBanner();
+      };
+      const onKey = (e) => { if (e.key === 'Escape') finish(); };
+      const onClick = (e) => {
+        // Clicks on the bot's own panel keep working normally.
+        if (panelEl && panelEl.contains(e.target)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        const t = e.target;
+        const out = [];
+        out.push('=== Paycom Inspect ===');
+        out.push('url: ' + location.href);
+        const path = [];
+        let n = t;
+        for (let i = 0; n && n.tagName && i < 8; i++) {
+          let desc = n.tagName.toLowerCase();
+          if (n.id) desc += '#' + n.id;
+          if (typeof n.className === 'string' && n.className.trim()) {
+            desc += '.' + n.className.trim().split(/\s+/).slice(0, 3).join('.');
+          }
+          path.push(desc);
+          n = n.parentElement;
+        }
+        out.push('ancestors: ' + path.join('  <  '));
+        out.push('--- clicked element outerHTML ---');
+        out.push(clip(t.outerHTML, 4000));
+        const container = t.closest('button, a, [role="button"], tr, li, form, table, [class*="modal" i], [class*="filter" i]') || t.parentElement;
+        if (container && container !== t) {
+          out.push('--- closest interesting container outerHTML ---');
+          out.push(clip(container.outerHTML, 6000));
+        }
+        const text = out.join('\n');
+        console.log('%c[PaycomBot Inspect]\n' + text, 'color:#077A7D');
+        try {
+          navigator.clipboard.writeText(text).then(
+            () => showSuccessBanner('✓ HTML copied — paste it to Claude'),
+            () => showSuccessBanner('HTML logged to console ([PaycomBot Inspect])')
+          );
+        } catch (_) {
+          showSuccessBanner('HTML logged to console ([PaycomBot Inspect])');
+        }
+        finish();
+      };
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('keydown', onKey, true);
     }
 
     // ───────────────── Floating panel ─────────────────
@@ -2842,6 +3044,7 @@
           #paycom-bot-panel .start-tp{background:#077A7D;color:#7AE2CF}
           #paycom-bot-panel .start-docs{background:#7AE2CF;color:#06202B}
           #paycom-bot-panel .stop{background:transparent;color:#FDEB9E;border:1px solid #FDEB9E}
+          #paycom-bot-panel .inspect-html{background:transparent;color:#7AE2CF;border:1px dashed #7AE2CF}
           #paycom-bot-panel.minimized .body{display:none}
         </style>
         <div class="hdr">
@@ -2859,6 +3062,7 @@
           <button class="start-sd">Run Scheduled Deductions</button>
           <button class="start-tp">Run Tax Profile Report</button>
           <button class="start-docs">Download All Documents</button>
+          <button class="inspect-html" title="Click this, then click any element on the page — its HTML is copied to the clipboard">Inspect Element HTML</button>
           <button class="stop">Stop / reset</button>
           <div class="doc-dl-section" style="display:none;border-top:1px solid #077A7D;margin-top:10px;padding-top:4px"></div>
         </div>
@@ -2901,12 +3105,24 @@
         setTpState(TP_STATES.IDLE);
         startDocs();
       });
+      panelEl.querySelector('.inspect-html').addEventListener('click', () => {
+        startInspectCapture();
+      });
       panelEl.querySelector('.stop').addEventListener('click', () => {
         log('Stop / reset clicked — clearing state and tearing down UI');
         setState(STATES.IDLE);
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
+        // Abort the document downloader (if mounted on this page) and clear
+        // its flags either way, so a queued auto-start can't fire later.
+        if (docsStop) docsStop();
+        try {
+          localStorage.removeItem('paycom_dl_state');
+          localStorage.removeItem('paycomBot.docs.autostart');
+          localStorage.removeItem('paycomBot.docs.postFilterStart');
+          localStorage.removeItem('paycomBot.docs.range');
+        } catch (_) {}
         // Close any modal dialogs the user might be looking at.
         document.getElementById('paycom-bot-confirm')?.remove();
         document.getElementById('paycom-bot-schedule-pick')?.remove();
@@ -2998,6 +3214,12 @@
       if (/\/Doc\/Dashboard/i.test(location.href) && localStorage.getItem('paycomBot.docs.autostart') === '1') {
         localStorage.removeItem('paycomBot.docs.autostart');
         waitForDocTable(() => { if (docsStartFresh) docsStartFresh(); });
+      } else if (/\/Doc\/Dashboard/i.test(location.href) && localStorage.getItem('paycomBot.docs.postFilterStart') === '1') {
+        // Apply Filters reloaded the page mid-start — the filter is already
+        // applied, so continue straight into the download run.
+        localStorage.removeItem('paycomBot.docs.postFilterStart');
+        log('Docs: resuming download after the filter-apply page reload');
+        waitForDocTable(() => { if (docsRunAfterReload) docsRunAfterReload(); });
       }
     }
 
