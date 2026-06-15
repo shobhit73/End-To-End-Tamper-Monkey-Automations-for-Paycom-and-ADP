@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.16.0
+  // @version      0.19.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -289,7 +289,7 @@
     // Both modes IDLE means the user clicked Stop / reset. Used by sleep + waitFor
     // so any in-flight async work bails within ~100ms of the click.
     function shouldAbort() {
-      return !isRunning() && !isPpRunning() && !isSdRunning() && !isTpRunning();
+      return !isRunning() && !isPpRunning() && !isSdRunning() && !isTpRunning() && !isQpRunning();
     }
 
     // Abort-aware sleep: rejects with err.aborted=true if the user clicks Stop
@@ -834,7 +834,7 @@
       hideProgressBanner();
       progressBannerEl = document.createElement('div');
       progressBannerEl.textContent = msg;
-      progressBannerEl.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#0a2c39,#06202B);color:#7AE2CF;border:1px solid rgba(122,226,207,.5);padding:10px 18px;border-radius:999px;font:600 13px "Segoe UI",system-ui,sans-serif;z-index:2147483647;box-shadow:0 8px 24px rgba(0,0,0,.45),0 0 12px rgba(122,226,207,.15)';
+      progressBannerEl.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#354f52,#2f3e46);color:#cad2c5;border:1px solid rgba(132,169,140,.5);padding:10px 18px;border-radius:999px;font:600 13px "Segoe UI",system-ui,sans-serif;z-index:2147483647;box-shadow:0 8px 24px rgba(0,0,0,.45),0 0 12px rgba(132,169,140,.15)';
       document.body.appendChild(progressBannerEl);
     }
     function hideProgressBanner() {
@@ -844,7 +844,7 @@
     function showSuccessBanner(msg) {
       const b = document.createElement('div');
       b.textContent = msg;
-      b.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#8fefdd,#7AE2CF);color:#06202B;padding:10px 18px;border-radius:999px;font:600 14px "Segoe UI",system-ui,sans-serif;z-index:2147483647;box-shadow:0 8px 24px rgba(0,0,0,.35),0 0 14px rgba(122,226,207,.35)';
+      b.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#cad2c5,#84a98c);color:#2f3e46;padding:10px 18px;border-radius:999px;font:600 14px "Segoe UI",system-ui,sans-serif;z-index:2147483647;box-shadow:0 8px 24px rgba(0,0,0,.35),0 0 14px rgba(132,169,140,.35)';
       document.body.appendChild(b);
       setTimeout(() => b.remove(), 6000);
     }
@@ -2200,6 +2200,118 @@
       }
     }
 
+    // ───────────────── Qualified Premiums Report (Report Center slug) ─────────────────
+    // Path-based Report Center URL (no rpt_id). Flow: navigate → set the Date
+    // Range start to 01/01/2026 → Generate → download. Default output format,
+    // no Employee Select-All (the report only needs the date + Generate).
+
+    const QP_STATE_KEY = 'paycomBot.qp.state';
+    const QP_STATES = {
+      IDLE: 'IDLE',
+      AT_REPORT: 'QP_AT_REPORT',
+    };
+    const QP_CONFIG = {
+      // Report Center slug URL the user provided.
+      slug: 'report-center/generate/estimated-qualified-overtime-ta-report',
+      startDate: '01/01/2026',
+    };
+    const qpReportUrl = () =>
+      'https://www.paycomonline.net/v4/cl/web.php/' + QP_CONFIG.slug;
+
+    const getQpState = () => localStorage.getItem(QP_STATE_KEY) || QP_STATES.IDLE;
+    const setQpState = (s) => {
+      if (s === QP_STATES.IDLE) localStorage.removeItem(QP_STATE_KEY);
+      else localStorage.setItem(QP_STATE_KEY, s);
+      refreshPanel();
+      log('QP state →', s);
+    };
+    const isQpRunning = () => getQpState() !== QP_STATES.IDLE;
+
+    function startQualifiedPremiums() {
+      setState(STATES.IDLE);
+      setPpState(PP_STATES.IDLE);
+      setSdState(SD_STATES.IDLE);
+      setTpState(TP_STATES.IDLE);
+      setQpState(QP_STATES.AT_REPORT);
+      showProgressBanner('Qualified Premiums Report: opening…');
+      dispatch();
+    }
+
+    async function qpHandleReportPage() {
+      showProgressBanner('Qualified Premiums Report: loading report form…');
+      log('QP: waiting for report form');
+      await waitFor(
+        () => findGenerateReportButton(),
+        { timeout: 25000, label: 'Qualified Premiums Report form' }
+      );
+      await sleep(500); // settle so the date field is wired up
+
+      // Set the Date Range START date only; leave the end date at the default.
+      // findDateRangeInputs requires both inputs to already hold MM/DD/YYYY, so
+      // fall back to a looser finder if the fields are empty on this report.
+      let dr = findDateRangeInputs();
+      if (!dr) {
+        const label = findVisibleByExactText('Date Range');
+        let container = label;
+        for (let i = 0; label && i < 6 && container; i++) {
+          container = container.parentElement;
+          if (!container) break;
+          const inputs = Array.from(container.querySelectorAll('input[type="text"]')).filter(visible);
+          if (inputs.length >= 1) { dr = { from: inputs[0], to: inputs[1] || null }; break; }
+        }
+      }
+      if (!dr || !dr.from) throw new Error('QP: Date Range start input not found');
+      log('QP: setting start date = ' + QP_CONFIG.startDate);
+      setInputValue(dr.from, QP_CONFIG.startDate);
+      await sleep(400);
+
+      const initialDownloads = getDownloadButtons().length;
+      const genBtn = findGenerateReportButton();
+      if (!genBtn) throw new Error('QP: Generate Report button not found');
+      log('QP: clicking Generate Report');
+      showProgressBanner('Qualified Premiums Report: generating…');
+      clickEl(genBtn);
+
+      log('QP: waiting for Download button (up to 10 min)');
+      await waitFor(
+        () => getDownloadButtons().length > initialDownloads,
+        { timeout: 10 * 60 * 1000, interval: 800, label: 'Qualified Premiums Report Download' }
+      );
+
+      const downloads = getDownloadButtons();
+      downloads.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      log('QP: clicking newest Download button');
+      clickEl(downloads[0]);
+
+      await sleep(1500);
+      hideProgressBanner();
+      showSuccessBanner('✓ Qualified Premiums Report downloaded');
+      setQpState(QP_STATES.IDLE);
+    }
+
+    async function dispatchQualifiedPremiums() {
+      if (!isQpRunning()) return;
+      dismissPrivacyBanner();
+      showProgressBanner('Qualified Premiums Report: opening report page…');
+      const url = location.href;
+      log('QP dispatch on', location.pathname);
+
+      const onQpReport = url.includes(QP_CONFIG.slug);
+      if (!onQpReport) {
+        location.href = qpReportUrl();
+        return;
+      }
+
+      try {
+        await qpHandleReportPage();
+      } catch (err) {
+        if (err.aborted) { log('QP aborted by user'); hideProgressBanner(); return; }
+        hideProgressBanner();
+        alert('Paycom Bot (Qualified Premiums Report): ' + err.message);
+        setQpState(QP_STATES.IDLE);
+      }
+    }
+
     // ───────────────── Page-router state machine ─────────────────
 
     async function dispatch() {
@@ -2207,6 +2319,7 @@
       if (isPpRunning()) return await dispatchPriorPayroll();
       if (isSdRunning()) return await dispatchScheduledDeductions();
       if (isTpRunning()) return await dispatchTaxProfile();
+      if (isQpRunning()) return await dispatchQualifiedPremiums();
     }
 
     async function dispatchCensus() {
@@ -3028,52 +3141,53 @@
       panelEl.id = 'paycom-bot-panel';
       panelEl.innerHTML = `
         <style>
-          /* Palette: #FDEB9E (yellow) #7AE2CF (mint) #077A7D (teal) #06202B (navy) */
-          #paycom-bot-panel{position:fixed;bottom:20px;right:20px;z-index:2147483647;width:268px;padding:0;color:#7AE2CF;
+          /* Palette: #cad2c5 (light sage) #84a98c (sage) #52796f (teal) #354f52 (slate) #2f3e46 (dark) */
+          #paycom-bot-panel{position:fixed;bottom:20px;right:20px;z-index:2147483647;width:268px;padding:0;color:#cad2c5;
             font:13px/1.45 'Segoe UI',system-ui,sans-serif;
-            background:linear-gradient(160deg,#0a2c39 0%,#06202B 55%,#04161f 100%);
-            border:1px solid rgba(122,226,207,.35);border-radius:16px;overflow:hidden;
-            box-shadow:0 14px 40px rgba(0,0,0,.55),0 0 0 1px rgba(7,122,125,.25),inset 0 1px 0 rgba(122,226,207,.12)}
+            background:linear-gradient(160deg,#354f52 0%,#2f3e46 58%,#263238 100%);
+            border:1px solid rgba(132,169,140,.4);border-radius:16px;overflow:hidden;
+            box-shadow:0 14px 40px rgba(0,0,0,.55),0 0 0 1px rgba(82,121,111,.3),inset 0 1px 0 rgba(202,210,197,.12)}
           #paycom-bot-panel.minimized{width:auto}
           #paycom-bot-panel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:move;user-select:none;
-            padding:12px 14px;background:linear-gradient(135deg,#077A7D 0%,#045b5e 100%);
-            border-bottom:1px solid rgba(122,226,207,.25)}
+            padding:12px 14px;background:linear-gradient(135deg,#52796f 0%,#3f5f56 100%);
+            border-bottom:1px solid rgba(202,210,197,.22)}
           #paycom-bot-panel.minimized .hdr{padding:8px 12px;border-bottom:0}
-          #paycom-bot-panel h4{margin:0;color:#FDEB9E;font-size:14px;font-weight:700;letter-spacing:.4px;white-space:nowrap;
+          #paycom-bot-panel h4{margin:0;color:#cad2c5;font-size:14px;font-weight:700;letter-spacing:.4px;white-space:nowrap;
             display:flex;align-items:center;gap:8px}
           #paycom-bot-panel h4::before{content:'';flex:none;width:9px;height:9px;border-radius:50%;
-            background:#FDEB9E;box-shadow:0 0 8px rgba(253,235,158,.9)}
-          #paycom-bot-panel.running h4::before{background:#7AE2CF;box-shadow:0 0 10px #7AE2CF;
+            background:#84a98c;box-shadow:0 0 8px rgba(132,169,140,.9)}
+          #paycom-bot-panel.running h4::before{background:#cad2c5;box-shadow:0 0 10px #cad2c5;
             animation:pcb-pulse 1.1s ease-in-out infinite}
           @keyframes pcb-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.5}}
           #paycom-bot-panel .body{padding:12px 14px 14px}
           #paycom-bot-panel .status{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 6px;
-            color:rgba(122,226,207,.7);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.6px}
-          #paycom-bot-panel .status span{color:#FDEB9E;font-weight:600;font-size:11px;text-transform:none;letter-spacing:0;
-            background:rgba(253,235,158,.07);border:1px solid rgba(253,235,158,.22);padding:2px 9px;border-radius:999px;
+            color:rgba(202,210,197,.65);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.6px}
+          #paycom-bot-panel .status span{color:#cad2c5;font-weight:600;font-size:11px;text-transform:none;letter-spacing:0;
+            background:rgba(132,169,140,.1);border:1px solid rgba(132,169,140,.28);padding:2px 9px;border-radius:999px;
             max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:all .25s ease}
-          #paycom-bot-panel .status span.on{color:#7AE2CF;background:rgba(122,226,207,.12);border-color:rgba(122,226,207,.5);
-            box-shadow:0 0 8px rgba(122,226,207,.25)}
+          #paycom-bot-panel .status span.on{color:#cad2c5;background:rgba(132,169,140,.22);border-color:rgba(132,169,140,.6);
+            box-shadow:0 0 8px rgba(132,169,140,.3)}
           #paycom-bot-panel button{display:block;width:100%;margin-top:8px;padding:9px 12px;border:0;border-radius:9px;
             font-size:13px;font-weight:600;letter-spacing:.2px;cursor:pointer;
             transition:transform .12s ease,box-shadow .12s ease,filter .12s ease}
           #paycom-bot-panel button:hover{transform:translateY(-1px);filter:brightness(1.1);box-shadow:0 7px 16px rgba(0,0,0,.4)}
           #paycom-bot-panel button:active{transform:translateY(0) scale(.98)}
           #paycom-bot-panel .min-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
-            margin:0;padding:0;flex:none;background:rgba(6,32,43,.4);color:#FDEB9E;
-            border:1px solid rgba(253,235,158,.45);border-radius:7px;font-size:15px;font-weight:700;line-height:1;cursor:pointer}
-          #paycom-bot-panel .min-btn:hover{transform:none;box-shadow:none;background:rgba(6,32,43,.7)}
-          #paycom-bot-panel .start{background:linear-gradient(135deg,#0a9396 0%,#077A7D 100%);color:#FDEB9E;margin-top:12px}
-          #paycom-bot-panel .start-pp{background:linear-gradient(135deg,#8fefdd 0%,#7AE2CF 100%);color:#06202B}
-          #paycom-bot-panel .start-sd{background:linear-gradient(135deg,#FDEB9E 0%,#f3d97e 100%);color:#06202B}
-          #paycom-bot-panel .start-tp{background:linear-gradient(135deg,#077A7D 0%,#055254 100%);color:#7AE2CF}
-          #paycom-bot-panel .start-docs{background:linear-gradient(135deg,#7AE2CF 0%,#4ecdb4 100%);color:#06202B}
-          #paycom-bot-panel .inspect-html{background:transparent;color:#7AE2CF;border:1px dashed rgba(122,226,207,.6)}
-          #paycom-bot-panel .inspect-html:hover{background:rgba(122,226,207,.08)}
-          #paycom-bot-panel .stop{background:transparent;color:#FDEB9E;border:1px solid rgba(253,235,158,.55)}
-          #paycom-bot-panel .stop:hover{background:rgba(253,235,158,.1)}
-          #paycom-bot-panel .doc-dl-section{border-top:1px dashed rgba(122,226,207,.3)!important;margin-top:12px!important;padding-top:8px!important}
-          #paycom-bot-panel .doc-dl-section .status{display:block;text-transform:none;letter-spacing:0;font-size:12px;color:#7AE2CF;font-weight:500}
+            margin:0;padding:0;flex:none;background:rgba(47,62,70,.45);color:#cad2c5;
+            border:1px solid rgba(202,210,197,.4);border-radius:7px;font-size:15px;font-weight:700;line-height:1;cursor:pointer}
+          #paycom-bot-panel .min-btn:hover{transform:none;box-shadow:none;background:rgba(47,62,70,.75)}
+          #paycom-bot-panel .start{background:linear-gradient(135deg,#52796f 0%,#3f5f56 100%);color:#cad2c5;margin-top:12px}
+          #paycom-bot-panel .start-pp{background:linear-gradient(135deg,#84a98c 0%,#6d9079 100%);color:#2f3e46}
+          #paycom-bot-panel .start-sd{background:linear-gradient(135deg,#cad2c5 0%,#aebfb0 100%);color:#2f3e46}
+          #paycom-bot-panel .start-tp{background:linear-gradient(135deg,#3f5f56 0%,#354f52 100%);color:#cad2c5}
+          #paycom-bot-panel .start-qp{background:linear-gradient(135deg,#84a98c 0%,#52796f 100%);color:#2f3e46}
+          #paycom-bot-panel .start-docs{background:linear-gradient(135deg,#6d9079 0%,#52796f 100%);color:#cad2c5}
+          #paycom-bot-panel .inspect-html{background:transparent;color:#84a98c;border:1px dashed rgba(132,169,140,.6)}
+          #paycom-bot-panel .inspect-html:hover{background:rgba(132,169,140,.1)}
+          #paycom-bot-panel .stop{background:transparent;color:#cad2c5;border:1px solid rgba(202,210,197,.5)}
+          #paycom-bot-panel .stop:hover{background:rgba(202,210,197,.12)}
+          #paycom-bot-panel .doc-dl-section{border-top:1px dashed rgba(132,169,140,.3)!important;margin-top:12px!important;padding-top:8px!important}
+          #paycom-bot-panel .doc-dl-section .status{display:block;text-transform:none;letter-spacing:0;font-size:12px;color:#cad2c5;font-weight:500}
           #paycom-bot-panel.minimized .body{display:none}
         </style>
         <div class="hdr">
@@ -3086,10 +3200,12 @@
           <div class="status">Prior Payroll <span class="pp-state"></span></div>
           <div class="status">Sched Deductions <span class="sd-state"></span></div>
           <div class="status">Tax Profile <span class="tp-state"></span></div>
+          <div class="status">Qual Premiums <span class="qp-state"></span></div>
           <button class="start">📊 Start Census Report</button>
           <button class="start-pp">🗓️ Run Prior Payroll</button>
           <button class="start-sd">💸 Run Scheduled Deductions</button>
           <button class="start-tp">🧾 Run Tax Profile Report</button>
+          <button class="start-qp">📋 Run Qualified Premiums</button>
           <button class="start-docs">📥 Download All Documents</button>
           <button class="inspect-html" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
           <button class="stop">⏹ Stop / reset</button>
@@ -3097,33 +3213,33 @@
         </div>
       `;
       document.body.appendChild(panelEl);
-      // Restore a position the user dragged the panel to on a previous page load.
-      try {
-        const pos = JSON.parse(localStorage.getItem('paycomBot.panelPos') || 'null');
-        if (pos && pos.left && pos.top) {
-          panelEl.style.left = pos.left;
-          panelEl.style.top = pos.top;
-          panelEl.style.right = 'auto';
-          panelEl.style.bottom = 'auto';
-        }
-      } catch (_) {}
+      // Always start at the bottom-right home corner. (Previous versions saved a
+      // dragged position that could restore off-screen — clear it once.)
+      try { localStorage.removeItem('paycomBot.panelPos'); } catch (_) {}
       panelEl.querySelector('.start').addEventListener('click', () => {
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
+        setQpState(QP_STATES.IDLE);
         setState(STATES.RUNNING);
         dispatch();
       });
       panelEl.querySelector('.start-pp').addEventListener('click', () => {
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
+        setQpState(QP_STATES.IDLE);
         startPriorPayroll();
       });
       panelEl.querySelector('.start-sd').addEventListener('click', () => {
+        setQpState(QP_STATES.IDLE);
         startScheduledDeductions();
       });
       panelEl.querySelector('.start-tp').addEventListener('click', () => {
+        setQpState(QP_STATES.IDLE);
         startTaxProfile();
+      });
+      panelEl.querySelector('.start-qp').addEventListener('click', () => {
+        startQualifiedPremiums();
       });
       panelEl.querySelector('.start-docs').addEventListener('click', () => {
         // Clear the other modes (this isn't part of their state machine) and
@@ -3132,6 +3248,7 @@
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
+        setQpState(QP_STATES.IDLE);
         startDocs();
       });
       panelEl.querySelector('.inspect-html').addEventListener('click', () => {
@@ -3143,6 +3260,7 @@
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
+        setQpState(QP_STATES.IDLE);
         // Abort the document downloader (if mounted on this page) and clear
         // its flags either way, so a queued auto-start can't fire later.
         if (docsStop) docsStop();
@@ -3192,12 +3310,16 @@
         document.addEventListener('mouseup', () => {
           if (!dragging) return;
           dragging = false;
-          try {
-            localStorage.setItem('paycomBot.panelPos',
-              JSON.stringify({ left: panelEl.style.left, top: panelEl.style.top }));
-          } catch (_) {}
+          // A maximized panel dragged low could overflow — re-cap its content so
+          // it stays on screen. A minimized chip just stays where it's dropped;
+          // the next maximize decides the grow direction from there.
+          if (!panelEl.classList.contains('minimized')) pcCapContent();
         });
       })();
+      // Keep the panel on-screen when the window is resized.
+      window.addEventListener('resize', () => {
+        if (panelEl && !panelEl.classList.contains('minimized')) pcCapContent();
+      });
       // Mount the Documents downloader only on the Doc Dashboard page.
       const docSection = panelEl.querySelector('.doc-dl-section');
       if (docSection && /\/Doc\/Dashboard/i.test(location.href)) {
@@ -3210,8 +3332,63 @@
       return panelEl;
     }
 
-    // Collapse/expand the panel body. Persisted so it stays minimized across the
-    // page reloads that Paycom triggers on every click.
+    // Snap the panel back to its bottom-right home corner.
+    function pcSnapHome() {
+      if (!panelEl) return;
+      panelEl.style.left = 'auto';
+      panelEl.style.top = 'auto';
+      panelEl.style.right = '20px';
+      panelEl.style.bottom = '20px';
+    }
+
+    // Cap the maximized panel's body so it never spills past the bottom of the
+    // viewport — WITHOUT moving the panel (no jumping). Used after drag/resize.
+    function pcCapContent() {
+      if (!panelEl || panelEl.classList.contains('minimized')) return;
+      const body = panelEl.querySelector('.body');
+      const hdr = panelEl.querySelector('.hdr');
+      if (!body || !hdr) return;
+      const margin = 16;
+      const below = window.innerHeight - hdr.getBoundingClientRect().bottom - margin;
+      body.style.maxHeight = Math.max(150, below) + 'px';
+      body.style.overflowY = 'auto';
+      body.style.overflowX = 'hidden';
+    }
+
+    // On maximize: keep the chip where it is and grow toward whichever vertical
+    // side has more room (down if more space below the chip, up otherwise),
+    // capping the body height so the whole panel stays on screen.
+    function pcExpandFromChip() {
+      if (!panelEl) return;
+      const body = panelEl.querySelector('.body');
+      const hdr = panelEl.querySelector('.hdr');
+      if (!body || !hdr) return;
+      const rect = hdr.getBoundingClientRect();
+      const headH = rect.height;
+      const margin = 16;
+      panelEl.style.left = rect.left + 'px';
+      panelEl.style.right = 'auto';
+      const spaceBelow = window.innerHeight - rect.top; // header-top → viewport bottom
+      const spaceAbove = rect.bottom;                   // viewport top → header bottom
+      if (spaceBelow >= spaceAbove) {
+        // Grow downward — header stays put, body flows below it.
+        panelEl.style.top = rect.top + 'px';
+        panelEl.style.bottom = 'auto';
+        body.style.maxHeight = Math.max(150, spaceBelow - headH - margin) + 'px';
+      } else {
+        // Grow upward — pin the panel's bottom at the chip's bottom; header rises.
+        panelEl.style.top = 'auto';
+        panelEl.style.bottom = (window.innerHeight - rect.bottom) + 'px';
+        body.style.maxHeight = Math.max(150, rect.bottom - headH - margin) + 'px';
+      }
+      body.style.overflowY = 'auto';
+      body.style.overflowX = 'hidden';
+    }
+
+    // Collapse/expand the panel body. The collapsed state is persisted so it
+    // stays minimized across the page reloads Paycom triggers on every click.
+    // Minimizing snaps the chip back to the bottom-right home; maximizing grows
+    // from the chip toward whichever side has more room.
     function setPanelMinimized(min) {
       if (!panelEl) return;
       panelEl.classList.toggle('minimized', min);
@@ -3221,6 +3398,8 @@
         btn.title = min ? 'Expand panel' : 'Minimize panel';
       }
       try { localStorage.setItem('paycomBot.panelMinimized', min ? '1' : '0'); } catch (_) {}
+      if (min) pcSnapHome();
+      else pcExpandFromChip();
     }
 
     function refreshPanel() {
@@ -3241,15 +3420,16 @@
       setChip('.pp-state', getPpState());
       setChip('.sd-state', getSdState());
       setChip('.tp-state', getTpState());
+      setChip('.qp-state', getQpState());
       // Pulsing header dot while anything is running.
       panelEl.classList.toggle('running',
-        isRunning() || isPpRunning() || isSdRunning() || isTpRunning());
+        isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning());
     }
 
     function init() {
       if (location.href.includes('cl-login.php') || location.href.includes('two-factor')) return;
       ensurePanel();
-      if (isRunning() || isPpRunning() || isSdRunning() || isTpRunning()) setTimeout(dispatch, 800);
+      if (isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning()) setTimeout(dispatch, 800);
       // Auto-start the document download after navigating here from the panel button.
       if (/\/Doc\/Dashboard/i.test(location.href) && localStorage.getItem('paycomBot.docs.autostart') === '1') {
         localStorage.removeItem('paycomBot.docs.autostart');
