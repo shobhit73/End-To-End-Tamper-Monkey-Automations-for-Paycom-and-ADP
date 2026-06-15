@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.0.0
-// @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
+// @version      1.1.4
+// @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
+// @noframes
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -1282,6 +1283,76 @@
     }
   }
 
+  // ───────────────── qualified overtime wages and tips flow ─────────────────
+
+  // Simplest standard-report flow: search → select first result → Run as Excel.
+  // No "What's Displayed" / field-selection step (report runs with its defaults).
+  async function downloadQualifiedOvertime(setStatus) {
+    logInfo('=== Download Qualified Overtime Wages and Tips ===');
+    resetAbort();
+
+    try {
+      setStatus('Step 1: Opening Reports menu…');
+      checkAbort();
+      if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
+
+      setStatus('Step 2: Navigating to All Standard Reports…');
+      checkAbort();
+      if (!await stepClickAllStandardReports()) { setStatus('Step 2 failed — see log'); return; }
+
+      setStatus('Step 3: Searching for Qualified Overtime Wages and Tips…');
+      checkAbort();
+      if (!await stepSearchDojoReport('Qualified Overtime Wages and Tips')) { setStatus('Step 3 failed — see log'); return; }
+
+      setStatus('Step 4: Selecting Qualified Overtime Wages and Tips…');
+      checkAbort();
+      if (!await stepSelectStandardReportByTitle('Qualified Overtime Wages and Tips')) { setStatus('Step 4 failed — see log'); return; }
+
+      setStatus('Step 5: Waiting for Run Report page…');
+      checkAbort();
+      if (!await stepWaitForRunReportPage()) { setStatus('Step 5 failed — see log'); return; }
+
+      // stepWaitForRunReportPage returns as soon as the button TEXT appears, but
+      // ADP is still rendering. Clicking too early makes ADP treat it as a bot
+      // click and silently drop it, so wait for the page sections to populate
+      // and then settle before clicking Run as Excel.
+      setStatus('Step 5b: Waiting for report page to fully load…');
+      logInfo('Waiting for report sections to populate...');
+      let sectionsReady = false;
+      for (let i = 0; i < 30; i++) { // up to ~15s
+        checkAbort();
+        const allText = deepQueryAll('*').filter(visible);
+        for (const el of allText) {
+          const txt = (el.textContent || '').trim();
+          if (txt === 'Included Fields' || txt === 'Sort Order' ||
+            txt === 'What\'s Displayed on the Report' || txt.startsWith('All Employees')) {
+            sectionsReady = true; break;
+          }
+        }
+        if (sectionsReady) { logSuccess('Report sections populated'); break; }
+        await sleep(500);
+      }
+      // Extra settle so ADP finishes wiring up the page before we click.
+      await sleep(3000);
+
+      setStatus('Step 6: Running report…');
+      checkAbort();
+      if (!await stepClickRunAsExcel()) { setStatus('Step 6 failed — see log'); return; }
+
+      setStatus('Qualified Overtime Report triggered ✓');
+      logSuccess('=== Qualified Overtime Wages and Tips complete ===');
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Qualified Overtime Report aborted');
+        logWarn('Flow aborted by user');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + (err && err.message ? err.message : err));
+    }
+  }
+
   // ───────────────── direct deposit report flow ─────────────────
 
   // Configure Appearance for Direct Deposit: unmask both Tax ID and Bank Account dropdowns
@@ -2422,6 +2493,7 @@
       { name: 'Payroll History', fn: downloadPayrollHistory },
       { name: 'Deduction', fn: downloadDeductionReport },
       { name: 'Direct Deposit', fn: downloadDirectDeposit },
+      { name: 'Qualified Overtime', fn: downloadQualifiedOvertime },
     ];
 
     for (let i = 0; i < flows.length; i++) {
@@ -2605,28 +2677,73 @@
     const contentDiv = document.createElement('div');
     contentDiv.id = 'adp-bot-content';
 
+    const HOME_MARGIN = 24;
+
+    // Snap the panel back to its bottom-right home corner.
+    function snapHome() {
+      wrapper.style.left = 'auto';
+      wrapper.style.top = 'auto';
+      wrapper.style.right = HOME_MARGIN + 'px';
+      wrapper.style.bottom = HOME_MARGIN + 'px';
+    }
+
+    // Cap the maximized panel's content so it never spills past the bottom of the
+    // viewport — WITHOUT moving the panel (no jumping). Used after a drag/resize.
+    function capContent() {
+      const margin = 16;
+      const rect = titleRow.getBoundingClientRect();
+      const below = window.innerHeight - rect.bottom - margin;
+      contentDiv.style.maxHeight = Math.max(150, below) + 'px';
+    }
+
+    // On maximize: keep the chip where it is and grow toward whichever vertical
+    // side has more room (down if more space below the chip, up otherwise),
+    // capping the content height so the whole panel stays on screen.
+    function expandFromChip() {
+      const margin = 16;
+      const rect = titleRow.getBoundingClientRect();
+      const headH = rect.height;
+      wrapper.style.left = rect.left + 'px';
+      wrapper.style.right = 'auto';
+      const spaceBelow = window.innerHeight - rect.top; // header-top → viewport bottom
+      const spaceAbove = rect.bottom;                   // viewport top → header bottom
+      if (spaceBelow >= spaceAbove) {
+        // Grow downward — header stays put, content flows below it.
+        wrapper.style.top = rect.top + 'px';
+        wrapper.style.bottom = 'auto';
+        contentDiv.style.maxHeight = Math.max(150, spaceBelow - headH - margin) + 'px';
+      } else {
+        // Grow upward — pin the panel's bottom at the chip's bottom; header rises.
+        wrapper.style.top = 'auto';
+        wrapper.style.bottom = (window.innerHeight - rect.bottom) + 'px';
+        contentDiv.style.maxHeight = Math.max(150, rect.bottom - headH - margin) + 'px';
+      }
+    }
+
     let minimized = false;
     function togglePanel() {
       minimized = !minimized;
-      contentDiv.style.display = minimized ? 'none' : 'block';
       toggleBtn.classList.toggle('min', minimized);
-      wrapper.style.width = minimized ? 'auto' : '324px';
+      if (minimized) {
+        // Collapse to the chip and return it to the bottom-right home corner.
+        contentDiv.style.display = 'none';
+        wrapper.style.width = 'auto';
+        snapHome();
+      } else {
+        // Expand from wherever the chip is, toward the side with more room.
+        contentDiv.style.display = 'block';
+        wrapper.style.width = '324px';
+        expandFromChip();
+      }
     }
     toggleBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePanel(); });
+    // On window resize, re-cap the content (no reposition) so it stays on-screen.
+    window.addEventListener('resize', () => { if (!minimized) capContent(); });
 
     // ---- Drag the panel by its title bar (position persists across reloads) ----
     let dragMoved = false;
     (function makeDraggable() {
       let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
-      try {
-        const p = JSON.parse(localStorage.getItem('adpBot.pos') || 'null');
-        if (p && typeof p.left === 'number') {
-          wrapper.style.left = p.left + 'px';
-          wrapper.style.top = p.top + 'px';
-          wrapper.style.right = 'auto';
-          wrapper.style.bottom = 'auto';
-        }
-      } catch (_) { }
 
       titleRow.addEventListener('mousedown', (e) => {
         if (e.target === toggleBtn) return; // don't drag when hitting the collapse button
@@ -2651,12 +2768,16 @@
       document.addEventListener('mouseup', () => {
         if (!dragging) return;
         dragging = false;
-        if (dragMoved) {
-          const r = wrapper.getBoundingClientRect();
-          try { localStorage.setItem('adpBot.pos', JSON.stringify({ left: r.left, top: r.top })); } catch (_) { }
-        }
+        // If the maximized panel was dragged, re-cap its content so it can't run
+        // off the bottom. (A minimized chip drag just stays where it's dropped;
+        // the next maximize decides the grow direction from there.)
+        if (dragMoved && !minimized) capContent();
       });
     })();
+
+    // One-time cleanup of the old persisted position (previous versions saved a
+    // dragged spot that could restore off-screen). Safe to remove every load.
+    try { localStorage.removeItem('adpBot.pos'); } catch (_) { }
 
     // A real click on the title (not a drag) toggles collapse.
     titleRow.addEventListener('click', () => {
@@ -2728,6 +2849,7 @@
     mkItem('💰', 'Payroll History', withRunGuard(downloadPayrollHistory));
     mkItem('🧮', 'Deduction', withRunGuard(downloadDeductionReport));
     mkItem('🏦', 'Direct Deposit', withRunGuard(downloadDirectDeposit));
+    mkItem('⏱️', 'Qualified Overtime', withRunGuard(downloadQualifiedOvertime));
 
     // Utility row: Stop + diagnostic as quiet ghost buttons.
     const utilRow = document.createElement('div');
