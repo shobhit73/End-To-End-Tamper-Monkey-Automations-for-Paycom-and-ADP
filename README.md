@@ -15,12 +15,12 @@ click yourself.
 
 ## Scripts
 
-| Script | Site | What it does |
-| ------ | ---- | ------------ |
-| [`paycom-reports.user.js`](paycom-reports.user.js) | `paycomonline.net/v4/cl/*` | Census report (full ARW wizard), Prior Payroll YTD (per-quarter / per-pay-period), Scheduled Deductions, Tax Profile, and **Download All Documents** (Doc Dashboard bulk export) |
-| [`adp-reports.user.js`](adp-reports.user.js) | `workforcenow.adp.com/*` | Unified panel: report automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit) + **Export Documents** bot (auto-detect categories, sequential export, auto-download) |
-| [`uzio-employee-history.user.js`](uzio-employee-history.user.js) | `*.uzio.com/*` | Bulk **Employee Profile Change Report** downloader — paste visible Employee IDs, the bot resolves them to internal GUIDs from the grid and clicks each row's download button |
-| [`uzio-deductions.user.js`](uzio-deductions.user.js) | `app.uzio.com/*` | **Setup auto-create** — reads the Earnings / Deductions / Contributions tabs of the Payroll Setup Helper `.xlsx` and creates each item in UZIO, with verified saves and pause/skip/resume on failure |
+| Script | Ver | Site | What it does |
+| ------ | --- | ---- | ------------ |
+| [`paycom-reports.user.js`](paycom-reports.user.js) | 0.19.0 | `paycomonline.net/v4/cl/*` | Census report (full ARW wizard), Prior Payroll YTD (per-quarter / per-pay-period), Scheduled Deductions, Tax Profile, Qualified Premiums, and **Download All Documents** (Doc Dashboard bulk export) |
+| [`adp-reports.user.js`](adp-reports.user.js) | 1.1.4 | `workforcenow.adp.com/*` | Unified panel: report automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + **Export Documents** bot (auto-detect categories, sequential export, auto-download) |
+| [`uzio-employee-history.user.js`](uzio-employee-history.user.js) | 0.12.0 | `*.uzio.com/*` | Bulk **Employee Profile Change Report** downloader — paste visible Employee IDs, the bot resolves them to internal GUIDs from the grid and clicks each row's download button |
+| [`uzio-deductions.user.js`](uzio-deductions.user.js) | 0.36.0 | `app.uzio.com/*` | **Setup auto-create** — reads the Earnings / Deductions / Contributions tabs of the Payroll Setup Helper `.xlsx` and creates each item in UZIO, with verified saves and pause/skip/resume on failure |
 
 ## Installation
 
@@ -35,6 +35,8 @@ click yourself.
 ## Highlights
 
 ### Paycom Bot (`paycom-reports.user.js`)
+- **Reports** — one-click buttons for Census, Prior Payroll, Scheduled Deductions, Tax
+  Profile, and Qualified Premiums; each drives Paycom's Report Center / ARW wizard end-to-end.
 - **Cross-page state machine** — Paycom reloads the page on nearly every click, so each
   mode persists its state in `localStorage` and a dispatcher resumes the flow on load.
 - **Download All Documents** — prompts for a start year, applies the *Last Modified* filter
@@ -42,12 +44,14 @@ click yourself.
   every file via `fetch → Blob` (verified size/status, retries, resumable, pause/stop).
 - **Inspect Element HTML** — click it, then click anything on the page: the element's
   `outerHTML` is copied to your clipboard for fast selector debugging.
-- Draggable, minimizable panel with live status pills and a pulsing run indicator.
+- Draggable, minimizable glass-themed panel with live status pills and a pulsing run indicator.
 
 ### ADP Bot (`adp-reports.user.js`)
 - Drives ADP's mixed UI stack (Stencil shadow DOM + legacy Dojo iframes + React views)
   through deep DOM queries that pierce shadow roots and same-origin iframes.
-- **Download All** runs every report back-to-back; each report is also a one-click button.
+- **Download All** runs every report back-to-back; each report is also a one-click button —
+  Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, and Qualified
+  Overtime Wages and Tips.
 - **Export Documents** module auto-detects document categories and exports them
   sequentially with automatic downloads.
 
