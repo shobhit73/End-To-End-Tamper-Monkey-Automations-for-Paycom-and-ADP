@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.1.4
+// @version      1.2.3
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -511,10 +511,11 @@
 
   // Step 3: click "Create new report" (a Dojo dijit widget inside the iframe).
   async function stepCreateNewReport() {
+    // Up to 60s — the All Custom Reports iframe can be slow to render.
     let createBtn = null;
-    for (let i = 0; i < 30 && !createBtn; i++) {
+    for (let i = 0; i < 120 && !createBtn; i++) {
       createBtn = findVisibleClickableByText('Create new report');
-      if (!createBtn) await sleep(300);
+      if (!createBtn) await sleep(500);
     }
     if (!createBtn) {
       logError('"Create new report" button not found');
@@ -527,11 +528,13 @@
 
   // Step 4: fill the Report Title input.
   async function stepFillReportTitle(title) {
+    // Up to 60s — the "Set Up New Report" page can render slowly (ADP/Dojo,
+    // worse on a throttled/backgrounded tab), and the title input appears late.
     let titleInput = null;
-    for (let i = 0; i < 30 && !titleInput; i++) {
+    for (let i = 0; i < 120 && !titleInput; i++) {
       titleInput = deepQueryAll('input').filter(visible)
         .find(inp => /report ?name|report ?title/i.test(inp.placeholder || ''));
-      if (!titleInput) await sleep(300);
+      if (!titleInput) await sleep(500);
     }
     if (!titleInput) {
       logError('Report Title input not found');
@@ -552,10 +555,11 @@
 
   // Step 5: click Select Fields.
   async function stepClickSelectFields() {
+    // Up to 45s — the Set Up New Report page can render the button late.
     let sfBtn = null;
-    for (let i = 0; i < 15 && !sfBtn; i++) {
+    for (let i = 0; i < 90 && !sfBtn; i++) {
       sfBtn = findVisibleClickableByText('Select Fields');
-      if (!sfBtn) await sleep(300);
+      if (!sfBtn) await sleep(500);
     }
     if (!sfBtn) {
       logError('Select Fields button not found');
@@ -846,7 +850,11 @@
   // Instead of looking for a specific heading tag, we look for elements that only
   // appear on this page: "What's Displayed on the Report" or "Run as Excel".
   async function stepWaitForRunReportPage() {
-    for (let i = 0; i < 40; i++) { // up to 20s
+    // Up to 60s — ADP's Dojo widgets can be slow to render the action area,
+    // especially on a backgrounded/throttled tab. Callers that need the report
+    // sections wait for them separately after this returns, so detecting the
+    // page is enough here.
+    for (let i = 0; i < 120; i++) { // up to 60s
       const clickables = deepQueryAll(CLICKABLE_HOST_SELECTOR).filter(visible);
       for (const el of clickables) {
         const text = normalize(el.textContent || el.value);
@@ -854,6 +862,16 @@
           text.includes("what’s displayed on the report") ||
           text === 'run as excel' || text === 'save my settings') {
           logSuccess('Run Report page loaded');
+          return true;
+        }
+      }
+      // Fallback: the "Run Report" page heading itself. The page shell often
+      // appears before the Dojo action widgets finish; this avoids a false
+      // timeout when the heading is clearly present.
+      const headings = deepQueryAll('h1, h2, h3, [role="heading"]').filter(visible);
+      for (const h of headings) {
+        if (normalize(h.textContent) === 'run report') {
+          logSuccess('Run Report page loaded (heading detected)');
           return true;
         }
       }
@@ -1705,12 +1723,98 @@
       const to = toMM + '/01/' + toYear;
 
       quarters.push({
+        quarter: q,                       // 1-4, used for selection + view logic
         label: 'Q' + q + ' ' + year,
         from: from,
         to: to
       });
     }
     return quarters;
+  }
+
+  // Modal: choose which quarters to download. Resolves to the selected quarters
+  // array, or null if the user cancels (or Stop/reset is pressed). Every quarter
+  // is ticked by default; unticking one skips that quarter. Styled to match the
+  // cobalt-blue panel.
+  function showQuarterPickDialog(quarters) {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('adp-quarter-pick');
+      if (existing) existing.remove();
+
+      const overlay = document.createElement('div');
+      overlay.id = 'adp-quarter-pick';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,8,22,.62);z-index:2147483647;' +
+        'display:flex;align-items:center;justify-content:center;font:14px "Segoe UI",system-ui,sans-serif;';
+
+      const box = document.createElement('div');
+      box.style.cssText = 'width:340px;max-width:92vw;color:#dce9ff;border-radius:16px;overflow:hidden;' +
+        'background:linear-gradient(165deg,rgba(2,20,46,.98),rgba(0,36,86,.96));' +
+        'border:1px solid rgba(90,159,255,.3);box-shadow:0 18px 50px rgba(0,0,0,.6);';
+
+      const head = document.createElement('div');
+      head.style.cssText = 'padding:14px 16px;font-weight:700;font-size:15px;color:#fff;' +
+        'background:linear-gradient(90deg,rgba(0,71,171,.45),rgba(0,100,241,.12));border-bottom:1px solid rgba(90,159,255,.2);';
+      head.textContent = 'Payroll History — choose quarters';
+      box.appendChild(head);
+
+      const body = document.createElement('div');
+      body.style.cssText = 'padding:12px 16px;';
+      const hint = document.createElement('div');
+      hint.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:10px;';
+      hint.textContent = 'All quarters up to the current one are selected. Untick any to skip it.';
+      body.appendChild(hint);
+
+      const checks = [];
+      quarters.forEach((q) => {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:9px 11px;margin-bottom:7px;cursor:pointer;' +
+          'background:rgba(0,71,171,.22);border:1px solid rgba(125,179,255,.18);border-radius:10px;';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = true;
+        cb.style.cssText = 'width:16px;height:16px;accent-color:#0064f1;cursor:pointer;';
+        const txt = document.createElement('span');
+        txt.style.cssText = 'font-weight:600;color:#eaf2ff;';
+        txt.textContent = q.label;
+        row.appendChild(cb);
+        row.appendChild(txt);
+        body.appendChild(row);
+        checks.push(cb);
+      });
+      box.appendChild(body);
+
+      const btns = document.createElement('div');
+      btns.style.cssText = 'display:flex;gap:8px;padding:0 16px 16px;';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = 'flex:1;padding:10px;border:1px solid rgba(125,179,255,.35);background:transparent;' +
+        'color:#9fc2ff;border-radius:10px;cursor:pointer;font-weight:600;';
+      const confirmBtn = document.createElement('button');
+      confirmBtn.textContent = 'Download selected';
+      confirmBtn.style.cssText = 'flex:2;padding:10px;border:0;border-radius:10px;cursor:pointer;font-weight:700;color:#fff;' +
+        'background:linear-gradient(120deg,#0055ce,#0064f1 45%,#00a4cc);';
+      btns.appendChild(cancelBtn);
+      btns.appendChild(confirmBtn);
+      box.appendChild(btns);
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearInterval(poll);
+        overlay.remove();
+        resolve(val);
+      };
+      cancelBtn.addEventListener('click', () => finish(null));
+      confirmBtn.addEventListener('click', () => finish(quarters.filter((_, i) => checks[i].checked)));
+      // Stop/reset (requestAbort) or external removal closes the dialog as a cancel.
+      const poll = setInterval(() => {
+        if (shouldAbort() || !document.body.contains(overlay)) finish(null);
+      }, 200);
+    });
   }
 
   // Helper: click a VDL dropdown, then select an option by text
@@ -2102,6 +2206,26 @@
 
   async function selectFields(columns, setStatus) {
     const failed = [];
+
+    // The canvas search INPUT appears a few seconds before the field ROWS
+    // render. Without this, the very first field (e.g. "Associate ID") gets
+    // searched against an empty list, its retry window expires before the rows
+    // appear, and only that first field ends up missing. Prime the search with
+    // the first column and wait until field rows are actually present.
+    if (columns.length) {
+      setStatus('Waiting for the field list to load…');
+      const firstTerm = FIELD_NAME_CORRECTIONS[columns[0]] || columns[0].split(' (')[0];
+      const fieldRowsPresent = () => deepQueryAll(
+        '.field-label-truncate, .adpr-column-label, span.field-label, span[data-ng-bind]'
+      ).filter(visible).length > 0;
+      for (let i = 0; i < 60; i++) { // up to ~30s
+        if (fieldRowsPresent()) break;
+        if (i % 4 === 0) triggerFieldSearch(firstTerm); // nudge the search periodically
+        await sleep(500);
+      }
+      await sleep(600); // let the filtered results settle
+    }
+
     for (let i = 0; i < columns.length; i++) {
       const col = columns[i];
       setStatus('Selecting field ' + (i + 1) + '/' + columns.length + ': ' + col.slice(0, 40));
@@ -2112,7 +2236,7 @@
 
       let success = false;
       let attempts = 0;
-      const maxAttempts = 10;
+      const maxAttempts = 14;
       while (!success && attempts < maxAttempts) {
         detectAndCloseModal();
         success = findFieldAndAdd(col);
@@ -2336,6 +2460,17 @@
     resetAbort();
 
     try {
+      // Ask which quarters to download BEFORE any navigation. The list is Q1
+      // through the current calendar quarter, all ticked by default; unticked
+      // quarters are skipped. Cancel (or Stop) downloads nothing.
+      const allQuarters = getQuartersToDownload();
+      const currentQuarter = allQuarters.length ? allQuarters[allQuarters.length - 1].quarter : 0;
+      setStatus('Choose quarters to download…');
+      const quarters = await showQuarterPickDialog(allQuarters);
+      if (quarters === null) { setStatus('Payroll History cancelled'); logInfo('Quarter selection cancelled'); return; }
+      if (!quarters.length) { setStatus('No quarters selected — nothing to download'); logWarn('No quarters selected'); return; }
+      logInfo('Selected quarters: ' + quarters.map(q => q.label).join(', '));
+
       setStatus('Step 1: Opening Reports menu…');
       checkAbort();
       if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
@@ -2391,9 +2526,8 @@
         logWarn('Some payroll fields could not be selected — continuing anyway');
       }
 
-      // Calculate quarters to download
-      const quarters = getQuartersToDownload();
-      logInfo('Current quarter: Q' + quarters.length + '. Quarters to download: ' + quarters.map(q => q.label).join(', '));
+      // `quarters` (the user-selected subset) was chosen via the dialog above.
+      logInfo('Downloading ' + quarters.length + ' quarter(s): ' + quarters.map(q => q.label).join(', '));
 
       // Loop through each quarter
       for (let qi = 0; qi < quarters.length; qi++) {
@@ -2444,9 +2578,11 @@
           }
         }
 
-        // Open Appearance settings and configure for this quarter
-        // Closed quarters (all except last) get totals view; current quarter gets detailed view
-        const isClosedQuarter = qi < quarters.length - 1;
+        // Open Appearance settings and configure for this quarter.
+        // Past (closed) quarters get the totals view; the current calendar
+        // quarter gets the detailed view. Keyed on the actual quarter number so
+        // a partial selection still classifies each quarter correctly.
+        const isClosedQuarter = q.quarter < currentQuarter;
         const viewType = isClosedQuarter ? 'totals' : 'detailed';
         setStatus('Configuring ' + viewType + ' view for ' + q.label + ' (' + q.from + ' → ' + q.to + ')…');
         checkAbort();
