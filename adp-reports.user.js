@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.2.3
+// @version      1.3.0
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1700,43 +1700,52 @@
 
   // ───────────────── payroll: appearance + quarterly download ─────────────────
 
-  // Helper: calculate which quarters to download based on current date.
+  // Build the { quarter, label, from, to } descriptor for one quarter of a year.
   // ADP requires start date +1 day and end date +1 day for correct filtering.
-  function getQuartersToDownload() {
+  function buildQuarterInfo(q, year) {
+    const startMonth = (q - 1) * 3 + 1; // 1, 4, 7, 10
+    const endMonth = q * 3;              // 3, 6, 9, 12
+
+    // From = quarter start + 1 day (e.g. Q1 = 01/02)
+    const fromMM = String(startMonth).padStart(2, '0');
+    const from = fromMM + '/02/' + year;
+
+    // To = quarter end + 1 day (rolls into next month's 1st)
+    let toMonth = endMonth + 1;
+    let toYear = year;
+    if (toMonth > 12) { toMonth = 1; toYear = year + 1; }
+    const toMM = String(toMonth).padStart(2, '0');
+    const to = toMM + '/01/' + toYear;
+
+    return {
+      quarter: q,                       // 1-4, used for selection + view logic
+      label: 'Q' + q + ' ' + year,
+      from: from,
+      to: to
+    };
+  }
+
+  // Quarters Q1 … currentQuarter. currentQuarter defaults to the calendar
+  // quarter, but the caller (the picker dialog) can pass a user-chosen one.
+  function getQuartersToDownload(currentQuarter) {
     const now = new Date();
     const year = now.getFullYear();
-    const currentQuarter = Math.floor(now.getMonth() / 3) + 1;
+    const cq = currentQuarter || (Math.floor(now.getMonth() / 3) + 1);
     const quarters = [];
-    for (let q = 1; q <= currentQuarter; q++) {
-      const startMonth = (q - 1) * 3 + 1; // 1, 4, 7, 10
-      const endMonth = q * 3;              // 3, 6, 9, 12
-
-      // From = quarter start + 1 day (e.g. Q1 = 01/02)
-      const fromMM = String(startMonth).padStart(2, '0');
-      const from = fromMM + '/02/' + year;
-
-      // To = quarter end + 1 day (rolls into next month's 1st)
-      let toMonth = endMonth + 1;
-      let toYear = year;
-      if (toMonth > 12) { toMonth = 1; toYear = year + 1; }
-      const toMM = String(toMonth).padStart(2, '0');
-      const to = toMM + '/01/' + toYear;
-
-      quarters.push({
-        quarter: q,                       // 1-4, used for selection + view logic
-        label: 'Q' + q + ' ' + year,
-        from: from,
-        to: to
-      });
-    }
+    for (let q = 1; q <= cq; q++) quarters.push(buildQuarterInfo(q, year));
     return quarters;
   }
 
-  // Modal: choose which quarters to download. Resolves to the selected quarters
-  // array, or null if the user cancels (or Stop/reset is pressed). Every quarter
-  // is ticked by default; unticking one skips that quarter. Styled to match the
-  // cobalt-blue panel.
-  function showQuarterPickDialog(quarters) {
+  // Modal: choose the current (live) quarter and which quarters to download.
+  // Resolves to { quarters: [...selected], currentQuarter: n }, or null if the
+  // user cancels (or Stop/reset is pressed).
+  //  - The "Current (live) quarter" selector (default = the calendar quarter)
+  //    drives the split: quarters BEFORE it are consolidated (Totals Only), and
+  //    the chosen quarter itself is detailed / per pay period.
+  //  - The quarter list shows Q1 … currentQuarter, all ticked by default;
+  //    unticking one skips it. Changing the selector rebuilds the list.
+  // Styled to match the cobalt-blue panel.
+  function showQuarterPickDialog(year, defaultCurrentQuarter) {
     return new Promise((resolve) => {
       const existing = document.getElementById('adp-quarter-pick');
       if (existing) existing.remove();
@@ -1747,7 +1756,7 @@
         'display:flex;align-items:center;justify-content:center;font:14px "Segoe UI",system-ui,sans-serif;';
 
       const box = document.createElement('div');
-      box.style.cssText = 'width:340px;max-width:92vw;color:#dce9ff;border-radius:16px;overflow:hidden;' +
+      box.style.cssText = 'width:360px;max-width:92vw;color:#dce9ff;border-radius:16px;overflow:hidden;' +
         'background:linear-gradient(165deg,rgba(2,20,46,.98),rgba(0,36,86,.96));' +
         'border:1px solid rgba(90,159,255,.3);box-shadow:0 18px 50px rgba(0,0,0,.6);';
 
@@ -1759,28 +1768,64 @@
 
       const body = document.createElement('div');
       body.style.cssText = 'padding:12px 16px;';
+
+      // Current (live) quarter selector — drives the consolidated/detailed split.
+      const cqLabel = document.createElement('div');
+      cqLabel.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:5px;';
+      cqLabel.textContent = 'Select the Quarter in which client will run first payroll in UZIO';
+      body.appendChild(cqLabel);
+
+      const cqSelect = document.createElement('select');
+      cqSelect.style.cssText = 'width:100%;padding:8px 10px;margin-bottom:12px;border-radius:9px;' +
+        'background:rgba(0,71,171,.3);color:#eaf2ff;border:1px solid rgba(125,179,255,.4);' +
+        'font:600 13px "Segoe UI",system-ui,sans-serif;cursor:pointer;';
+      [1, 2, 3, 4].forEach((q) => {
+        const opt = document.createElement('option');
+        opt.value = String(q);
+        opt.textContent = 'Q' + q + ' ' + year;
+        opt.style.cssText = 'color:#000;';
+        if (q === defaultCurrentQuarter) opt.selected = true;
+        cqSelect.appendChild(opt);
+      });
+      body.appendChild(cqSelect);
+
       const hint = document.createElement('div');
       hint.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:10px;';
-      hint.textContent = 'All quarters up to the current one are selected. Untick any to skip it.';
+      hint.textContent = 'Untick any quarter to skip it.';
       body.appendChild(hint);
 
-      const checks = [];
-      quarters.forEach((q) => {
-        const row = document.createElement('label');
-        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:9px 11px;margin-bottom:7px;cursor:pointer;' +
-          'background:rgba(0,71,171,.22);border:1px solid rgba(125,179,255,.18);border-radius:10px;';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = true;
-        cb.style.cssText = 'width:16px;height:16px;accent-color:#0064f1;cursor:pointer;';
-        const txt = document.createElement('span');
-        txt.style.cssText = 'font-weight:600;color:#eaf2ff;';
-        txt.textContent = q.label;
-        row.appendChild(cb);
-        row.appendChild(txt);
-        body.appendChild(row);
-        checks.push(cb);
-      });
+      // Rebuildable quarter checkbox list (Q1 … selected current quarter).
+      const listWrap = document.createElement('div');
+      body.appendChild(listWrap);
+      let checks = [];
+      let listQuarters = [];
+      function rebuildList() {
+        const cq = parseInt(cqSelect.value, 10);
+        listWrap.innerHTML = '';
+        checks = [];
+        listQuarters = [];
+        for (let q = 1; q <= cq; q++) listQuarters.push(buildQuarterInfo(q, year));
+        listQuarters.forEach((q) => {
+          const row = document.createElement('label');
+          row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:9px 11px;margin-bottom:7px;cursor:pointer;' +
+            'background:rgba(0,71,171,.22);border:1px solid rgba(125,179,255,.18);border-radius:10px;';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.checked = true;
+          cb.style.cssText = 'width:16px;height:16px;accent-color:#0064f1;cursor:pointer;';
+          const txt = document.createElement('span');
+          txt.style.cssText = 'font-weight:600;color:#eaf2ff;';
+          const tag = q.quarter < cq ? 'consolidated' : 'per pay period';
+          txt.innerHTML = q.label + ' <span style="font-weight:400;color:#9fc2ff;font-size:11px;">(' + tag + ')</span>';
+          row.appendChild(cb);
+          row.appendChild(txt);
+          listWrap.appendChild(row);
+          checks.push(cb);
+        });
+      }
+      rebuildList();
+      cqSelect.addEventListener('change', rebuildList);
+
       box.appendChild(body);
 
       const btns = document.createElement('div');
@@ -1809,7 +1854,10 @@
         resolve(val);
       };
       cancelBtn.addEventListener('click', () => finish(null));
-      confirmBtn.addEventListener('click', () => finish(quarters.filter((_, i) => checks[i].checked)));
+      confirmBtn.addEventListener('click', () => finish({
+        quarters: listQuarters.filter((_, i) => checks[i].checked),
+        currentQuarter: parseInt(cqSelect.value, 10)
+      }));
       // Stop/reset (requestAbort) or external removal closes the dialog as a cancel.
       const poll = setInterval(() => {
         if (shouldAbort() || !document.body.contains(overlay)) finish(null);
@@ -2459,17 +2507,28 @@
     logInfo('=== Download Payroll History ===');
     resetAbort();
 
+    // Payroll History runs against ADP's Dojo-heavy Standard Reports pages,
+    // which are slow to wire up their widgets. PH_PAD is an extra settle pause
+    // inserted before the click-heavy steps in THIS flow only, to avoid the
+    // "DOJO not found" failures that force a re-run. Abort-aware (uses sleep).
+    const PH_PAD = 2000;
+
     try {
-      // Ask which quarters to download BEFORE any navigation. The list is Q1
-      // through the current calendar quarter, all ticked by default; unticked
-      // quarters are skipped. Cancel (or Stop) downloads nothing.
-      const allQuarters = getQuartersToDownload();
-      const currentQuarter = allQuarters.length ? allQuarters[allQuarters.length - 1].quarter : 0;
+      // Ask which quarters to download BEFORE any navigation. The user picks the
+      // current (live) quarter (default = the calendar quarter): quarters before
+      // it are consolidated, that quarter is per pay period. Every listed quarter
+      // is ticked by default; unticked quarters are skipped. Cancel downloads
+      // nothing.
+      const now = new Date();
+      const year = now.getFullYear();
+      const calendarQuarter = Math.floor(now.getMonth() / 3) + 1;
       setStatus('Choose quarters to download…');
-      const quarters = await showQuarterPickDialog(allQuarters);
-      if (quarters === null) { setStatus('Payroll History cancelled'); logInfo('Quarter selection cancelled'); return; }
+      const pick = await showQuarterPickDialog(year, calendarQuarter);
+      if (pick === null) { setStatus('Payroll History cancelled'); logInfo('Quarter selection cancelled'); return; }
+      const quarters = pick.quarters;
+      const currentQuarter = pick.currentQuarter;
       if (!quarters.length) { setStatus('No quarters selected — nothing to download'); logWarn('No quarters selected'); return; }
-      logInfo('Selected quarters: ' + quarters.map(q => q.label).join(', '));
+      logInfo('Current (live) quarter: Q' + currentQuarter + '. Selected: ' + quarters.map(q => q.label).join(', '));
 
       setStatus('Step 1: Opening Reports menu…');
       checkAbort();
@@ -2485,6 +2544,7 @@
 
       setStatus('Step 4: Selecting Payroll History (Standard)…');
       checkAbort();
+      await sleep(PH_PAD); // let the Dojo search results settle before clicking
       if (!await stepSelectPayrollHistoryStandard()) { setStatus('Step 4 failed — see log'); return; }
 
       setStatus('Step 5: Waiting for Run Report page…');
@@ -2512,7 +2572,7 @@
         }
         await sleep(500);
       }
-      await sleep(2000); // extra buffer for Dojo widget init
+      await sleep(2000 + PH_PAD); // extra buffer for Dojo widget init
 
       setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
       checkAbort();
@@ -2548,6 +2608,7 @@
           checkAbort();
           if (!await stepSearchPayrollHistory()) { setStatus('Re-nav step 3 failed'); return; }
           checkAbort();
+          await sleep(PH_PAD); // let the Dojo search results settle before clicking
           if (!await stepSelectPayrollHistoryStandard()) { setStatus('Re-nav step 4 failed'); return; }
           checkAbort();
           if (!await stepWaitForRunReportPage()) { setStatus('Re-nav step 5 failed'); return; }
@@ -2566,7 +2627,7 @@
             if (found) break;
             await sleep(500);
           }
-          await sleep(2000);
+          await sleep(2000 + PH_PAD);
 
           // Re-select fields for this run
           setStatus('Re-selecting fields for ' + q.label + '…');
@@ -2579,14 +2640,15 @@
         }
 
         // Open Appearance settings and configure for this quarter.
-        // Past (closed) quarters get the totals view; the current calendar
-        // quarter gets the detailed view. Keyed on the actual quarter number so
-        // a partial selection still classifies each quarter correctly.
+        // Quarters BEFORE the user-selected current quarter get the totals
+        // (consolidated) view; the selected current quarter gets the detailed /
+        // per-pay-period view. Keyed on the chosen quarter number, so a partial
+        // selection still classifies each quarter correctly.
         const isClosedQuarter = q.quarter < currentQuarter;
         const viewType = isClosedQuarter ? 'totals' : 'detailed';
         setStatus('Configuring ' + viewType + ' view for ' + q.label + ' (' + q.from + ' → ' + q.to + ')…');
         checkAbort();
-        await sleep(2000);
+        await sleep(2000 + PH_PAD);
         if (!await stepClickAppearanceSettings()) { setStatus('Appearance click failed for ' + q.label); return; }
         checkAbort();
         if (!await stepConfigureAppearance(q.from, q.to, isClosedQuarter)) { setStatus('Appearance config failed for ' + q.label); return; }
@@ -2594,7 +2656,7 @@
         // Run as Excel
         setStatus('Running report for ' + q.label + '…');
         checkAbort();
-        await sleep(1500);
+        await sleep(1500 + PH_PAD);
         if (!await stepClickRunAsExcel()) { setStatus('Run as Excel failed for ' + q.label); return; }
 
         logSuccess(q.label + ' report triggered!');
