@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.3.0
+// @version      1.3.2
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -3265,7 +3265,32 @@
     });
   }
   function gridReady() {
-    return getRows().length > 0;
+    // The grid is "ready" once AG Grid has rendered — even with zero data rows.
+    // A fresh client (or one whose export list is currently empty) shows a
+    // "No Rows To Show" overlay instead of rows, so requiring getRows() > 0
+    // would time out forever. Treat the grid header / viewport / no-rows
+    // overlay as proof the grid loaded.
+    if (getRows().length > 0) return true;
+    const shell = deepFind((el) =>
+      el.classList && (
+        el.classList.contains('ag-overlay-no-rows-wrapper') ||
+        el.classList.contains('ag-overlay-no-rows-center') ||
+        el.classList.contains('ag-center-cols-viewport') ||
+        el.classList.contains('ag-body-viewport') ||
+        el.classList.contains('ag-header')
+      ) && isVisible(el)
+    );
+    if (shell) return true;
+    // Last-resort fallback: if the page's own "Request New Export" button is
+    // present and visible, the Export Documents page has fully rendered even if
+    // ADP re-themed the AG Grid class names. That button is all we actually
+    // need to proceed (detection/submit both start by opening its dialog).
+    const reqBtn = deepFind((el) =>
+      el.tagName === 'SDF-BUTTON' &&
+      el.getAttribute('aria-label') === 'Request New Export' &&
+      isVisible(el)
+    );
+    return !!reqBtn;
   }
   function isInProgress(r) {
     // Robust: match by text or badge status attribute, not a single hard-coded value.
