@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.3.2
+// @version      1.3.3
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -3149,6 +3149,7 @@
   const FILE_DOWNLOAD_GAP_MS = 1500;          // stagger between file downloads
   const POLL_RELOAD_MS = 60000;               // how often to reload the page to refresh grid status while waiting
   const STEP_TIMEOUT_MS = 25000;              // max wait for any single UI step (dialog open, dropdown, etc.)
+  const GRID_READY_TIMEOUT_MS = 60000;        // grid/page can be slow to render on this SPA route — be generous
   const MAX_WAIT_PER_CATEGORY_MS = 40 * 60 * 1000; // safety: give up waiting on one category after 40 min
 
   // Categories differ per client, so nothing is hard-coded — they are detected
@@ -3393,7 +3394,7 @@
       navigateToExport();
       await waitFor(onExportPage, { label: 'Export route', timeout: STEP_TIMEOUT_MS });
     }
-    await waitFor(gridReady, { label: 'grid to load', timeout: STEP_TIMEOUT_MS });
+    await waitFor(gridReady, { label: 'grid to load', timeout: GRID_READY_TIMEOUT_MS });
     await sleep(800);
 
     await openDialog();
@@ -3723,7 +3724,7 @@
       if (!onExportPage()) { return; } // wait until user is on the page
 
       // Make sure the grid has loaded before reading/counting anything.
-      await waitFor(gridReady, { label: 'grid to load', timeout: STEP_TIMEOUT_MS });
+      await waitFor(gridReady, { label: 'grid to load', timeout: GRID_READY_TIMEOUT_MS });
       await sleep(1200); // settle
 
       if (state.phase === 'submit') {
