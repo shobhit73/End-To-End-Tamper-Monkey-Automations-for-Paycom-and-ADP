@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.3.0
+// @version      1.4.0
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1725,6 +1725,22 @@
     };
   }
 
+  // Build the task descriptor for one consolidated FULL past year. Same shape
+  // as a quarter task so the download loop runs it unchanged: quarter 0 is
+  // always < the chosen current quarter, so it gets the closed-quarter
+  // treatment (Associate ID sort, Group By, Totals Only, unmasked, custom
+  // dates). Dates follow the same +1-day ADP convention as the quarters.
+  function buildYearInfo(year) {
+    return {
+      quarter: 0,                       // 0 = full-year task → always consolidated
+      fullYear: true,
+      year: year,
+      label: 'FY ' + year,
+      from: '01/02/' + year,
+      to: '01/01/' + (year + 1)
+    };
+  }
+
   // Quarters Q1 … currentQuarter. currentQuarter defaults to the calendar
   // quarter, but the caller (the picker dialog) can pass a user-chosen one.
   function getQuartersToDownload(currentQuarter) {
@@ -1736,12 +1752,18 @@
     return quarters;
   }
 
-  // Modal: choose the current (live) quarter and which quarters to download.
-  // Resolves to { quarters: [...selected], currentQuarter: n }, or null if the
-  // user cancels (or Stop/reset is pressed).
-  //  - The "Current (live) quarter" selector (default = the calendar quarter)
-  //    drives the split: quarters BEFORE it are consolidated (Totals Only), and
-  //    the chosen quarter itself is detailed / per pay period.
+  // Modal: choose years + quarters to download. Resolves to
+  // { quarters: [...tasks], currentQuarter: n } — where tasks is the COMBINED
+  // ordered list [past-year FY tasks (ascending)…, current-year quarter
+  // tasks…] — or null if the user cancels (or Stop/reset is pressed).
+  //  - "Years" chips: the past 3 years + the current year (derived from the
+  //    system year). Only the current year is ticked by default. A ticked past
+  //    year becomes ONE consolidated full-year task (buildYearInfo).
+  //  - The quarter section applies to the CURRENT year only, and is hidden
+  //    entirely while the current-year chip is unticked.
+  //  - The first-payroll-quarter selector (default = the calendar quarter)
+  //    drives the split: quarters BEFORE it are consolidated (Totals Only),
+  //    and the chosen quarter itself is detailed / per pay period.
   //  - The quarter list shows Q1 … currentQuarter, all ticked by default;
   //    unticking one skips it. Changing the selector rebuilds the list.
   // Styled to match the cobalt-blue panel.
@@ -1763,17 +1785,52 @@
       const head = document.createElement('div');
       head.style.cssText = 'padding:14px 16px;font-weight:700;font-size:15px;color:#fff;' +
         'background:linear-gradient(90deg,rgba(0,71,171,.45),rgba(0,100,241,.12));border-bottom:1px solid rgba(90,159,255,.2);';
-      head.textContent = 'Payroll History — choose quarters';
+      head.textContent = 'Payroll History — choose years & quarters';
       box.appendChild(head);
 
       const body = document.createElement('div');
       body.style.cssText = 'padding:12px 16px;';
 
-      // Current (live) quarter selector — drives the consolidated/detailed split.
+      // ── Years: past 3 years + current year as tick-able chips ──
+      // Only the current year is ticked by default. A ticked PAST year becomes
+      // one consolidated full-year report; the quarter section below applies
+      // to the current year only and hides while the current year is unticked.
+      const yearLabel = document.createElement('div');
+      yearLabel.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:5px;';
+      yearLabel.textContent = 'Select year(s) — a past year downloads as one consolidated full-year report';
+      body.appendChild(yearLabel);
+
+      const yearsArr = [year - 3, year - 2, year - 1, year]; // oldest → newest
+      const yearRow = document.createElement('div');
+      yearRow.style.cssText = 'display:flex;gap:7px;margin-bottom:12px;';
+      const yearChecks = [];
+      yearsArr.forEach((y) => {
+        const chip = document.createElement('label');
+        chip.style.cssText = 'flex:1;display:flex;align-items:center;justify-content:center;gap:6px;' +
+          'padding:8px 4px;cursor:pointer;border-radius:10px;' +
+          'background:rgba(0,71,171,.22);border:1px solid rgba(125,179,255,.18);';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = (y === year); // default: current year only
+        cb.style.cssText = 'width:15px;height:15px;accent-color:#0064f1;cursor:pointer;';
+        const txt = document.createElement('span');
+        txt.style.cssText = 'font-weight:600;color:#eaf2ff;font-size:12.5px;';
+        txt.textContent = String(y);
+        chip.appendChild(cb);
+        chip.appendChild(txt);
+        yearRow.appendChild(chip);
+        yearChecks.push(cb);
+      });
+      body.appendChild(yearRow);
+
+      // ── Quarter section (current year only) — hidden if current year unticked ──
+      const qSection = document.createElement('div');
+      body.appendChild(qSection);
+
       const cqLabel = document.createElement('div');
       cqLabel.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:5px;';
       cqLabel.textContent = 'Select the Quarter in which client will run first payroll in UZIO';
-      body.appendChild(cqLabel);
+      qSection.appendChild(cqLabel);
 
       const cqSelect = document.createElement('select');
       cqSelect.style.cssText = 'width:100%;padding:8px 10px;margin-bottom:12px;border-radius:9px;' +
@@ -1787,16 +1844,22 @@
         if (q === defaultCurrentQuarter) opt.selected = true;
         cqSelect.appendChild(opt);
       });
-      body.appendChild(cqSelect);
+      qSection.appendChild(cqSelect);
 
       const hint = document.createElement('div');
       hint.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:10px;';
       hint.textContent = 'Untick any quarter to skip it.';
-      body.appendChild(hint);
+      qSection.appendChild(hint);
 
       // Rebuildable quarter checkbox list (Q1 … selected current quarter).
       const listWrap = document.createElement('div');
-      body.appendChild(listWrap);
+      qSection.appendChild(listWrap);
+
+      // Hide/show the quarter section as the current-year chip is toggled.
+      const currentYearCb = yearChecks[yearChecks.length - 1];
+      const updateQSection = () => { qSection.style.display = currentYearCb.checked ? '' : 'none'; };
+      yearChecks.forEach((cb) => cb.addEventListener('change', updateQSection));
+      updateQSection();
       let checks = [];
       let listQuarters = [];
       function rebuildList() {
@@ -1854,10 +1917,21 @@
         resolve(val);
       };
       cancelBtn.addEventListener('click', () => finish(null));
-      confirmBtn.addEventListener('click', () => finish({
-        quarters: listQuarters.filter((_, i) => checks[i].checked),
-        currentQuarter: parseInt(cqSelect.value, 10)
-      }));
+      confirmBtn.addEventListener('click', () => {
+        // Past years (ascending) → one consolidated FY task each; then the
+        // current year's selected quarters (only if the current year is ticked).
+        // yearsArr is already oldest → newest, so order falls out naturally.
+        const pastTasks = yearsArr
+          .filter((y, i) => y !== year && yearChecks[i].checked)
+          .map(buildYearInfo);
+        const quarterTasks = currentYearCb.checked
+          ? listQuarters.filter((_, i) => checks[i].checked)
+          : [];
+        finish({
+          quarters: pastTasks.concat(quarterTasks),
+          currentQuarter: parseInt(cqSelect.value, 10)
+        });
+      });
       // Stop/reset (requestAbort) or external removal closes the dialog as a cancel.
       const poll = setInterval(() => {
         if (shouldAbort() || !document.body.contains(overlay)) finish(null);
@@ -2514,21 +2588,22 @@
     const PH_PAD = 2000;
 
     try {
-      // Ask which quarters to download BEFORE any navigation. The user picks the
-      // current (live) quarter (default = the calendar quarter): quarters before
-      // it are consolidated, that quarter is per pay period. Every listed quarter
-      // is ticked by default; unticked quarters are skipped. Cancel downloads
-      // nothing.
+      // Ask which years + quarters to download BEFORE any navigation. Past
+      // years arrive as one consolidated FY task each (quarter 0 → always the
+      // closed-quarter treatment); the current year's quarters split
+      // consolidated / per-pay-period around the user-picked first-payroll
+      // quarter. Tasks are already ordered ascending (past years first, then
+      // Q1 → Qn of the current year). Cancel downloads nothing.
       const now = new Date();
       const year = now.getFullYear();
       const calendarQuarter = Math.floor(now.getMonth() / 3) + 1;
-      setStatus('Choose quarters to download…');
+      setStatus('Choose years & quarters to download…');
       const pick = await showQuarterPickDialog(year, calendarQuarter);
-      if (pick === null) { setStatus('Payroll History cancelled'); logInfo('Quarter selection cancelled'); return; }
-      const quarters = pick.quarters;
+      if (pick === null) { setStatus('Payroll History cancelled'); logInfo('Year/quarter selection cancelled'); return; }
+      const quarters = pick.quarters; // combined [FY tasks…, quarter tasks…]
       const currentQuarter = pick.currentQuarter;
-      if (!quarters.length) { setStatus('No quarters selected — nothing to download'); logWarn('No quarters selected'); return; }
-      logInfo('Current (live) quarter: Q' + currentQuarter + '. Selected: ' + quarters.map(q => q.label).join(', '));
+      if (!quarters.length) { setStatus('Nothing selected — nothing to download'); logWarn('No years/quarters selected'); return; }
+      logInfo('First-payroll quarter: Q' + currentQuarter + '. Selected: ' + quarters.map(q => q.label).join(', '));
 
       setStatus('Step 1: Opening Reports menu…');
       checkAbort();
@@ -2586,10 +2661,11 @@
         logWarn('Some payroll fields could not be selected — continuing anyway');
       }
 
-      // `quarters` (the user-selected subset) was chosen via the dialog above.
-      logInfo('Downloading ' + quarters.length + ' quarter(s): ' + quarters.map(q => q.label).join(', '));
+      // `quarters` is the combined task list from the dialog: full past years
+      // first (ascending), then the current year's selected quarters.
+      logInfo('Downloading ' + quarters.length + ' report(s): ' + quarters.map(q => q.label).join(', '));
 
-      // Loop through each quarter
+      // Loop through each task (full-year or quarter — same steps either way)
       for (let qi = 0; qi < quarters.length; qi++) {
         const q = quarters[qi];
         logInfo('───── Processing ' + q.label + ' (' + (qi + 1) + '/' + quarters.length + ') ─────');
@@ -2639,11 +2715,11 @@
           }
         }
 
-        // Open Appearance settings and configure for this quarter.
-        // Quarters BEFORE the user-selected current quarter get the totals
-        // (consolidated) view; the selected current quarter gets the detailed /
-        // per-pay-period view. Keyed on the chosen quarter number, so a partial
-        // selection still classifies each quarter correctly.
+        // Open Appearance settings and configure for this task. Quarters BEFORE
+        // the user-selected current quarter get the totals (consolidated) view;
+        // the selected current quarter gets the detailed / per-pay-period view.
+        // Full-year tasks carry quarter 0, so they always classify as closed →
+        // consolidated (Totals Only + Group By + unmasked), by design.
         const isClosedQuarter = q.quarter < currentQuarter;
         const viewType = isClosedQuarter ? 'totals' : 'detailed';
         setStatus('Configuring ' + viewType + ' view for ' + q.label + ' (' + q.from + ' → ' + q.to + ')…');
@@ -2665,7 +2741,7 @@
         await sleep(5000);
       }
 
-      setStatus('All ' + quarters.length + ' quarter(s) downloaded ✓');
+      setStatus('All ' + quarters.length + ' report(s) downloaded ✓');
       logSuccess('=== Payroll History complete: ' + quarters.map(q => q.label).join(', ') + ' ===');
 
     } catch (err) {
