@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UZIO Setup Auto-Create (Earnings + Deductions + Contributions from Payroll Setup Helper xlsx)
 // @namespace    https://uzio.com/
-// @version      0.36.0
+// @version      0.39.0
 // @description  Reads the Earnings, Deductions and Contributions tabs of the Payroll Setup Helper .xlsx and auto-creates each in UZIO. Buttons: Start Earnings / Deductions / Contributions. Each save is positively verified (form must reset/close) so silent failures pause instead of being skipped. On failure: pause with Save & Continue / Resume / Skip, or skip & continue; manual Pause; end-of-run reconciliation.
 // @match        https://app.uzio.com/*
 // @run-at       document-idle
@@ -250,7 +250,7 @@
 
   // Subtle, non-intrusive marker on the element the script clicks, so you can
   // confirm it hit the right control without the old alarm-red flash: a thin
-  // purple outline (no fill) that gently fades + barely expands, gone in ~0.5s.
+  // UZIO-blue outline (no fill) that gently fades + barely expands, gone in ~0.5s.
   function flashClick(el) {
     try {
       const r = el.getBoundingClientRect();
@@ -260,8 +260,8 @@
         'position:fixed',
         'left:' + (r.left - 2) + 'px', 'top:' + (r.top - 2) + 'px',
         'width:' + (r.width + 4) + 'px', 'height:' + (r.height + 4) + 'px',
-        'border:2px solid rgba(108,43,217,0.85)', 'border-radius:6px',
-        'background:transparent', 'box-shadow:0 0 0 2px rgba(108,43,217,0.12)',
+        'border:2px solid rgba(45,156,244,0.85)', 'border-radius:6px',
+        'background:transparent', 'box-shadow:0 0 0 2px rgba(45,156,244,0.12)',
         'z-index:2147483646', 'pointer-events:none', 'opacity:0.9',
         'transition:opacity .45s ease, transform .45s ease',
       ].join(';');
@@ -1659,41 +1659,141 @@
     if (document.getElementById('uzio-bot-panel')) return;
     const wrap = document.createElement('div');
     wrap.id = 'uzio-bot-panel';
+    // "Modern SaaS dashboard card" redesign, native to UZIO's dashboard UI:
+    // white card, labeled sections (SETUP / RUN / ON FAILURE / ACTIVITY),
+    // icon-chip buttons with hero Start actions. UZIO palette: deep indigo
+    // #312E5B/#232048, gold #D3B23C, blue #2D9CF4, orange #F5A623.
     wrap.style.cssText = [
       'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
-      'width:320px', 'background:#fff', 'border:2px solid #6c2bd9', 'border-radius:10px',
-      'box-shadow:0 6px 24px rgba(0,0,0,.25)', 'font:13px/1.4 system-ui,sans-serif',
-      'color:#222', 'padding:10px',
+      'width:336px', 'background:#fff', 'border:1px solid #E4E2F0', 'border-radius:16px',
+      'box-shadow:0 24px 56px rgba(35,32,72,.30),0 4px 14px rgba(35,32,72,.12)',
+      "font:13px/1.45 'Source Sans Pro','Segoe UI',system-ui,sans-serif",
+      'color:#2B2950', 'padding:0', 'overflow:hidden',
     ].join(';');
     wrap.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-        <span style="font-weight:700;color:#6c2bd9">UZIO Setup Bot <span style="font-weight:400;color:#888">v0.36.0</span></span>
-        <button id="uziobot-min" title="Minimize / expand" style="border:1px solid #ccc;background:#f7f7f7;border-radius:6px;cursor:pointer;width:26px;height:22px;line-height:1;font-weight:700">–</button>
+      <style>
+        #uzio-bot-panel *{box-sizing:border-box}
+        /* ── Header ─────────────────────────────────────────────── */
+        #uzio-bot-panel .uzb-hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;
+          padding:10px 13px;background:linear-gradient(135deg,#312E5B 0%,#232048 100%);
+          border-bottom:3px solid #D3B23C;cursor:move;user-select:none}
+        #uzio-bot-panel .uzb-brand{display:flex;align-items:center;gap:9px;min-width:0}
+        #uzio-bot-panel .uzb-logo{flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+          border:2px solid #fff;border-radius:8px;color:#fff;font-weight:700;font-size:14px;
+          background:rgba(255,255,255,.08);box-shadow:0 0 12px rgba(211,178,60,.25)}
+        #uzio-bot-panel .uzb-titlebox{display:flex;flex-direction:column;min-width:0}
+        #uzio-bot-panel .uzb-title{color:#fff;font-weight:700;font-size:14px;letter-spacing:.3px;white-space:nowrap;line-height:1.2}
+        #uzio-bot-panel .uzb-sub{font-size:8.5px;font-weight:700;color:#B9B5E0;letter-spacing:1.6px;text-transform:uppercase}
+        #uzio-bot-panel .uzb-ver{font-size:10px;font-weight:700;color:#232048;background:#D3B23C;
+          padding:2px 8px;border-radius:999px;flex:none}
+        #uzio-bot-panel #uziobot-min{flex:none;width:28px;height:26px;line-height:1;font-weight:700;cursor:pointer;
+          color:#fff;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.35);border-radius:8px;
+          transition:background .15s ease}
+        #uzio-bot-panel #uziobot-min:hover{background:rgba(255,255,255,.26)}
+        /* ── Body & sections ────────────────────────────────────── */
+        #uzio-bot-panel #uziobot-body{padding:11px 12px 12px;background:#FDFDFF}
+        #uzio-bot-panel .uzb-sec{margin-bottom:10px}
+        #uzio-bot-panel .uzb-sec:last-child{margin-bottom:0}
+        #uzio-bot-panel .uzb-lbl{display:flex;align-items:center;gap:8px;margin-bottom:6px;
+          font-size:10px;font-weight:800;letter-spacing:1.4px;color:#8B89A6;text-transform:uppercase}
+        #uzio-bot-panel .uzb-lbl::after{content:'';flex:1;height:1px;background:#EBE9F4}
+        #uzio-bot-panel .uzb-row{display:flex;gap:8px;flex-wrap:wrap}
+        #uzio-bot-panel .uzb-row+.uzb-row{margin-top:8px}
+        /* ── Buttons: icon chip + left-aligned label ────────────── */
+        #uzio-bot-panel .uzb-btn{display:flex;align-items:center;gap:9px;text-align:left;flex:1 1 46%;
+          padding:8px 11px;border:0;border-radius:11px;cursor:pointer;color:#fff;
+          font:600 12.5px 'Source Sans Pro','Segoe UI',system-ui,sans-serif;
+          transition:transform .16s ease,box-shadow .16s ease,filter .16s ease,background .16s ease,color .16s ease}
+        #uzio-bot-panel .uzb-ic{flex:none;width:24px;height:24px;display:flex;align-items:center;justify-content:center;
+          border-radius:7px;font-size:12px;background:rgba(255,255,255,.2)}
+        #uzio-bot-panel .uzb-btn:hover:not(:disabled){transform:translateY(-2px);filter:brightness(1.06);
+          box-shadow:0 6px 16px rgba(35,32,72,.22)}
+        #uzio-bot-panel .uzb-btn:active:not(:disabled){transform:translateY(0) scale(.985)}
+        #uzio-bot-panel .uzb-btn:disabled{cursor:not-allowed;opacity:.5}
+        /* Hero Start buttons — the stars of the panel */
+        #uzio-bot-panel .uzb-hero{flex:1 1 100%;padding:8px 11px;border-radius:11px;font-size:13px;font-weight:700}
+        #uzio-bot-panel .uzb-hero .uzb-ic{width:26px;height:26px;border-radius:8px;font-size:13px}
+        #uzio-bot-panel .uzb-earn{background:linear-gradient(120deg,#F5A623,#E8940A)}
+        #uzio-bot-panel .uzb-ded{background:linear-gradient(120deg,#2EAA5E,#1F934C)}
+        #uzio-bot-panel .uzb-cont{background:linear-gradient(120deg,#3E3A75,#312E5B)}
+        /* Secondary variants */
+        #uzio-bot-panel .uzb-blue{background:#2D9CF4}
+        #uzio-bot-panel .uzb-gold{background:#D3B23C;color:#232048}
+        #uzio-bot-panel .uzb-gold .uzb-ic{background:rgba(35,32,72,.12)}
+        #uzio-bot-panel .uzb-ghost{background:#F4F3FA;color:#312E5B;border:1px solid #E4E2F0}
+        #uzio-bot-panel .uzb-ghost .uzb-ic{background:#E9E7F5}
+        /* Stop: red outline that fills on hover */
+        #uzio-bot-panel .uzb-stop{background:#fff;color:#E14D57;border:1.5px solid #E14D57}
+        #uzio-bot-panel .uzb-stop .uzb-ic{background:rgba(225,77,87,.12)}
+        #uzio-bot-panel .uzb-stop:hover:not(:disabled){background:#E14D57;color:#fff;filter:none}
+        #uzio-bot-panel .uzb-stop:hover:not(:disabled) .uzb-ic{background:rgba(255,255,255,.22)}
+        /* ── Failure-mode toggle row ────────────────────────────── */
+        #uzio-bot-panel .uzb-toggle{display:flex;align-items:center;gap:9px;margin-top:8px;cursor:pointer;
+          background:#F4F3FA;border:1px solid #E4E2F0;border-radius:11px;padding:9px 11px;
+          font-size:11.5px;color:#6E6C8A;line-height:1.35}
+        #uzio-bot-panel .uzb-toggle input{flex:none;width:16px;height:16px;accent-color:#312E5B;cursor:pointer;margin:0}
+        #uzio-bot-panel .uzb-toggle b{color:#2B2950}
+        /* ── Activity: status chip + console ────────────────────── */
+        #uzio-bot-panel .uzb-status{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:#2B2950;
+          background:linear-gradient(180deg,#F7F6FC,#F1EFF9);border:1px solid #E4E2F0;border-radius:11px;
+          padding:8px 12px;margin-bottom:8px}
+        #uzio-bot-panel .uzb-dot{flex:none;width:9px;height:9px;border-radius:50%;background:#D3B23C;
+          box-shadow:0 0 8px rgba(211,178,60,.85);animation:uzb-pulse 2s ease-in-out infinite}
+        @keyframes uzb-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.78)}}
+        #uzio-bot-panel #uziobot-status{min-width:0}
+        #uzio-bot-panel #uziobot-log{height:110px;overflow:auto;margin:0;padding:8px 11px;border-radius:11px;
+          background:linear-gradient(165deg,#2B2852,#232048);color:#C9C6E8;font-size:11px;line-height:1.55;
+          white-space:pre-wrap;border:1px solid #3E3A75;box-shadow:inset 0 2px 8px rgba(0,0,0,.25)}
+        #uzio-bot-panel #uziobot-log::-webkit-scrollbar{width:6px}
+        #uzio-bot-panel #uziobot-log::-webkit-scrollbar-thumb{background:rgba(211,178,60,.45);border-radius:3px}
+        #uzio-bot-panel #uziobot-log::-webkit-scrollbar-track{background:transparent}
+      </style>
+      <div class="uzb-hdr">
+        <div class="uzb-brand">
+          <span class="uzb-logo">U</span>
+          <span class="uzb-titlebox">
+            <span class="uzb-title">UZIO Setup Bot</span>
+            <span class="uzb-sub">Automation Assistant</span>
+          </span>
+        </div>
+        <span class="uzb-ver">v0.39.0</span>
+        <button id="uziobot-min" title="Minimize / expand">–</button>
       </div>
       <div id="uziobot-body">
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
-          <button id="uziobot-file" style="flex:1;padding:6px;border:1px solid #6c2bd9;background:#f3effd;border-radius:6px;cursor:pointer">Choose .xlsx</button>
-          <button id="uziobot-inspect" style="flex:1;padding:6px;border:1px solid #888;background:#f7f7f7;border-radius:6px;cursor:pointer">Inspect Form</button>
+        <div class="uzb-sec">
+          <div class="uzb-lbl">Setup</div>
+          <div class="uzb-row">
+            <button id="uziobot-file" class="uzb-btn uzb-blue"><span class="uzb-ic">📂</span>Choose .xlsx</button>
+            <button id="uziobot-inspect" class="uzb-btn uzb-ghost"><span class="uzb-ic">🔍</span>Inspect Form</button>
+          </div>
         </div>
-        <div style="display:flex;gap:6px;margin-bottom:6px">
-          <button id="uziobot-starte" style="flex:1;padding:6px;border:0;background:#fd7e14;color:#fff;border-radius:6px;cursor:pointer">Start Earnings</button>
-          <button id="uziobot-start" style="flex:1;padding:6px;border:0;background:#28a745;color:#fff;border-radius:6px;cursor:pointer">Start Deductions</button>
+        <div class="uzb-sec">
+          <div class="uzb-lbl">Run</div>
+          <div class="uzb-row">
+            <button id="uziobot-starte" class="uzb-btn uzb-hero uzb-earn"><span class="uzb-ic">💰</span>Start Earnings</button>
+            <button id="uziobot-start" class="uzb-btn uzb-hero uzb-ded"><span class="uzb-ic">💸</span>Start Deductions</button>
+            <button id="uziobot-startc" class="uzb-btn uzb-hero uzb-cont"><span class="uzb-ic">🏦</span>Start Contributions</button>
+            <button id="uziobot-stop" class="uzb-btn uzb-stop"><span class="uzb-ic">⏹</span>Stop</button>
+          </div>
         </div>
-        <div style="display:flex;gap:6px;margin-bottom:6px">
-          <button id="uziobot-startc" style="flex:1;padding:6px;border:0;background:#0d6efd;color:#fff;border-radius:6px;cursor:pointer">Start Contributions</button>
-          <button id="uziobot-stop" style="flex:1;padding:6px;border:0;background:#dc3545;color:#fff;border-radius:6px;cursor:pointer">Stop</button>
+        <div class="uzb-sec">
+          <div class="uzb-lbl">On failure</div>
+          <div class="uzb-row">
+            <button id="uziobot-pause" class="uzb-btn uzb-gold" style="display:none"><span class="uzb-ic">⏸</span>Pause</button>
+            <button id="uziobot-savecont" class="uzb-btn uzb-blue" style="display:none" title="I fixed the field — you click Save"><span class="uzb-ic">💾</span>Save &amp; Continue</button>
+            <button id="uziobot-resume" class="uzb-btn uzb-hero uzb-ded" style="display:none" title="I already saved it myself — just continue"><span class="uzb-ic">▶</span>Resume</button>
+            <button id="uziobot-skip" class="uzb-btn uzb-ghost" style="display:none"><span class="uzb-ic">⏭</span>Skip this one</button>
+          </div>
+          <label class="uzb-toggle">
+            <input type="checkbox" id="uziobot-skipmode">
+            <span>On failure: <b>skip &amp; continue</b> (default: pause on the form)</span>
+          </label>
         </div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
-          <button id="uziobot-pause" style="display:none;flex:1 1 90px;padding:6px;border:0;background:#f0ad4e;color:#fff;border-radius:6px;cursor:pointer">Pause</button>
-          <button id="uziobot-savecont" style="display:none;flex:1 1 90px;padding:6px;border:0;background:#0d6efd;color:#fff;border-radius:6px;cursor:pointer" title="I fixed the field — you click Save">Save &amp; Continue</button>
-          <button id="uziobot-resume" style="display:none;flex:1 1 90px;padding:6px;border:0;background:#28a745;color:#fff;border-radius:6px;cursor:pointer" title="I already saved it myself — just continue">Resume</button>
-          <button id="uziobot-skip" style="display:none;flex:1 1 90px;padding:6px;border:0;background:#6c757d;color:#fff;border-radius:6px;cursor:pointer">Skip this one</button>
+        <div class="uzb-sec">
+          <div class="uzb-lbl">Activity</div>
+          <div class="uzb-status"><span class="uzb-dot"></span><span id="uziobot-status">Idle.</span></div>
+          <pre id="uziobot-log"></pre>
         </div>
-        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#555;margin-bottom:6px">
-          <input type="checkbox" id="uziobot-skipmode"> On failure: <b>skip &amp; continue</b> (default: pause on the form)
-        </label>
-        <div id="uziobot-status" style="font-size:12px;color:#555;margin-bottom:4px">Idle.</div>
-        <pre id="uziobot-log" style="height:140px;overflow:auto;background:#0d1117;color:#d1d5da;padding:6px;border-radius:6px;margin:0;font-size:11px;white-space:pre-wrap"></pre>
       </div>
       <input id="uziobot-fileinput" type="file" accept=".xlsx,.xls" style="display:none" />
     `;
@@ -1720,14 +1820,97 @@
     };
     updateControls();
 
-    // Minimize / expand: collapse the body, leaving just the title bar.
+    // ── Drag + smart minimize/expand (same behavior as the Paycom bot) ──
     const body = wrap.querySelector('#uziobot-body');
     const minBtn = wrap.querySelector('#uziobot-min');
+    const hdr = wrap.querySelector('.uzb-hdr');
+
+    // Snap the panel back to its bottom-right home corner.
+    function snapHome() {
+      wrap.style.left = 'auto';
+      wrap.style.top = 'auto';
+      wrap.style.right = '16px';
+      wrap.style.bottom = '16px';
+    }
+    // Cap the body so the card never grows past the viewport (content scrolls
+    // inside instead of cropping the header off-screen). No repositioning.
+    function capBody() {
+      if (body.style.display === 'none') return;
+      const margin = 14;
+      const below = window.innerHeight - hdr.getBoundingClientRect().bottom - margin;
+      body.style.maxHeight = Math.max(140, below) + 'px';
+      body.style.overflowY = 'auto';
+      body.style.overflowX = 'hidden';
+    }
+    // On expand: grow from the chip toward whichever vertical side has more
+    // room (down if more space below, up otherwise), capped to stay on screen.
+    function expandFromChip() {
+      const r = hdr.getBoundingClientRect();
+      const headH = r.height;
+      const margin = 14;
+      wrap.style.left = r.left + 'px';
+      wrap.style.right = 'auto';
+      const spaceBelow = window.innerHeight - r.top; // header-top → viewport bottom
+      const spaceAbove = r.bottom;                   // viewport top → header bottom
+      if (spaceBelow >= spaceAbove) {
+        wrap.style.top = r.top + 'px';
+        wrap.style.bottom = 'auto';
+        body.style.maxHeight = Math.max(140, spaceBelow - headH - margin) + 'px';
+      } else {
+        wrap.style.top = 'auto';
+        wrap.style.bottom = (window.innerHeight - r.bottom) + 'px';
+        body.style.maxHeight = Math.max(140, r.bottom - headH - margin) + 'px';
+      }
+      body.style.overflowY = 'auto';
+      body.style.overflowX = 'hidden';
+    }
+
+    // Minimize → collapse to the title chip and snap to bottom-right.
+    // Expand → grow from wherever the chip is, toward the side with more room.
     minBtn.onclick = () => {
       const hidden = body.style.display === 'none';
       body.style.display = hidden ? '' : 'none';
       minBtn.textContent = hidden ? '–' : '+';
+      if (hidden) {
+        wrap.style.width = '336px';
+        expandFromChip();
+      } else {
+        wrap.style.width = 'auto';
+        snapHome();
+      }
     };
+
+    // Drag by the header (minimize button excluded).
+    (function makeDraggable() {
+      let dragging = false, dx = 0, dy = 0;
+      hdr.addEventListener('mousedown', (e) => {
+        if (e.target.closest('#uziobot-min')) return;
+        dragging = true;
+        const r = wrap.getBoundingClientRect();
+        dx = e.clientX - r.left;
+        dy = e.clientY - r.top;
+        wrap.style.left = r.left + 'px';
+        wrap.style.top = r.top + 'px';
+        wrap.style.right = 'auto';
+        wrap.style.bottom = 'auto';
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        let l = e.clientX - dx, t = e.clientY - dy;
+        l = Math.max(0, Math.min(l, window.innerWidth - wrap.offsetWidth));
+        t = Math.max(0, Math.min(t, window.innerHeight - wrap.offsetHeight));
+        wrap.style.left = l + 'px';
+        wrap.style.top = t + 'px';
+      });
+      document.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        capBody(); // re-cap for the new position so it can't run off-screen
+      });
+    })();
+    window.addEventListener('resize', capBody);
+    capBody(); // initial cap — fixes the header cropping past the viewport top
 
     log('Ready. Choose .xlsx, open the matching Add form, then Start Deductions or Start Contributions.');
   }
