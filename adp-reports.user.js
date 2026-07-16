@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.4.1
+// @version      1.5.8
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -2574,12 +2574,591 @@
     });
   }
 
+  // ───────────────── payroll history: pay-period dates → PriorPayroll filenames ─────────────────
+  // Consolidated (Totals Only) quarter/FY files lack Pay Period Begin/End Date
+  // and Pay Date, so the downstream Sanity Check tool reads them from the
+  // FILENAME: PriorPayroll_<begin>_<end>_<paydate>.xlsx (all MMDDYYYY).
+  //   Begin   = period start of the FIRST pay period in the task's range
+  //   End/Pay = period end + pay date of the LAST pay period in the range
+  //   (a pay period belongs to a task iff its PAY DATE falls in the range)
+  // Source: Process → Payroll Dashboard → Payroll Schedule (ag-grid list gives
+  // Pay Date + End Date per row; Period Start comes from the row's "Payroll
+  // Dates" side panel, read once per task). Detailed (current-quarter) reports
+  // already contain the three columns → they keep ADP's default filename.
+
+  const PH_SCHEDULE_HASH = '#/Process/ProcessTabPayrollCategoryPayrollCycle';
+
+  // Run Date-Time signatures of report rows already downloaded THIS run, so a
+  // multi-file run never re-downloads the previous task's (still-topmost, just-
+  // completed) row while the new report is still rendering. Reset per flow.
+  let phDownloadedSigs = new Set();
+
+  // The Run Date-Time text of the row nearest `top` (e.g. "07/16/2026 - 03:45
+  // AM"), used to tell one report row from another. '' if none is visible.
+  function phRowSignatureNear(top) {
+    for (const el of deepQueryAll('*')) {
+      if (!visible(el) || el.children.length) continue;
+      const t = (el.textContent || '').trim();
+      if (t.length < 40 &&
+        /\d{2}\/\d{2}\/\d{4}\s*[-–]\s*\d{1,2}:\d{2}\s*(AM|PM)/i.test(t) &&
+        Math.abs(el.getBoundingClientRect().top - top) < 30) {
+        return t;
+      }
+    }
+    return '';
+  }
+
+  function phDate(s) {
+    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec((s || '').trim());
+    return m ? new Date(+m[3], +m[1] - 1, +m[2]) : null;
+  }
+  function phCompact(s) { return (s || '').replace(/\//g, ''); }
+
+  // Real calendar bounds of a task (not the +1-day report dates).
+  function phTaskRange(task, calendarYear) {
+    if (task.fullYear) return { s: new Date(task.year, 0, 1), e: new Date(task.year, 11, 31) };
+    const q = task.quarter;
+    return { s: new Date(calendarYear, (q - 1) * 3, 1), e: new Date(calendarYear, q * 3, 0) };
+  }
+
+  // Navigate the admin SPA to the Payroll Schedule page and wait for the grid.
+  // The Process route lands on the Payroll Dashboard first — the schedule grid
+  // only appears after clicking the "Payroll Schedule" smart-link (an
+  // <sdf-button id="smart-link-PSCHEDULE"> Stencil component in shadow DOM,
+  // which deepQueryAll pierces).
+  async function phOpenSchedulePage() {
+    logInfo('Opening Payroll Schedule page…');
+    location.hash = PH_SCHEDULE_HASH;
+    let clickedLink = false;
+    for (let i = 0; i < 120; i++) { // up to 60s
+      checkAbort();
+      if (deepQueryAll('.ag-header-cell[col-id], [role="columnheader"][col-id]').length) {
+        await sleep(2000); // let rows render after the header appears
+        return true;
+      }
+      if (!clickedLink) {
+        const link = deepQueryAll('#smart-link-PSCHEDULE').filter(visible)[0]
+          || deepQueryAll('sdf-button[aria-label="Payroll Schedule"]').filter(visible)[0];
+        if (link) {
+          logInfo('Clicking the "Payroll Schedule" link on the Payroll Dashboard');
+          clickEl(link);
+          clickedLink = true;
+          await sleep(1500); // let the schedule view start loading
+          continue;
+        }
+      }
+      await sleep(500);
+    }
+    return false;
+  }
+
+  // Pick a year in the Payroll Schedule "Year" dropdown (native select expected).
+  async function phSelectYear(year) {
+    const sel = deepQueryAll('select').filter(visible).find(s =>
+      Array.from(s.options || []).some(o => /^\d{4}$/.test((o.textContent || '').trim())));
+    if (!sel) return false;
+    const opt = Array.from(sel.options).find(o => (o.textContent || '').trim() === String(year));
+    if (!opt) return false;
+    if (sel.value !== opt.value) {
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(3000); // grid reloads for the new year
+    }
+    return true;
+  }
+
+  // Map the grid's header names → col-ids, then read the visible rows.
+  function phCollectVisibleRows() {
+    const headers = deepQueryAll('.ag-header-cell[col-id], [role="columnheader"][col-id]');
+    const col = {};
+    for (const h of headers) {
+      const t = (h.textContent || '').trim().toLowerCase();
+      const id = h.getAttribute('col-id');
+      // Exact match first — the grid also has a "Holiday Pay Date" column
+      // (usually empty) that a substring match would wrongly grab.
+      if (!col.pay && t === 'pay date') col.pay = id;
+      if (!col.end && t === 'end date') col.end = id;
+    }
+    for (const h of headers) { // lenient fallback, still excluding Holiday
+      const t = (h.textContent || '').trim().toLowerCase();
+      const id = h.getAttribute('col-id');
+      if (!col.pay && t.includes('pay date') && !t.includes('holiday')) col.pay = id;
+      if (!col.end && t.includes('end date')) col.end = id;
+    }
+    if (!col.pay || !col.end) return null;
+    const out = [];
+    for (const r of deepQueryAll('.ag-row')) {
+      const get = (cid) => { const c = r.querySelector('[col-id="' + cid + '"]'); return c ? (c.textContent || '').trim() : ''; };
+      const pay = get(col.pay), end = get(col.end);
+      if (/^\d{2}\/\d{2}\/\d{4}$/.test(pay)) out.push({ pay, end });
+    }
+    return out;
+  }
+
+  // Total row count from the grid's paging summary ("1 to 20 of 27" → 27).
+  function phGridTotalRows() {
+    for (const el of deepQueryAll('*')) {
+      const t = (el.textContent || '').trim();
+      if (t.length < 40 && visible(el)) {
+        const m = /^\d+\s+to\s+\d+\s+of\s+(\d+)$/.exec(t);
+        if (m) return parseInt(m[1], 10);
+      }
+    }
+    return 0;
+  }
+
+  // Best effort: bump the paging "Page Size" dropdown to its largest option so
+  // one page holds every pay period. Returns true if it changed anything.
+  async function phTrySetMaxPageSize() {
+    const sel = deepQueryAll('select').filter(visible).find(s =>
+      Array.from(s.options || []).some(o => /^(50|100|200|500)$/.test((o.textContent || '').trim())));
+    if (!sel) return false;
+    let best = null;
+    for (const o of sel.options) {
+      const n = parseInt((o.textContent || '').trim(), 10);
+      if (Number.isFinite(n) && (!best || n > parseInt(best.textContent, 10))) best = o;
+    }
+    if (!best || sel.value === best.value) return false;
+    logInfo('Setting Payroll Schedule page size to ' + (best.textContent || '').trim());
+    sel.value = best.value;
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(2500);
+    return true;
+  }
+
+  // Click the paging "next page" control. Returns false when missing/disabled.
+  function phClickNextPage() {
+    const icon = deepQueryAll('.ag-icon-next, [aria-label="Next Page"], [ref="btNext"]').filter(visible)[0];
+    if (!icon) return false;
+    const host = icon.closest('[role="button"], .ag-paging-button') || icon;
+    const state = (host.className || '') + ' ' + (host.getAttribute('aria-disabled') || '');
+    if (/disabled|true/i.test(state)) return false;
+    clickEl(host);
+    return true;
+  }
+  function phClickFirstPage() {
+    const icon = deepQueryAll('.ag-icon-first, [aria-label="First Page"], [ref="btFirst"]').filter(visible)[0];
+    if (!icon) return false;
+    clickEl(icon.closest('[role="button"], .ag-paging-button') || icon);
+    return true;
+  }
+
+  // Sweep the current page's (virtualized) viewport, grabbing at every stop.
+  async function phSweepGrid(grab) {
+    const vp = deepQueryAll('.ag-body-viewport').filter(visible)[0];
+    grab();
+    if (!vp) return;
+    const step = Math.max(80, Math.floor(vp.clientHeight * 0.5));
+    vp.scrollTop = 0;
+    await sleep(450);
+    grab();
+    for (let pos = step, i = 0; i < 80; pos += step, i++) {
+      checkAbort();
+      const max = Math.max(0, vp.scrollHeight - vp.clientHeight);
+      vp.scrollTop = Math.min(pos, max);
+      await sleep(450);
+      grab();
+      if (pos >= max) break; // bottom reached (and grabbed)
+    }
+    vp.scrollTop = 0; await sleep(300); grab();
+  }
+
+  // Collect every pay period of the year. The grid is PAGINATED (e.g.
+  // "1 to 20 of 27", Page 1 of 2) — first try raising the page size, then walk
+  // the remaining pages until the collected count reaches the "of N" total.
+  async function phScrapeYearRows() {
+    const seen = new Map();
+    const grab = () => { const rows = phCollectVisibleRows(); if (rows) for (const r of rows) seen.set(r.pay + '|' + r.end, r); };
+    // The grid renders its headers before the data rows arrive — wait (up to
+    // ~15s) for the first date-bearing row.
+    for (let i = 0; i < 30; i++) {
+      grab();
+      if (seen.size) break;
+      checkAbort();
+      await sleep(500);
+    }
+    await phTrySetMaxPageSize(); // one page for everything, when possible
+    await phSweepGrid(grab);
+    // Walk remaining pages (weekly clients can have 3+).
+    for (let page = 0; page < 12; page++) {
+      checkAbort();
+      const total = phGridTotalRows();
+      if (total && seen.size >= total) break;
+      if (!phClickNextPage()) break;
+      await sleep(1200);
+      await phSweepGrid(grab);
+    }
+    const total = phGridTotalRows();
+    if (total && seen.size < total) {
+      logWarn('Payroll Schedule: collected ' + seen.size + ' of ' + total + ' rows — some pages may be missing');
+    }
+    phClickFirstPage(); // leave the grid on page 1 for the Period-Start click
+    await sleep(800);
+    return Array.from(seen.values()).filter(r => phDate(r.pay))
+      .sort((a, b) => phDate(a.pay) - phDate(b.pay));
+  }
+
+  // Read a single-date value sitting under a side-panel label (e.g. "Period
+  // Start Date" → 12/14/2025). The label's near ancestors hold only its value.
+  function phPanelValue(labelText) {
+    const labels = deepQueryAll('*').filter(el =>
+      visible(el) && el.children.length === 0 && (el.textContent || '').trim() === labelText);
+    for (const lb of labels) {
+      let p = lb.parentElement;
+      for (let i = 0; i < 3 && p; i++, p = p.parentElement) {
+        const dates = ((p.innerText || '').match(/\d{2}\/\d{2}\/\d{4}/g)) || [];
+        if (dates.length === 1) return dates[0];
+        if (dates.length > 1) break; // walked too far — ambiguous container
+      }
+    }
+    return '';
+  }
+
+  // Click the schedule row with the given Pay Date and read its Period Start
+  // Date from the "Payroll Dates" panel. Scrolls the grid to find the row.
+  async function phReadPeriodStartFor(payDate) {
+    phClickFirstPage(); // the first pay period always lives on page 1
+    await sleep(600);
+    const vp = deepQueryAll('.ag-body-viewport').filter(visible)[0];
+    if (vp) { vp.scrollTop = 0; await sleep(350); }
+    for (let i = 0; i < 45; i++) {
+      checkAbort();
+      const cell = deepQueryAll('.ag-row [col-id]').filter(visible)
+        .find(c => (c.textContent || '').trim() === payDate);
+      if (cell) {
+        clickEl(cell.closest('.ag-row') || cell);
+        // Wait for the panel to show THIS row (its Pay Date matches).
+        for (let j = 0; j < 16; j++) {
+          await sleep(500);
+          if (phPanelValue('Pay Date') === payDate) {
+            const start = phPanelValue('Period Start Date');
+            if (start) return start;
+          }
+        }
+        return '';
+      }
+      if (vp) { vp.scrollTop = vp.scrollTop + Math.max(100, vp.clientHeight * 0.8); }
+      await sleep(350);
+    }
+    return '';
+  }
+
+  // For every consolidated task, compute the three dates and stash the target
+  // filename on the task (task.phFileName). Missing data → warn + default name.
+  async function phCaptureScheduleDates(tasks, calendarYear) {
+    if (!await phOpenSchedulePage()) {
+      logWarn('Payroll Schedule page did not load — files keep ADP default names');
+      return;
+    }
+    const byYear = new Map();
+    for (const t of tasks) {
+      const y = t.fullYear ? t.year : calendarYear;
+      if (!byYear.has(y)) byYear.set(y, []);
+      byYear.get(y).push(t);
+    }
+    for (const [y, list] of Array.from(byYear.entries()).sort((a, b) => a[0] - b[0])) {
+      checkAbort();
+      const picked = await phSelectYear(y);
+      if (!picked && y !== calendarYear) {
+        logWarn('Year ' + y + ' not selectable on Payroll Schedule — default names for that year');
+        continue;
+      }
+      const rows = await phScrapeYearRows();
+      logInfo('Payroll Schedule ' + y + ': ' + rows.length + ' pay period(s) scraped');
+      for (const t of list) {
+        checkAbort();
+        const range = phTaskRange(t, calendarYear);
+        const inRange = rows.filter(r => { const d = phDate(r.pay); return d && d >= range.s && d <= range.e; });
+        if (!inRange.length) { logWarn('No pay periods with a pay date inside ' + t.label + ' — default name'); continue; }
+        const first = inRange[0], last = inRange[inRange.length - 1];
+        const begin = await phReadPeriodStartFor(first.pay);
+        if (!begin) { logWarn('Could not read Period Start Date for ' + t.label + ' — default name'); continue; }
+        t.phFileName = 'PriorPayroll_' + phCompact(begin) + '_' + phCompact(last.end) + '_' + phCompact(last.pay) + '.xlsx';
+        logSuccess(t.label + ' → ' + t.phFileName);
+      }
+    }
+  }
+
+  // Arm URL-capture hooks on a window (the Reports area lives in an iframe, so
+  // hooks must go on the ANCHOR'S OWN window, not just the top one). window.open
+  // is also suppressed — we fetch the file ourselves instead of letting ADP pop
+  // a tab (which pop-up blockers eat anyway).
+  function phArmSniffer(win) {
+    const st = { urls: [], forms: [] };
+    const looks = (u) => typeof u === 'string' && u && u !== '#!' && !/#!$/.test(u) && !/^(javascript:|about:blank$)/i.test(u);
+    const push = (u) => { try { if (looks(u) && st.urls.indexOf(String(u)) < 0) st.urls.push(String(u)); } catch (_) { } };
+    const oOpen = win.open;
+    const oFetch = win.fetch;
+    const XP = win.XMLHttpRequest && win.XMLHttpRequest.prototype;
+    const oXo = XP && XP.open;
+    const FP = win.HTMLFormElement && win.HTMLFormElement.prototype;
+    const oSub = FP && FP.submit;
+    // window.open: capture the URL AND hand back a fake window, because ADP
+    // often opens a launcher page first and only then assigns the real file
+    // URL to the popup's location (or writes a form into it). The fake window
+    // records location assignments instead of opening a tab.
+    win.open = function (u) {
+      push(u);
+      const fake = {
+        closed: false, opener: win,
+        focus() { }, blur() { }, close() { this.closed = true; },
+        addEventListener() { }, removeEventListener() { }, postMessage() { },
+        document: { write() { }, writeln() { }, open() { }, close() { }, addEventListener() { } },
+      };
+      try {
+        Object.defineProperty(fake, 'location', {
+          configurable: true,
+          get() { return { get href() { return ''; }, set href(v) { push(v); }, assign: push, replace: push }; },
+          set(v) { push(v); },
+        });
+      } catch (_) { }
+      return fake;
+    };
+    if (oFetch) win.fetch = function (u) { const s = typeof u === 'string' ? u : (u && u.url) || ''; if (/xls|export|download|external|output|instanceRefId/i.test(s)) push(s); return oFetch.apply(this, arguments); };
+    if (oXo) XP.open = function (m, u) { if (/xls|export|download|external|output|instanceRefId/i.test(String(u))) push(String(u)); return oXo.apply(this, arguments); };
+    // form.submit: ADP may POST a form targeting the popup instead of using
+    // the window handle. Record action + fields so the request can be replayed
+    // with fetch() if URL capture alone doesn't yield the file.
+    if (oSub) FP.submit = function () {
+      try {
+        const action = this.getAttribute('action') || this.action || '';
+        const fields = [];
+        for (const el of this.elements || []) {
+          if (el.name) fields.push(encodeURIComponent(el.name) + '=' + encodeURIComponent(el.value || ''));
+        }
+        st.forms.push({ action: String(action), method: String(this.method || 'get'), query: fields.join('&') });
+        if (action) push(String(action));
+      } catch (_) { }
+      return oSub.apply(this, arguments);
+    };
+    st.restore = () => { try { win.open = oOpen; if (oFetch) win.fetch = oFetch; if (oXo) XP.open = oXo; if (oSub) FP.submit = oSub; } catch (_) { } };
+    return st;
+  }
+
+  // After Run as Excel: wait for the report row to complete on Reports Output,
+  // open its ⋯ menu, click "View as XLS", capture the real file URL from the
+  // iframe's window, fetch it with session cookies, and save under our name.
+  // Any failure falls back to ADP's native behavior (default filename).
+  async function phDownloadRenamed(task, setStatus) {
+    setStatus('Waiting for ' + task.label + ' to finish generating…');
+    // The report we just ran is the NEWEST row → topmost on Reports Output
+    // (sorted by Run Date desc). Wait until THAT specific row shows "Completed".
+    // Older completed rows from previous runs sit below it and must be ignored,
+    // or we'd click the wrong (or a still-processing) row's menu.
+    const completedNear = (top) => deepQueryAll('*').filter(visible).some(el =>
+      (el.textContent || '').trim() === 'Completed' &&
+      Math.abs(el.getBoundingClientRect().top - top) < 30);
+    let trigger = null, topSig = '';
+    let loggedProc = false, loggedPrev = false;
+    for (let i = 0; i < 400 && !trigger; i++) { // up to ~10 min
+      checkAbort();
+      const trigs = deepQueryAll('.fa-ellipsis-h').filter(visible)
+        .map(t => t.closest('[role="button"], .revitButton') || t.parentElement || t)
+        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      if (trigs.length) {
+        const topEl = trigs[0];
+        const top = topEl.getBoundingClientRect().top;
+        const sig = phRowSignatureNear(top);
+        // Ignore the PREVIOUS task's row: on a multi-file run it can still be
+        // topmost (and already Completed) for a moment before the new report's
+        // row renders. Only accept a row we haven't downloaded this run.
+        if (sig && phDownloadedSigs.has(sig)) {
+          if (!loggedPrev) { logInfo('Previous report still topmost — waiting for the new row…'); loggedPrev = true; }
+        } else if (completedNear(top)) {
+          trigger = topEl; topSig = sig; // a NEW row that is Completed
+          break;
+        } else if (!loggedProc) {
+          logInfo('Newest report row is still processing — waiting for Completed…');
+          loggedProc = true;
+        }
+      }
+      await sleep(1500);
+    }
+    if (!trigger) throw new Error('report row did not reach Completed in time');
+    // Mark this row done now (whatever the download outcome), so the NEXT task
+    // waits for a genuinely new row instead of re-grabbing this one.
+    if (topSig) phDownloadedSigs.add(topSig);
+    logInfo('Newest report row is Completed — opening its options menu');
+
+    setStatus('Downloading ' + task.label + ' as ' + task.phFileName + '…');
+    // The ⋯ options button is a Dojo DROPDOWN widget — it opens on MOUSEDOWN,
+    // which a plain .click() never fires. Dispatch the full pointer/mouse
+    // sequence (pointerdown → mousedown → pointerup → mouseup → click) on the
+    // widget host, plus dijitclick for good measure.
+    const phMouseSeq = (el) => {
+      let cx = 0, cy = 0;
+      try {
+        const r = el.getBoundingClientRect();
+        cx = r.left + r.width / 2;
+        cy = r.top + r.height / 2;
+      } catch (_) { }
+      const base = { bubbles: true, cancelable: true, view: el.ownerDocument.defaultView || window, button: 0, clientX: cx, clientY: cy };
+      const PE = (el.ownerDocument.defaultView || window).PointerEvent || MouseEvent;
+      const fire = (Ctor, type, extra) => { try { el.dispatchEvent(new Ctor(type, Object.assign({}, base, extra || {}))); } catch (_) { } };
+      fire(PE, 'pointerover', { pointerId: 1, isPrimary: true });
+      fire(MouseEvent, 'mouseover');
+      fire(PE, 'pointerdown', { pointerId: 1, isPrimary: true });
+      fire(MouseEvent, 'mousedown');
+      fire(PE, 'pointerup', { pointerId: 1, isPrimary: true });
+      fire(MouseEvent, 'mouseup');
+      fire(MouseEvent, 'click');
+    };
+    const phClickRevit = (el) => {
+      const host = el.closest('[role="button"], .revitButton') || el;
+      try { host.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (_) { }
+      phMouseSeq(host);
+      try { host.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+    };
+    // The grid re-renders when the row flips to Completed, which can leave the
+    // ⋯ node we captured DETACHED from the DOM — events dispatched on a
+    // detached node go nowhere, so the menu "never opens". Re-locate the
+    // trigger fresh (same row, matched by signature) whenever ours is stale.
+    const phFreshTrigger = () => {
+      const trigs = deepQueryAll('.fa-ellipsis-h').filter(visible)
+        .map(t => t.closest('[role="button"], .revitButton') || t.parentElement || t)
+        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      if (!trigs.length) return null;
+      if (topSig) {
+        const same = trigs.find(t => phRowSignatureNear(t.getBoundingClientRect().top) === topSig);
+        if (same) return same;
+      }
+      return trigs[0];
+    };
+    const phClickTrigger = () => {
+      if (!trigger.isConnected) {
+        const fresh = phFreshTrigger();
+        if (fresh) { logInfo('⋯ button was re-rendered by a grid refresh — re-located it'); trigger = fresh; }
+        else logWarn('⋯ button is detached and no replacement was found');
+      }
+      phClickRevit(trigger);
+    };
+    phClickTrigger();
+    await sleep(800);
+    // Find "View as XLS" in the opened menu — by its stable pendo id first,
+    // then by text. If the menu didn't open, re-click the trigger and retry.
+    const findXlsAnchor = () =>
+      deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0]
+      || deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
+        .find(el => /view as xls/i.test((el.textContent || '').trim()) && (el.textContent || '').trim().length < 30)
+      || null;
+    let anchor = null;
+    for (let i = 0; i < 24 && !anchor; i++) {
+      anchor = findXlsAnchor();
+      if (!anchor) {
+        if (i > 0 && i % 8 === 0) { // menu didn't open — try the trigger again
+          logInfo('Options menu not open yet — re-clicking the ⋯ button');
+          phClickTrigger();
+        }
+        await sleep(500);
+      }
+    }
+    if (!anchor) throw new Error('"View as XLS" menu item not found (trigger still in DOM: ' + trigger.isConnected + ')');
+
+    const win = (anchor.ownerDocument && anchor.ownerDocument.defaultView) || window;
+    const sn1 = phArmSniffer(win);
+    const sn2 = (win === window) ? null : phArmSniffer(window);
+    const baseHref = anchor.ownerDocument.baseURI;
+    // The real spreadsheet lives at …/downloadTemplate/?instanceRefId=BIRT…;
+    // the first thing ADP opens is usually a launcher/viewer page
+    // (auditOutput.do). Prefer a URL that looks like the file itself.
+    const phIsFileUrl = (u) => /downloadTemplate|instanceRefId|\.(xlsx?|csv)(\?|$)/i.test(u);
+    const capturedUrls = () => sn1.urls.concat(sn2 ? sn2.urls : []);
+    const capturedForms = () => sn1.forms.concat(sn2 ? sn2.forms : []);
+    let url = '';
+    try {
+      clickEl(anchor);
+      try { anchor.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+      for (let i = 0; i < 40; i++) { // up to 12s for the handler to fire
+        const arr = capturedUrls();
+        const good = arr.find(phIsFileUrl);
+        if (good) { url = good; break; }
+        if (!url) url = arr[0] || '';
+        if (url && i >= 20) break; // give the real file URL ~6s to appear, then work with the viewer
+        checkAbort();
+        await sleep(300);
+      }
+    } finally {
+      sn1.restore();
+      if (sn2) sn2.restore();
+    }
+    if (!url) {
+      logWarn(task.label + ': could not capture the file URL — the file keeps ADP\'s default name');
+      return false;
+    }
+    const abs = new URL(url, baseHref).href;
+    logInfo('Captured report file URL: ' + abs);
+
+    const isHtml = (r) => /text\/html/i.test((r && r.headers.get('content-type')) || '');
+    const phFetchBlob = async (u, opts) => {
+      const r = await fetch(u, Object.assign({ credentials: 'include' }, opts || {}));
+      if (!r.ok) { logWarn('Fetch failed (HTTP ' + r.status + ') for ' + u); return null; }
+      return { resp: r, blob: await r.blob() };
+    };
+    let got = await phFetchBlob(abs);
+    if (!got || !got.blob.size) throw new Error('file download returned an empty body');
+    let viewerHtml = '';
+    if (isHtml(got.resp)) {
+      // A viewer/launcher page, not the spreadsheet. Mine its HTML for the
+      // real file URL — a downloadTemplate link or a BIRT… instanceRefId.
+      try { viewerHtml = await got.blob.text(); } catch (_) { }
+      logInfo(task.label + ': captured URL is a viewer page — mining it for the real file URL');
+      let fileUrl = '';
+      const mLink = viewerHtml.match(/[\w\/.:-]*downloadTemplate\/?\?[^"'<>\s\\]+/i);
+      const mId = viewerHtml.match(/instanceRefId['"=:\s]+["']?([\w.-]+)/i) || viewerHtml.match(/\b(BIRT[\w.-]+)\b/);
+      if (mLink) fileUrl = new URL(mLink[0].replace(/&amp;/g, '&'), abs).href;
+      else if (mId) fileUrl = new URL('/wfn/chr/reporting/downloadTemplate/?instanceRefId=' + encodeURIComponent(mId[1]), abs).href;
+      if (fileUrl) {
+        logInfo('Viewer page references the file: ' + fileUrl);
+        got = await phFetchBlob(fileUrl);
+      }
+      // Still no spreadsheet? Replay any form submissions ADP made toward the
+      // popup (POST forms carry their params outside the URL).
+      if (!got || !got.blob.size || isHtml(got.resp)) {
+        for (const f of capturedForms()) {
+          checkAbort();
+          try {
+            const action = new URL(f.action || '', baseHref).href;
+            const post = /post/i.test(f.method);
+            const u = post ? action : action + (f.query ? (action.indexOf('?') >= 0 ? '&' : '?') + f.query : '');
+            logInfo('Replaying captured ' + f.method.toUpperCase() + ' form: ' + action);
+            const r = await phFetchBlob(u, post ? { method: 'POST', body: f.query, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } } : null);
+            if (r && r.blob.size && !isHtml(r.resp)) { got = r; break; }
+          } catch (_) { }
+        }
+      }
+    }
+    if (!got || !got.blob.size || isHtml(got.resp)) {
+      // Everything above failed — log evidence for diagnosis, then fall back
+      // to ADP's own behavior (viewer tab, default filename).
+      logWarn(task.label + ': could not reach the real file — opening the viewer normally (default name)');
+      logInfo('Diagnostics — URLs: ' + JSON.stringify(capturedUrls()) +
+        ' | forms: ' + JSON.stringify(capturedForms().map(f => f.method + ' ' + f.action)) +
+        ' | viewer HTML (' + viewerHtml.length + ' chars) mentions instanceRefId=' + /instanceRefId/i.test(viewerHtml) +
+        ' BIRT=' + /BIRT/.test(viewerHtml) + ' downloadTemplate=' + /downloadTemplate/i.test(viewerHtml));
+      try { window.open(abs); } catch (_) { }
+      return false;
+    }
+    const blob = got.blob;
+    const bu = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = bu;
+    a.download = task.phFileName;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => { try { URL.revokeObjectURL(bu); } catch (_) { } }, 15000);
+    logSuccess('Saved ' + task.phFileName + ' (' + blob.size + ' bytes)');
+    return true;
+  }
+
   // Payroll History uses a different flow: Standard Reports → search → select,
   // instead of Custom Reports → Create new → Select Fields. So it has its own
   // flow function rather than going through runFullFlow.
   async function downloadPayrollHistory(setStatus) {
     logInfo('=== Download Payroll History ===');
     resetAbort();
+    phDownloadedSigs = new Set(); // fresh per run (multi-file de-dup by row)
 
     // Payroll History runs against ADP's Dojo-heavy Standard Reports pages,
     // which are slow to wire up their widgets. PH_PAD is an extra settle pause
@@ -2604,6 +3183,23 @@
       const currentQuarter = pick.currentQuarter;
       if (!quarters.length) { setStatus('Nothing selected — nothing to download'); logWarn('No years/quarters selected'); return; }
       logInfo('First-payroll quarter: Q' + currentQuarter + '. Selected: ' + quarters.map(q => q.label).join(', '));
+
+      // Step 0 — CONSOLIDATED tasks only: read the Payroll Schedule to compute
+      // each task's PriorPayroll_<begin>_<end>_<paydate>.xlsx filename. Any
+      // failure logs a warning and the affected file keeps ADP's default name;
+      // the downloads themselves are never blocked.
+      const consolidatedTasks = quarters.filter(q => q.quarter < currentQuarter);
+      if (consolidatedTasks.length) {
+        setStatus('Step 0: Reading the Payroll Schedule for pay-period dates…');
+        checkAbort();
+        try {
+          await phCaptureScheduleDates(consolidatedTasks, year);
+        } catch (err) {
+          if (err && err.aborted) throw err;
+          logWarn('Payroll Schedule capture failed — files keep ADP default names (' +
+            ((err && err.message) || err) + ')');
+        }
+      }
 
       setStatus('Step 1: Opening Reports menu…');
       checkAbort();
@@ -2739,6 +3335,20 @@
 
         // Wait for the report to process and redirect to output page
         await sleep(5000);
+
+        // Consolidated tasks with a computed date-set: fetch the finished file
+        // ourselves so it saves as PriorPayroll_<begin>_<end>_<paydate>.xlsx.
+        // Detailed reports (and tasks whose dates couldn't be captured) keep
+        // ADP's default filename/behavior.
+        if (q.phFileName) {
+          try {
+            await phDownloadRenamed(q, setStatus);
+          } catch (err) {
+            if (err && err.aborted) throw err;
+            logWarn('Renamed download failed for ' + q.label + ' — file keeps the default name (' +
+              ((err && err.message) || err) + ')');
+          }
+        }
       }
 
       setStatus('All ' + quarters.length + ' report(s) downloaded ✓');
