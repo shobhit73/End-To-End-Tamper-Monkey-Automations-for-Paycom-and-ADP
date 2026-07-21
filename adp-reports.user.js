@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.5.8
+// @version      1.5.10
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -2778,17 +2778,30 @@
       await sleep(500);
     }
     await phTrySetMaxPageSize(); // one page for everything, when possible
+    // GOTCHA: the grid can open on the page holding TODAY's pay period (a
+    // weekly client in July starts on page 2 of 3), and the walk below only
+    // pages FORWARD — start from page 1 or the earlier pages are never seen.
+    if (phClickFirstPage()) await sleep(1200);
+    const phWalkPages = async () => {
+      for (let page = 0; page < 12; page++) {
+        checkAbort();
+        const total = phGridTotalRows();
+        if (total && seen.size >= total) break;
+        if (!phClickNextPage()) break;
+        await sleep(1200);
+        await phSweepGrid(grab);
+      }
+    };
     await phSweepGrid(grab);
-    // Walk remaining pages (weekly clients can have 3+).
-    for (let page = 0; page < 12; page++) {
-      checkAbort();
-      const total = phGridTotalRows();
-      if (total && seen.size >= total) break;
-      if (!phClickNextPage()) break;
-      await sleep(1200);
+    await phWalkPages(); // weekly clients can have 3+ pages
+    let total = phGridTotalRows();
+    if (total && seen.size < total) { // safety net: one more pass from page 1
+      logInfo('Re-walking the schedule from page 1 (' + seen.size + ' of ' + total + ' so far)');
+      if (phClickFirstPage()) await sleep(1200);
       await phSweepGrid(grab);
+      await phWalkPages();
+      total = phGridTotalRows();
     }
-    const total = phGridTotalRows();
     if (total && seen.size < total) {
       logWarn('Payroll Schedule: collected ' + seen.size + ' of ' + total + ' rows — some pages may be missing');
     }
@@ -2817,28 +2830,39 @@
   // Click the schedule row with the given Pay Date and read its Period Start
   // Date from the "Payroll Dates" panel. Scrolls the grid to find the row.
   async function phReadPeriodStartFor(payDate) {
-    phClickFirstPage(); // the first pay period always lives on page 1
-    await sleep(600);
-    const vp = deepQueryAll('.ag-body-viewport').filter(visible)[0];
-    if (vp) { vp.scrollTop = 0; await sleep(350); }
-    for (let i = 0; i < 45; i++) {
+    // The target row can sit on ANY page (a Q2 task's first pay period lands
+    // mid-year), so sweep the current page top-to-bottom and page forward
+    // until the Pay Date cell is found.
+    phClickFirstPage();
+    await sleep(800);
+    for (let page = 0; page < 12; page++) {
       checkAbort();
-      const cell = deepQueryAll('.ag-row [col-id]').filter(visible)
-        .find(c => (c.textContent || '').trim() === payDate);
-      if (cell) {
-        clickEl(cell.closest('.ag-row') || cell);
-        // Wait for the panel to show THIS row (its Pay Date matches).
-        for (let j = 0; j < 16; j++) {
-          await sleep(500);
-          if (phPanelValue('Pay Date') === payDate) {
-            const start = phPanelValue('Period Start Date');
-            if (start) return start;
+      const vp = deepQueryAll('.ag-body-viewport').filter(visible)[0];
+      if (vp) { vp.scrollTop = 0; await sleep(350); }
+      for (let i = 0; i < 25; i++) {
+        checkAbort();
+        const cell = deepQueryAll('.ag-row [col-id]').filter(visible)
+          .find(c => (c.textContent || '').trim() === payDate);
+        if (cell) {
+          clickEl(cell.closest('.ag-row') || cell);
+          // Wait for the panel to show THIS row (its Pay Date matches).
+          for (let j = 0; j < 16; j++) {
+            await sleep(500);
+            if (phPanelValue('Pay Date') === payDate) {
+              const start = phPanelValue('Period Start Date');
+              if (start) return start;
+            }
           }
+          return '';
         }
-        return '';
+        if (!vp) break;
+        const max = Math.max(0, vp.scrollHeight - vp.clientHeight);
+        if (vp.scrollTop >= max) break; // bottom of this page — try the next
+        vp.scrollTop = vp.scrollTop + Math.max(100, vp.clientHeight * 0.8);
+        await sleep(350);
       }
-      if (vp) { vp.scrollTop = vp.scrollTop + Math.max(100, vp.clientHeight * 0.8); }
-      await sleep(350);
+      if (!phClickNextPage()) break;
+      await sleep(1200);
     }
     return '';
   }
@@ -2937,8 +2961,10 @@
 
   // After Run as Excel: wait for the report row to complete on Reports Output,
   // open its ⋯ menu, click "View as XLS", capture the real file URL from the
-  // iframe's window, fetch it with session cookies, and save under our name.
-  // Any failure falls back to ADP's native behavior (default filename).
+  // iframe's window, fetch it with session cookies, and save it — under the
+  // computed PriorPayroll_* name when task.phFileName is set (consolidated
+  // tasks), else under ADP's own default filename (per-pay-period tasks).
+  // Any failure falls back to ADP's native behavior.
   async function phDownloadRenamed(task, setStatus) {
     setStatus('Waiting for ' + task.label + ' to finish generating…');
     // The report we just ran is the NEWEST row → topmost on Reports Output
@@ -2980,7 +3006,7 @@
     if (topSig) phDownloadedSigs.add(topSig);
     logInfo('Newest report row is Completed — opening its options menu');
 
-    setStatus('Downloading ' + task.label + ' as ' + task.phFileName + '…');
+    setStatus('Downloading ' + task.label + (task.phFileName ? ' as ' + task.phFileName : ' (ADP default name)') + '…');
     // The ⋯ options button is a Dojo DROPDOWN widget — it opens on MOUSEDOWN,
     // which a plain .click() never fires. Dispatch the full pointer/mouse
     // sequence (pointerdown → mousedown → pointerup → mouseup → click) on the
@@ -3139,16 +3165,30 @@
       return false;
     }
     const blob = got.blob;
+    // Per-pay-period tasks have no computed name — keep ADP's own filename:
+    // Content-Disposition first, then the URL's basename, then a label-based
+    // fallback so the download never silently vanishes.
+    let fname = task.phFileName;
+    if (!fname) {
+      const cd = got.resp.headers.get('content-disposition') || '';
+      const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
+      if (m) { try { fname = decodeURIComponent(m[1].trim()); } catch (_) { fname = m[1].trim(); } }
+      if (!fname) {
+        const pathName = (got.resp.url || '').split('?')[0].split('/').pop() || '';
+        if (/\.(xlsx?|csv)$/i.test(pathName)) fname = pathName;
+      }
+      if (!fname) fname = 'PayrollHistory_' + task.label.replace(/\s+/g, '_') + '.xlsx';
+    }
     const bu = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = bu;
-    a.download = task.phFileName;
+    a.download = fname;
     a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => { try { URL.revokeObjectURL(bu); } catch (_) { } }, 15000);
-    logSuccess('Saved ' + task.phFileName + ' (' + blob.size + ' bytes)');
+    logSuccess('Saved ' + fname + ' (' + blob.size + ' bytes)');
     return true;
   }
 
@@ -3336,18 +3376,16 @@
         // Wait for the report to process and redirect to output page
         await sleep(5000);
 
-        // Consolidated tasks with a computed date-set: fetch the finished file
-        // ourselves so it saves as PriorPayroll_<begin>_<end>_<paydate>.xlsx.
-        // Detailed reports (and tasks whose dates couldn't be captured) keep
-        // ADP's default filename/behavior.
-        if (q.phFileName) {
-          try {
-            await phDownloadRenamed(q, setStatus);
-          } catch (err) {
-            if (err && err.aborted) throw err;
-            logWarn('Renamed download failed for ' + q.label + ' — file keeps the default name (' +
-              ((err && err.message) || err) + ')');
-          }
+        // EVERY task fetches its finished file from Reports Output. Tasks with
+        // a computed date-set save as PriorPayroll_<begin>_<end>_<paydate>.xlsx;
+        // detailed/per-pay-period tasks (and tasks whose dates couldn't be
+        // captured) download under ADP's own default filename.
+        try {
+          await phDownloadRenamed(q, setStatus);
+        } catch (err) {
+          if (err && err.aborted) throw err;
+          logWarn('Download failed for ' + q.label + ' — fetch it from Reports Output manually (' +
+            ((err && err.message) || err) + ')');
         }
       }
 
