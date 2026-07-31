@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         UZIO Setup Auto-Create (Earnings + Deductions + Contributions from Payroll Setup Helper xlsx)
+// @name         UZIO Bot (Unified) — Setup Auto-Create + Bulk Employee History
 // @namespace    https://uzio.com/
-// @version      0.39.0
-// @description  Reads the Earnings, Deductions and Contributions tabs of the Payroll Setup Helper .xlsx and auto-creates each in UZIO. Buttons: Start Earnings / Deductions / Contributions. Each save is positively verified (form must reset/close) so silent failures pause instead of being skipped. On failure: pause with Save & Continue / Resume / Skip, or skip & continue; manual Pause; end-of-run reconciliation.
-// @match        https://app.uzio.com/*
+// @version      1.0.0
+// @description  One unified "UZIO Bot" panel with two tabs. SETUP tab: reads the Earnings/Deductions/Contributions tabs of the Payroll Setup Helper .xlsx and auto-creates each in UZIO (positively-verified saves; pause / Save & Continue / Resume / Skip on failure). EMP HISTORY tab: paste visible Employee IDs and bulk-trigger "Download Employee Profile Change Report" for each. Both tools' features are preserved unchanged; only the outer panel is shared.
+// @match        *://*.uzio.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      cdn.jsdelivr.net
@@ -31,6 +31,168 @@
  *  shows exactly where a row is if it ever stalls; a per-row watchdog
  *  (rowTimeoutMs) guarantees the run never freezes silently.
  */
+
+// ═════════════════════════════════════════════════════════════════════════
+//  SHARED HOST SHELL  (window.__UZIO_HOST__)
+//  One floating "UZIO Bot" card with a header (drag + minimize) and a tab bar.
+//  Each tool registers a tab + a mount function; the host owns all outer chrome
+//  and persistence (SPA re-render survival). Tools keep 100% of their own logic.
+// ═════════════════════════════════════════════════════════════════════════
+(function () {
+  'use strict';
+  if (window.__UZIO_HOST__) return;
+
+  const tools = [];                       // { key, meta:{label,icon}, mountFn }
+  let shell = null, hdr = null, minBtn = null, tabsBar = null, slotsWrap = null;
+  let activeKey = null, desiredKey = null, minimized = false;
+
+  function injectStyle() {
+    if (document.getElementById('uzio-host-style')) return;
+    const s = document.createElement('style');
+    s.id = 'uzio-host-style';
+    s.textContent = `
+      #uzio-bot-shell{position:fixed;right:16px;bottom:16px;z-index:2147483647;width:360px;background:#fff;
+        border:1px solid #E4E2F0;border-radius:16px;overflow:hidden;color:#2B2950;
+        font:13px/1.45 'Source Sans Pro','Segoe UI',system-ui,sans-serif;
+        box-shadow:0 24px 56px rgba(35,32,72,.30),0 4px 14px rgba(35,32,72,.12)}
+      #uzio-bot-shell *{box-sizing:border-box}
+      #uzio-bot-shell .uzh-hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;
+        padding:10px 13px;background:linear-gradient(135deg,#312E5B 0%,#232048 100%);
+        border-bottom:3px solid #D3B23C;cursor:move;user-select:none}
+      #uzio-bot-shell .uzh-brand{display:flex;align-items:center;gap:9px;min-width:0}
+      #uzio-bot-shell .uzh-logo{flex:none;width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+        border:2px solid #fff;border-radius:8px;color:#fff;font-weight:700;font-size:14px;background:rgba(255,255,255,.08)}
+      #uzio-bot-shell .uzh-title{color:#fff;font-weight:700;font-size:14px;letter-spacing:.3px;white-space:nowrap}
+      #uzio-bot-shell .uzh-min{flex:none;width:28px;height:26px;line-height:1;font-weight:700;cursor:pointer;color:#fff;
+        background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.35);border-radius:8px}
+      #uzio-bot-shell .uzh-min:hover{background:rgba(255,255,255,.26)}
+      #uzio-bot-shell .uzh-tabs{display:flex;background:#F4F3FA;border-bottom:1px solid #E4E2F0}
+      #uzio-bot-shell .uzh-tab{flex:1;padding:9px 10px;border:0;background:transparent;cursor:pointer;
+        font:700 12px 'Source Sans Pro','Segoe UI',system-ui,sans-serif;color:#8B89A6;
+        border-bottom:2px solid transparent;transition:color .15s ease,background .15s ease}
+      #uzio-bot-shell .uzh-tab:hover{color:#312E5B;background:#EEEBF8}
+      #uzio-bot-shell .uzh-tab.active{color:#312E5B;background:#fff;border-bottom-color:#D3B23C}
+      #uzio-bot-shell .uzh-slots{overflow-y:auto;overflow-x:hidden}
+      #uzio-bot-shell .uzh-slot{display:none}
+    `;
+    (document.head || document.documentElement).appendChild(s);
+  }
+
+  function build() {
+    if (shell && document.body && document.body.contains(shell)) return;
+    if (!document.body) return;
+    injectStyle();
+    shell = document.createElement('div');
+    shell.id = 'uzio-bot-shell';
+    shell.innerHTML =
+      '<div class="uzh-hdr"><div class="uzh-brand"><span class="uzh-logo">U</span>' +
+      '<span class="uzh-title">UZIO Bot</span></div>' +
+      '<button class="uzh-min" title="Minimize / expand">–</button></div>' +
+      '<div class="uzh-tabs"></div><div class="uzh-slots"></div>';
+    document.body.appendChild(shell);
+    hdr = shell.querySelector('.uzh-hdr');
+    minBtn = shell.querySelector('.uzh-min');
+    tabsBar = shell.querySelector('.uzh-tabs');
+    slotsWrap = shell.querySelector('.uzh-slots');
+    activeKey = null;
+    for (const t of tools) addToolDom(t);
+    activate(desiredKey || (tools[0] && tools[0].key));
+    wireChrome();
+    capBody();
+  }
+
+  function addToolDom(t) {
+    const tab = document.createElement('button');
+    tab.className = 'uzh-tab';
+    tab.dataset.key = t.key;
+    tab.textContent = (t.meta.icon ? t.meta.icon + ' ' : '') + t.meta.label;
+    tab.onclick = () => activate(t.key);
+    tabsBar.appendChild(tab);
+    const slot = document.createElement('div');
+    slot.className = 'uzh-slot';
+    slot.dataset.key = t.key;
+    slotsWrap.appendChild(slot);
+    try { t.mountFn(slot); } catch (e) { console.error('[UZIO Host] mount failed:', t.key, e); }
+  }
+
+  function activate(key) {
+    if (!key || !slotsWrap) return;
+    activeKey = key; desiredKey = key;
+    slotsWrap.querySelectorAll('.uzh-slot').forEach(s => { s.style.display = s.dataset.key === key ? 'block' : 'none'; });
+    tabsBar.querySelectorAll('.uzh-tab').forEach(b => b.classList.toggle('active', b.dataset.key === key));
+    capBody();
+  }
+
+  function capBody() {
+    if (!shell || minimized || !tabsBar || !slotsWrap) return;
+    const margin = 16;
+    const below = window.innerHeight - tabsBar.getBoundingClientRect().bottom - margin;
+    slotsWrap.style.maxHeight = Math.max(160, below) + 'px';
+  }
+
+  function snapHome() {
+    shell.style.left = 'auto'; shell.style.top = 'auto';
+    shell.style.right = '16px'; shell.style.bottom = '16px';
+  }
+
+  function wireChrome() {
+    minBtn.onclick = () => {
+      minimized = !minimized;
+      tabsBar.style.display = minimized ? 'none' : '';
+      slotsWrap.style.display = minimized ? 'none' : '';
+      minBtn.textContent = minimized ? '+' : '–';
+      if (!minimized) { snapHome(); capBody(); }
+    };
+    let dragging = false, dx = 0, dy = 0;
+    hdr.addEventListener('mousedown', (e) => {
+      if (e.target.closest('.uzh-min')) return;
+      dragging = true;
+      const r = shell.getBoundingClientRect();
+      dx = e.clientX - r.left; dy = e.clientY - r.top;
+      shell.style.left = r.left + 'px'; shell.style.top = r.top + 'px';
+      shell.style.right = 'auto'; shell.style.bottom = 'auto';
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      let l = e.clientX - dx, t = e.clientY - dy;
+      l = Math.max(0, Math.min(l, window.innerWidth - shell.offsetWidth));
+      t = Math.max(0, Math.min(t, window.innerHeight - shell.offsetHeight));
+      shell.style.left = l + 'px'; shell.style.top = t + 'px';
+    });
+    document.addEventListener('mouseup', () => { if (dragging) { dragging = false; capBody(); } });
+    window.addEventListener('resize', capBody);
+  }
+
+  function register(key, meta, mountFn) {
+    if (tools.find(t => t.key === key)) return;
+    const t = { key, meta, mountFn };
+    tools.push(t);
+    if (shell && document.body && document.body.contains(shell)) {
+      addToolDom(t);
+      if (!activeKey) activate(key);
+      capBody();
+    } else {
+      build();
+    }
+  }
+
+  // Re-mount the shell if UZIO's SPA tears it out of the DOM (route changes,
+  // re-renders). Same persistence strategy the standalone bots used.
+  function keepAlive() {
+    if (!document.body) return;
+    if (!(shell && document.body.contains(shell))) build();
+  }
+  try {
+    const mo = new MutationObserver(keepAlive);
+    if (document.documentElement) mo.observe(document.documentElement, { childList: true, subtree: true });
+  } catch (_) { }
+  setInterval(keepAlive, 2000);
+  window.addEventListener('hashchange', keepAlive);
+  window.addEventListener('popstate', keepAlive);
+
+  window.__UZIO_HOST__ = { register, activate };
+})();
 
 (function () {
   'use strict';
@@ -1655,21 +1817,16 @@
   function fail(msg) { warn(msg); return { ok: false, reason: msg }; }
   function setStatus(s) { if (statusEl) statusEl.textContent = s; }
 
-  function buildPanel() {
-    if (document.getElementById('uzio-bot-panel')) return;
+  // Mounts the Setup tool's UI into a host-provided slot. The unified "UZIO Bot"
+  // shell owns the outer card/header/tabs/drag/minimize; this keeps its id
+  // (#uzio-bot-panel) so all its scoped CSS + button handlers stay unchanged.
+  function buildPanel(slot) {
+    if (!slot || slot.querySelector('#uzio-bot-panel')) return;
     const wrap = document.createElement('div');
     wrap.id = 'uzio-bot-panel';
-    // "Modern SaaS dashboard card" redesign, native to UZIO's dashboard UI:
-    // white card, labeled sections (SETUP / RUN / ON FAILURE / ACTIVITY),
-    // icon-chip buttons with hero Start actions. UZIO palette: deep indigo
-    // #312E5B/#232048, gold #D3B23C, blue #2D9CF4, orange #F5A623.
-    wrap.style.cssText = [
-      'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
-      'width:336px', 'background:#fff', 'border:1px solid #E4E2F0', 'border-radius:16px',
-      'box-shadow:0 24px 56px rgba(35,32,72,.30),0 4px 14px rgba(35,32,72,.12)',
-      "font:13px/1.45 'Source Sans Pro','Segoe UI',system-ui,sans-serif",
-      'color:#2B2950', 'padding:0', 'overflow:hidden',
-    ].join(';');
+    // Inner content only — the host shell provides the outer card chrome. The
+    // scoped <style> below (all #uzio-bot-panel …) still applies to descendants.
+    wrap.style.cssText = 'width:100%;color:#2B2950';
     wrap.innerHTML = `
       <style>
         #uzio-bot-panel *{box-sizing:border-box}
@@ -1748,17 +1905,6 @@
         #uzio-bot-panel #uziobot-log::-webkit-scrollbar-thumb{background:rgba(211,178,60,.45);border-radius:3px}
         #uzio-bot-panel #uziobot-log::-webkit-scrollbar-track{background:transparent}
       </style>
-      <div class="uzb-hdr">
-        <div class="uzb-brand">
-          <span class="uzb-logo">U</span>
-          <span class="uzb-titlebox">
-            <span class="uzb-title">UZIO Setup Bot</span>
-            <span class="uzb-sub">Automation Assistant</span>
-          </span>
-        </div>
-        <span class="uzb-ver">v0.39.0</span>
-        <button id="uziobot-min" title="Minimize / expand">–</button>
-      </div>
       <div id="uziobot-body">
         <div class="uzb-sec">
           <div class="uzb-lbl">Setup</div>
@@ -1797,7 +1943,7 @@
       </div>
       <input id="uziobot-fileinput" type="file" accept=".xlsx,.xls" style="display:none" />
     `;
-    document.body.appendChild(wrap);
+    slot.appendChild(wrap);
 
     logEl = wrap.querySelector('#uziobot-log');
     statusEl = wrap.querySelector('#uziobot-status');
@@ -1820,136 +1966,12 @@
     };
     updateControls();
 
-    // ── Drag + smart minimize/expand (same behavior as the Paycom bot) ──
-    const body = wrap.querySelector('#uziobot-body');
-    const minBtn = wrap.querySelector('#uziobot-min');
-    const hdr = wrap.querySelector('.uzb-hdr');
-
-    // Snap the panel back to its bottom-right home corner.
-    function snapHome() {
-      wrap.style.left = 'auto';
-      wrap.style.top = 'auto';
-      wrap.style.right = '16px';
-      wrap.style.bottom = '16px';
-    }
-    // Cap the body so the card never grows past the viewport (content scrolls
-    // inside instead of cropping the header off-screen). No repositioning.
-    function capBody() {
-      if (body.style.display === 'none') return;
-      const margin = 14;
-      const below = window.innerHeight - hdr.getBoundingClientRect().bottom - margin;
-      body.style.maxHeight = Math.max(140, below) + 'px';
-      body.style.overflowY = 'auto';
-      body.style.overflowX = 'hidden';
-    }
-    // On expand: grow from the chip toward whichever vertical side has more
-    // room (down if more space below, up otherwise), capped to stay on screen.
-    function expandFromChip() {
-      const r = hdr.getBoundingClientRect();
-      const headH = r.height;
-      const margin = 14;
-      wrap.style.left = r.left + 'px';
-      wrap.style.right = 'auto';
-      const spaceBelow = window.innerHeight - r.top; // header-top → viewport bottom
-      const spaceAbove = r.bottom;                   // viewport top → header bottom
-      if (spaceBelow >= spaceAbove) {
-        wrap.style.top = r.top + 'px';
-        wrap.style.bottom = 'auto';
-        body.style.maxHeight = Math.max(140, spaceBelow - headH - margin) + 'px';
-      } else {
-        wrap.style.top = 'auto';
-        wrap.style.bottom = (window.innerHeight - r.bottom) + 'px';
-        body.style.maxHeight = Math.max(140, r.bottom - headH - margin) + 'px';
-      }
-      body.style.overflowY = 'auto';
-      body.style.overflowX = 'hidden';
-    }
-
-    // Minimize → collapse to the title chip and snap to bottom-right.
-    // Expand → grow from wherever the chip is, toward the side with more room.
-    minBtn.onclick = () => {
-      const hidden = body.style.display === 'none';
-      body.style.display = hidden ? '' : 'none';
-      minBtn.textContent = hidden ? '–' : '+';
-      if (hidden) {
-        wrap.style.width = '336px';
-        expandFromChip();
-      } else {
-        wrap.style.width = 'auto';
-        snapHome();
-      }
-    };
-
-    // Drag by the header (minimize button excluded).
-    (function makeDraggable() {
-      let dragging = false, dx = 0, dy = 0;
-      hdr.addEventListener('mousedown', (e) => {
-        if (e.target.closest('#uziobot-min')) return;
-        dragging = true;
-        const r = wrap.getBoundingClientRect();
-        dx = e.clientX - r.left;
-        dy = e.clientY - r.top;
-        wrap.style.left = r.left + 'px';
-        wrap.style.top = r.top + 'px';
-        wrap.style.right = 'auto';
-        wrap.style.bottom = 'auto';
-        e.preventDefault();
-      });
-      document.addEventListener('mousemove', (e) => {
-        if (!dragging) return;
-        let l = e.clientX - dx, t = e.clientY - dy;
-        l = Math.max(0, Math.min(l, window.innerWidth - wrap.offsetWidth));
-        t = Math.max(0, Math.min(t, window.innerHeight - wrap.offsetHeight));
-        wrap.style.left = l + 'px';
-        wrap.style.top = t + 'px';
-      });
-      document.addEventListener('mouseup', () => {
-        if (!dragging) return;
-        dragging = false;
-        capBody(); // re-cap for the new position so it can't run off-screen
-      });
-    })();
-    window.addEventListener('resize', capBody);
-    capBody(); // initial cap — fixes the header cropping past the viewport top
-
     log('Ready. Choose .xlsx, open the matching Add form, then Start Deductions or Start Contributions.');
   }
 
-  // ═════════════════════════════════════════════════════════════════════════
-  //  PERSISTENT INJECTION (SPA-safe)
-  // ═════════════════════════════════════════════════════════════════════════
-  // Only show the bot on the employer home app (post-login):
-  //   https://app.uzio.com/employer/home#/...
-  // @match can't filter on the "#/" hash route, so we gate at runtime here.
-  function shouldShowPanel() {
-    try { return location.href.indexOf('app.uzio.com/employer/home') !== -1; }
-    catch (_) { return false; }
-  }
-
-  function ensurePanel() {
-    try {
-      if (!document.body) return;
-      const existing = document.getElementById('uzio-bot-panel');
-      if (shouldShowPanel()) {
-        if (!existing) buildPanel();              // on employer/home → show
-      } else if (existing) {
-        existing.remove();                        // anywhere else (e.g. login) → hide
-      }
-    } catch (e) { console.error('[UZIO Bot] ensurePanel error', e); }
-  }
-
-  function startInjector() {
-    ensurePanel();
-    try {
-      const mo = new MutationObserver(() => {
-        if (!document.getElementById('uzio-bot-panel')) ensurePanel();
-      });
-      if (document.documentElement) mo.observe(document.documentElement, { childList: true, subtree: true });
-    } catch (e) { console.error('[UZIO Bot] observer error', e); }
-    setInterval(ensurePanel, 2000);
-    window.addEventListener('hashchange', ensurePanel);
-    window.addEventListener('popstate', ensurePanel);
-  }
+  // Panel lifecycle (mounting + SPA-persistence) is owned by the shared host
+  // shell (window.__UZIO_HOST__) — the Setup tool just registers a mount fn in
+  // boot() below. The bot now shows on all UZIO pages, both tabs available.
 
   // ═════════════════════════════════════════════════════════════════════════
   //  SheetJS loader (CSP-safe via GM_xmlhttpRequest)
@@ -2001,7 +2023,12 @@
   async function boot() {
     if (booted) return;
     booted = true;
-    startInjector();              // panel appears immediately (don't block on CDN)
+    // Mount the Setup tool as the "Setup" tab of the shared UZIO Bot shell.
+    if (window.__UZIO_HOST__) {
+      window.__UZIO_HOST__.register('deductions', { label: 'Setup', icon: '⚙️' }, buildPanel);
+    } else {
+      console.error('[UZIO Bot] host shell not found — cannot mount Setup tab.');
+    }
     const ok = await loadSheetJS();
     if (ok) {
       log('Ready. Choose .xlsx, open the matching Add form, then Start (Earnings / Deductions / Contributions).');
@@ -2015,5 +2042,765 @@
     setTimeout(boot, 0);
   } else {
     boot();
+  }
+})();
+
+
+// ═════════════════════════════════════════════════════════════════════════
+//  EMPLOYEE HISTORY TOOL  (merged from uzio-employee-history.user.js)
+//  Registers as the "Emp History" tab of the shared UZIO Bot shell above.
+//  Feature logic is unchanged; only the outer panel chrome moved to the host.
+// ═════════════════════════════════════════════════════════════════════════
+(function () {
+  'use strict';
+
+  // The AngularJS scope method behind the per-employee button:
+  //   <button ng-click="triggerEmployeeHistoryDownload('<guid>')">…
+  const FN_NAME = 'triggerEmployeeHistoryDownload';
+
+  // ───────────────── page-context runner (injected) ─────────────────
+  // Tampermonkey runs in an isolated world; AngularJS scopes live in the page
+  // world. We inject this runner so angular.element(el).scope() resolves against
+  // the page's real Angular, then talk to it over window.postMessage.
+  function pageRunner(FN_NAME) {
+    var GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+    function post(type, payload) {
+      window.postMessage({ source: 'uzioBot-page', type: type, payload: payload }, '*');
+    }
+
+    // ── network sniffer ───────────────────────────────────────────────
+    // The download is delivered by a service method we can't read. Hook XHR +
+    // fetch so that when a report is triggered we capture its exact URL/method,
+    // which lets us re-issue it as an independent blob download.
+    var netLog = [];
+    function recordNet(info) { netLog.push(info); if (netLog.length > 60) netLog.shift(); }
+    (function hookNet() {
+      try {
+        var XO = window.XMLHttpRequest;
+        if (XO && XO.prototype && !XO.prototype.__uzioHooked) {
+          var open = XO.prototype.open, send = XO.prototype.send;
+          XO.prototype.open = function (method, url) {
+            this.__uzio = { method: method, url: url, ts: Date.now(), via: 'xhr' };
+            return open.apply(this, arguments);
+          };
+          XO.prototype.send = function (body) {
+            var info = this.__uzio || { via: 'xhr' };
+            try { info.body = (typeof body === 'string') ? body.slice(0, 400) : (body ? '[' + (body && body.constructor && body.constructor.name) + ']' : null); } catch (e) {}
+            recordNet(info);
+            var self = this;
+            try {
+              this.addEventListener('load', function () {
+                try {
+                  info.status = self.status;
+                  info.cdisp = self.getResponseHeader && self.getResponseHeader('Content-Disposition');
+                  info.ctype = self.getResponseHeader && self.getResponseHeader('Content-Type');
+                } catch (e) {}
+              });
+            } catch (e) {}
+            return send.apply(this, arguments);
+          };
+          XO.prototype.__uzioHooked = true;
+        }
+      } catch (e) {}
+      try {
+        if (window.fetch && !window.fetch.__uzioHooked) {
+          var of = window.fetch;
+          var nf = function (input, init) {
+            var url = (typeof input === 'string') ? input : (input && input.url);
+            var method = (init && init.method) || (input && input.method) || 'GET';
+            recordNet({ method: method, url: url, ts: Date.now(), via: 'fetch' });
+            return of.apply(this, arguments);
+          };
+          nf.__uzioHooked = true;
+          window.fetch = nf;
+        }
+      } catch (e) {}
+      // Hidden-form downloads (most common Angular file-download pattern).
+      try {
+        var FP = window.HTMLFormElement && window.HTMLFormElement.prototype;
+        function hookFormFn(name) {
+          if (!FP || !FP[name] || FP['__uzioHooked_' + name]) return;
+          var orig = FP[name];
+          FP[name] = function () {
+            try {
+              var inputs = {};
+              Array.prototype.forEach.call(this.querySelectorAll('input,textarea,select'), function (el) {
+                inputs[el.name || el.id || '?'] = String(el.value || '').slice(0, 80);
+              });
+              recordNet({ via: 'form.' + name, method: String(this.method || 'GET').toUpperCase(), url: this.action, target: this.target, body: JSON.stringify(inputs).slice(0, 400), ts: Date.now() });
+            } catch (e) {}
+            return orig.apply(this, arguments);
+          };
+          FP['__uzioHooked_' + name] = true;
+        }
+        hookFormFn('submit');
+        hookFormFn('requestSubmit');
+      } catch (e) {}
+      // window.open downloads.
+      try {
+        if (window.open && !window.open.__uzioHooked) {
+          var oopen = window.open;
+          var nopen = function (url) { recordNet({ via: 'window.open', method: 'GET', url: url, ts: Date.now() }); return oopen.apply(this, arguments); };
+          nopen.__uzioHooked = true;
+          window.open = nopen;
+        }
+      } catch (e) {}
+      // Temporary <a download> clicks.
+      try {
+        var AP = window.HTMLAnchorElement && window.HTMLAnchorElement.prototype;
+        if (AP && AP.click && !AP.__uzioHookedClick) {
+          var aclick = AP.click;
+          AP.click = function () {
+            try {
+              if (this.href && (this.hasAttribute('download') || /blob:|data:|\.csv|\.xls|\.pdf|download|report|history|profile/i.test(this.href))) {
+                recordNet({ via: 'a.click', method: 'GET', url: String(this.href).slice(0, 300), body: this.download ? 'download="' + this.download + '"' : '', ts: Date.now() });
+              }
+            } catch (e) {}
+            return aclick.apply(this, arguments);
+          };
+          AP.__uzioHookedClick = true;
+        }
+      } catch (e) {}
+      // iframe.src navigations (hidden-iframe download pattern).
+      try {
+        var IFP = window.HTMLIFrameElement && window.HTMLIFrameElement.prototype;
+        var sd = IFP && Object.getOwnPropertyDescriptor(IFP, 'src');
+        if (IFP && sd && sd.set && sd.get && !IFP.__uzioHookedSrc) {
+          Object.defineProperty(IFP, 'src', {
+            configurable: true, enumerable: sd.enumerable,
+            get: function () { return sd.get.call(this); },
+            set: function (v) { try { recordNet({ via: 'iframe.src', method: 'GET', url: String(v).slice(0, 300), ts: Date.now() }); } catch (e) {} return sd.set.call(this, v); }
+          });
+          IFP.__uzioHookedSrc = true;
+        }
+      } catch (e) {}
+      // Element.setAttribute('src', …) on iframes (covers attr-based set).
+      try {
+        var EP = window.Element && window.Element.prototype;
+        if (EP && EP.setAttribute && !EP.__uzioHookedSetAttr) {
+          var osa = EP.setAttribute;
+          EP.setAttribute = function (name, value) {
+            try {
+              if (this.tagName === 'IFRAME' && String(name).toLowerCase() === 'src') {
+                recordNet({ via: 'iframe.setAttribute', method: 'GET', url: String(value).slice(0, 300), ts: Date.now() });
+              }
+            } catch (e) {}
+            return osa.apply(this, arguments);
+          };
+          EP.__uzioHookedSetAttr = true;
+        }
+      } catch (e) {}
+      // PerformanceObserver — catches EVERY resource the browser fetches no
+      // matter how it was triggered (location.href, iframe, form, img, …).
+      // Filter to download-ish URLs to keep the log readable.
+      try {
+        if (window.PerformanceObserver && !window.__uzioPerfHooked) {
+          var po = new window.PerformanceObserver(function (list) {
+            list.getEntries().forEach(function (en) {
+              var it = en.initiatorType || '';
+              var url = en.name || '';
+              var interesting =
+                /report|download|export|history|profile|audit|\.csv|\.xls|\.pdf|\.zip|\.doc/i.test(url) ||
+                it === 'iframe' || it === 'other' || it === 'navigation' || it === 'object' || it === 'embed' || it === 'form';
+              if (interesting) recordNet({ via: 'perf:' + it, method: '-', url: String(url).slice(0, 300), ts: Date.now() });
+            });
+          });
+          po.observe({ entryTypes: ['resource'] });
+          window.__uzioPerfHooked = true;
+        }
+      } catch (e) {}
+    })();
+
+    function ng() { return window.angular || null; }
+
+    // Find a row's actual "Download Employee Profile Change Report" button by GUID.
+    function findDownloadButton(guid) {
+      var all = document.querySelectorAll('[ng-click*="' + FN_NAME + '"]');
+      for (var i = 0; i < all.length; i++) {
+        var oc = all[i].getAttribute('ng-click') || '';
+        if (oc.indexOf(guid) >= 0) return all[i];
+      }
+      return null;
+    }
+
+    // Drive the real UI: open the row's ⋮ actions menu, click the real download
+    // button (a genuine gesture path), then close the menu. Returns true if the
+    // button was found and clicked.
+    function downloadViaUI(guid) {
+      var btn = findDownloadButton(guid);
+      if (!btn) return false;
+      var menu = btn.closest('.action-menu');
+      var toggle = menu && menu.querySelector('.hc-three-dots, [data-toggle="dropdown"]');
+      // Open the dropdown so the item is the active, visible target.
+      if (toggle) { try { toggle.click(); } catch (e) {} }
+      try { btn.click(); } catch (e) {}
+      // Close the dropdown again to leave the UI tidy for the next row.
+      if (toggle) { setTimeout(function () { try { toggle.click(); } catch (e) {} }, 150); }
+      return true;
+    }
+
+    // Locate a scope that actually exposes the download function.
+    function findFnScope() {
+      var a = ng(); if (!a) return null;
+      var direct = document.querySelector('[ng-click*="' + FN_NAME + '"]');
+      if (direct) {
+        try { var s = a.element(direct).scope(); if (s && typeof s[FN_NAME] === 'function') return s; } catch (e) {}
+      }
+      var all = document.querySelectorAll('*');
+      for (var i = 0; i < all.length; i++) {
+        var sc; try { sc = a.element(all[i]).scope(); } catch (e) { continue; }
+        if (sc && typeof sc[FN_NAME] === 'function') return sc;
+      }
+      return null;
+    }
+
+    // Pull the GUID out of a row's data object (any string property shaped like a GUID).
+    function guidOf(obj) {
+      if (!obj || typeof obj !== 'object') return null;
+      for (var k in obj) {
+        try { if (typeof obj[k] === 'string' && GUID_RE.test(obj[k].trim())) return obj[k].trim(); } catch (e) {}
+      }
+      return null;
+    }
+
+    // Find the employee-like object hanging off a row scope (depth <= 2).
+    function rowObject(scope) {
+      if (!scope) return null;
+      function scan(o, depth) {
+        if (!o || typeof o !== 'object' || depth > 2) return null;
+        if (guidOf(o)) return o;
+        for (var k in o) {
+          if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+          if (k.charAt(0) === '$') continue;
+          var v;
+          try { v = o[k]; } catch (e) { continue; }
+          if (v && typeof v === 'object' && !Array.isArray(v)) {
+            var hit = scan(v, depth + 1);
+            if (hit) return hit;
+          }
+        }
+        return null;
+      }
+      // check own props of the scope itself
+      for (var k in scope) {
+        if (!Object.prototype.hasOwnProperty.call(scope, k)) continue;
+        if (k.charAt(0) === '$') continue;
+        var v; try { v = scope[k]; } catch (e) { continue; }
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          var hit = scan(v, 1);
+          if (hit) return hit;
+        }
+      }
+      return null;
+    }
+
+    // Collect a row's per-cell text values. The grid renders each column as its
+    // own <td>; the Employee ID is a cell of its own (e.g. "VBP8L5UJZ"), so
+    // cell-level exact matching beats whole-row text (cells concatenate with no
+    // separators, which merges the ID into its neighbours).
+    function cellsOf(rowEl) {
+      var cells = [];
+      if (!rowEl || !rowEl.querySelectorAll) return cells;
+      var tds = rowEl.querySelectorAll('td');
+      Array.prototype.forEach.call(tds, function (td) {
+        var t = (td.textContent || '').trim();
+        if (t) cells.push(t);
+      });
+      return cells;
+    }
+
+    // Build an index of every employee row visible on the page:
+    //   { guid, obj, cells, text }
+    function buildIndex() {
+      var a = ng();
+      var rows = [];
+      var seenGuid = {};
+
+      // Primary: rows that already have a rendered download button (GUID is authoritative).
+      var btns = Array.prototype.slice.call(document.querySelectorAll('[ng-click*="' + FN_NAME + '"]'));
+      btns.forEach(function (btn) {
+        var m = (btn.getAttribute('ng-click') || '').match(/['"]([^'"]+)['"]/);
+        var guid = m ? m[1].trim() : null;
+        var rowEl = btn.closest('tr') || btn.closest('[ng-repeat]') || btn.closest('li') || btn.parentElement;
+        var obj = null;
+        if (a && rowEl) { try { obj = rowObject(a.element(rowEl).scope()); } catch (e) {} }
+        if (!guid && obj) guid = guidOf(obj);
+        if (guid && !seenGuid[guid]) {
+          seenGuid[guid] = true;
+          rows.push({ guid: guid, obj: obj, cells: cellsOf(rowEl), text: rowEl ? (rowEl.textContent || '') : '' });
+        }
+      });
+
+      // Secondary: ng-repeat / table rows whose data object carries a GUID
+      // (covers grids where the action button isn't rendered until its menu opens).
+      if (a) {
+        var rowEls = Array.prototype.slice.call(document.querySelectorAll('[ng-repeat], [data-ng-repeat], tr'));
+        rowEls.forEach(function (rowEl) {
+          var obj; try { obj = rowObject(a.element(rowEl).scope()); } catch (e) { return; }
+          var guid = guidOf(obj);
+          if (guid && !seenGuid[guid]) {
+            seenGuid[guid] = true;
+            rows.push({ guid: guid, obj: obj, cells: cellsOf(rowEl), text: rowEl.textContent || '' });
+          }
+        });
+      }
+
+      return rows;
+    }
+
+    // Resolve a user token (visible Employee ID or a raw GUID) to a GUID.
+    function resolveToken(token, index) {
+      var t = String(token).trim();
+      if (!t) return null;
+      if (GUID_RE.test(t)) return { guid: t, label: t, via: 'guid' };
+      var low = t.toLowerCase();
+      for (var i = 0; i < index.length; i++) {
+        var row = index[i];
+        // a) exact match on an individual grid cell (the Employee ID is its own <td>)
+        if (row.cells) {
+          for (var c = 0; c < row.cells.length; c++) {
+            if (row.cells[c].trim().toLowerCase() === low) {
+              return { guid: row.guid, label: t, via: 'cell' };
+            }
+          }
+        }
+        // b) exact match on any string field of the row data object
+        if (row.obj) {
+          for (var k in row.obj) {
+            var v; try { v = row.obj[k]; } catch (e) { continue; }
+            if (typeof v === 'string' && v.trim().toLowerCase() === low) {
+              return { guid: row.guid, label: t, via: 'field' };
+            }
+          }
+        }
+        // c) substring fallback in the whole-row text
+        if (row.text && row.text.toLowerCase().indexOf(low) >= 0) {
+          return { guid: row.guid, label: t, via: 'text' };
+        }
+      }
+      return null;
+    }
+
+    function resolveAll(tokens) {
+      var index = buildIndex();
+      var resolved = [], unresolved = [];
+      tokens.forEach(function (tok) {
+        var r = resolveToken(tok, index);
+        if (r) resolved.push({ token: tok, guid: r.guid, via: r.via });
+        else unresolved.push(tok);
+      });
+      return { indexSize: index.length, resolved: resolved, unresolved: unresolved };
+    }
+
+    // ── diagnostics (Inspect) ─────────────────────────────────────────
+    function truncate(s, n) {
+      s = String(s == null ? '' : s);
+      return s.length > n ? s.slice(0, n) + ' …[+' + (s.length - n) + ' chars]' : s;
+    }
+
+    // Flatten an object's primitive fields up to depth 2 — reveals which key
+    // holds the visible Employee ID and which holds the GUID.
+    function objDump(o) {
+      if (!o || typeof o !== 'object') return '(null)';
+      var lines = [];
+      function walk(obj, prefix, depth) {
+        if (depth > 2) return;
+        for (var k in obj) {
+          if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+          if (k.charAt(0) === '$') continue;
+          var v; try { v = obj[k]; } catch (e) { continue; }
+          var t = typeof v;
+          if (v === null || t === 'string' || t === 'number' || t === 'boolean') {
+            lines.push(prefix + k + ' = ' + truncate(String(v), 80));
+          } else if (Array.isArray(v)) {
+            lines.push(prefix + k + ' = [array len ' + v.length + ']');
+          } else if (t === 'object') {
+            walk(v, prefix + k + '.', depth + 1);
+          }
+        }
+      }
+      walk(o, '', 1);
+      return lines.length ? '\n    ' + lines.join('\n    ') : '(no primitive fields)';
+    }
+
+    function inspect(ids) {
+      var a = ng();
+      var out = [];
+      out.push('=== UZIO Inspect ===');
+      out.push('url: ' + location.href);
+      out.push('angular present: ' + (!!a));
+
+      var btns = document.querySelectorAll('[ng-click*="' + FN_NAME + '"]');
+      out.push('download buttons (' + FN_NAME + ') in DOM: ' + btns.length);
+      if (btns.length) {
+        out.push('--- first download button outerHTML ---');
+        out.push(truncate(btns[0].outerHTML, 1500));
+        var btnTr = btns[0].closest('tr');
+        if (btnTr) { out.push('--- that button\'s <tr> outerHTML ---'); out.push(truncate(btnTr.outerHTML, 3500)); }
+      }
+
+      // Find the <tr> whose visible text contains the first requested Employee ID.
+      var firstId = (ids && ids[0] ? String(ids[0]) : '').toLowerCase();
+      var trs = document.querySelectorAll('tr');
+      var matchTr = null;
+      if (firstId) {
+        for (var i = 0; i < trs.length; i++) {
+          var cells = cellsOf(trs[i]).map(function (c) { return c.toLowerCase(); });
+          if (cells.indexOf(firstId) >= 0) { matchTr = trs[i]; break; }
+        }
+      }
+      out.push('total <tr> on page: ' + trs.length);
+      if (matchTr) {
+        out.push('--- <tr> containing "' + ids[0] + '" outerHTML ---');
+        out.push(truncate(matchTr.outerHTML, 4500));
+        if (a) {
+          try {
+            var sc = a.element(matchTr).scope();
+            out.push('--- matched <tr> scope.$id=' + (sc && sc.$id) + ' own object fields ---');
+            out.push(objDump(rowObject(sc) || sc));
+          } catch (e) { out.push('scope read failed: ' + e); }
+        }
+      } else {
+        out.push('No <tr> text-contains "' + (ids && ids[0]) + '".');
+      }
+
+      // Dump the download function's source so we can see how it delivers the
+      // file (location.href vs iframe vs window.open vs $http+blob).
+      var fnScope = findFnScope();
+      if (fnScope && typeof fnScope[FN_NAME] === 'function') {
+        out.push('--- ' + FN_NAME + ' source ---');
+        out.push(truncate(fnScope[FN_NAME].toString(), 4000));
+      } else {
+        out.push('--- ' + FN_NAME + ' source: scope/function NOT found ---');
+      }
+
+      // The scope method is a thin wrapper (function(e){o.X(e)}). Walk the
+      // controller object(s) reachable from the scope to find the REAL
+      // implementation whose body contains the download URL.
+      out.push('--- real ' + FN_NAME + ' implementation(s) found by walking scope ---');
+      try {
+        var impls = [];
+        var visited = [];
+        function consider(obj, path, depth) {
+          if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return;
+          if (visited.indexOf(obj) >= 0) return;
+          visited.push(obj);
+          if (visited.length > 800 || depth > 4) return;
+          for (var k in obj) {
+            if (k.charAt(0) === '$') continue;
+            var v; try { v = obj[k]; } catch (e) { continue; }
+            if (typeof v === 'function') {
+              if (k === FN_NAME) {
+                var src = ''; try { src = v.toString(); } catch (e) {}
+                // Skip the trivial wrapper; keep anything with a URL/real body.
+                if (src && src.length > 60) impls.push(path + '.' + k + ' ::\n' + truncate(src, 1500));
+              }
+            } else if (v && typeof v === 'object') {
+              consider(v, path + '.' + k, depth + 1);
+            }
+          }
+        }
+        var fs = findFnScope();
+        if (fs) {
+          consider(fs, 'scope', 0);
+          // also walk the controller of any ng-controller ancestor
+          var ctrlEl = document.querySelector('[ng-controller]');
+          if (a && ctrlEl) {
+            try { var ctrl = a.element(ctrlEl).controller(); if (ctrl) consider(ctrl, 'controller', 0); } catch (e) {}
+          }
+        }
+        if (impls.length) { impls.forEach(function (s) { out.push(s); }); }
+        else { out.push('(none reachable — the impl lives in a closure var; will hook location instead)'); }
+      } catch (e) { out.push('impl-walk error: ' + e); }
+
+      // Recent network requests — used to identify the real download endpoint.
+      out.push('--- recent network requests (last 20) ---');
+      if (!netLog.length) {
+        out.push('(none captured yet — trigger ONE download, then click Inspect again)');
+      } else {
+        netLog.slice(-20).forEach(function (n) {
+          out.push((n.via || '') + ' ' + (n.method || '') + ' ' + (n.url || '') +
+            (n.status ? ' [' + n.status + ']' : '') +
+            (n.ctype ? ' ctype=' + n.ctype : '') +
+            (n.cdisp ? ' cdisp=' + n.cdisp : ''));
+        });
+      }
+
+      var idx = buildIndex();
+      out.push('--- buildIndex() rows: ' + idx.length + ' (first 3) ---');
+      idx.slice(0, 3).forEach(function (r, n) {
+        out.push('row#' + n + ' guid=' + r.guid);
+        out.push('  text: ' + truncate((r.text || '').replace(/\s+/g, ' ').trim(), 160));
+        out.push('  obj:' + objDump(r.obj));
+      });
+
+      return out.join('\n');
+    }
+
+    var running = false;
+
+    window.addEventListener('message', function (ev) {
+      var d = ev.data;
+      if (!d || d.source !== 'uzioBot-cs') return;
+
+      if (d.type === 'stop') { running = false; return; }
+
+      if (d.type === 'scan') {
+        var res = resolveAll(d.ids || []);
+        post('resolved', res);
+        return;
+      }
+
+      if (d.type === 'inspect') {
+        var report;
+        try { report = inspect(d.ids || []); }
+        catch (e) { report = 'Inspect error: ' + (e && e.message ? e.message : e); }
+        post('inspect', report);
+        return;
+      }
+
+      if (d.type === 'trace') {
+        var rr = resolveAll(d.ids || []);
+        if (!rr.resolved.length) { post('inspect', 'TRACE: no resolved Employee ID to trigger. Paste one valid ID first.'); return; }
+        var tscope = findFnScope();
+        if (!tscope) { post('inspect', 'TRACE: download scope/function not found.'); return; }
+        var startLen = netLog.length;
+        var tguid = rr.resolved[0].guid;
+        post('log', 'TRACE: triggering ' + rr.resolved[0].token + ' → ' + tguid + ', watching network for 9s…');
+        try { tscope.$apply(function () { tscope[FN_NAME](tguid); }); }
+        catch (e) { try { tscope[FN_NAME](tguid); } catch (e2) {} }
+        setTimeout(function () {
+          var nw = netLog.slice(startLen);
+          var lines = ['=== TRACE: ' + nw.length + ' new network event(s) after triggering ' + tguid + ' ==='];
+          nw.forEach(function (n) {
+            lines.push((n.via || '') + ' ' + (n.method || '') + ' ' + (n.url || '') +
+              (n.status ? ' [' + n.status + ']' : '') +
+              (n.target ? ' target=' + n.target : '') +
+              (n.ctype ? ' ctype=' + n.ctype : '') +
+              (n.cdisp ? ' cdisp=' + n.cdisp : '') +
+              (n.body ? ' body=' + n.body : ''));
+          });
+          if (!nw.length) {
+            lines.push('(NO network event captured — delivery uses an un-hooked channel, e.g. document.location assignment.)');
+          }
+          post('inspect', lines.join('\n'));
+        }, 9000);
+        return;
+      }
+
+      if (d.type !== 'start') return;
+      if (running) { post('log', 'Already running — ignoring Start.'); return; }
+      running = true;
+
+      var res2 = resolveAll(d.ids || []);
+      post('resolved', res2);
+
+      if (!res2.resolved.length) {
+        post('error', 'None of the pasted Employee IDs matched a row on this page. Make sure the matching employees are visible in the grid.');
+        running = false; post('done'); return;
+      }
+
+      var list = res2.resolved;
+      var delay = d.delay || 5000;
+      post('log', 'Downloading ' + list.length + ' report(s) by clicking each row button, ' + delay + 'ms apart.');
+      post('log', 'NOTE: each file is delivered by a page navigation, so they MUST be spaced out. If some are skipped, raise the Delay and re-run just those.');
+
+      var i = 0;
+      function next() {
+        if (!running) { post('log', 'Stopped at ' + i + '/' + list.length + '.'); post('done'); return; }
+        if (i >= list.length) { post('log', 'All ' + list.length + ' report(s) triggered.'); running = false; post('done'); return; }
+        var item = list[i];
+        var clicked = downloadViaUI(item.guid);
+        if (clicked) post('log', '[' + (i + 1) + '/' + list.length + '] clicked ' + item.token + ' → ' + item.guid);
+        else post('error', '[' + (i + 1) + '/' + list.length + '] button not found for ' + item.token + ' (' + item.guid + ') — is the row visible?');
+        i++;
+        setTimeout(next, delay);
+      }
+      next();
+    });
+
+    post('ready', {});
+  }
+
+  function injectRunner() {
+    var s = document.createElement('script');
+    s.textContent = '(' + pageRunner.toString() + ')(' + JSON.stringify(FN_NAME) + ');';
+    (document.head || document.documentElement).appendChild(s);
+    s.remove();
+  }
+
+  // ───────────────── content-script UI + messaging ─────────────────
+
+  let logEl, statusEl, startBtn, scanBtn, inspectBtn, traceBtn;
+
+  function log(kind, text) {
+    if (!logEl) return;
+    const colors = { info: '#ddd', ok: '#7CFC9B', err: '#ff7b7b', warn: '#ffd479' };
+    const line = document.createElement('div');
+    line.style.cssText = 'white-space:pre-wrap;word-break:break-word;line-height:1.35;color:' + (colors[kind] || '#ddd') + ';';
+    line.textContent = new Date().toLocaleTimeString('en-US', { hour12: false }) + '  ' + text;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function setStatus(t) { if (statusEl) statusEl.textContent = t; }
+
+  function parseIds(raw) {
+    return raw.split(/[\s,;\n\r\t]+/).map(s => s.trim()).filter(Boolean);
+  }
+
+  function reportResolution(res) {
+    log('info', 'Scanned grid: ' + res.indexSize + ' employee row(s) found.');
+    if (res.resolved.length) {
+      log('ok', 'Matched ' + res.resolved.length + ':');
+      res.resolved.forEach(r => log('ok', '  ' + r.token + ' → ' + r.guid + '  (' + r.via + ')'));
+    }
+    if (res.unresolved.length) {
+      log('warn', 'No match for ' + res.unresolved.length + ' (not on the visible grid?):');
+      log('warn', '  ' + res.unresolved.join(', '));
+    }
+  }
+
+  window.addEventListener('message', function (ev) {
+    const d = ev.data;
+    if (!d || d.source !== 'uzioBot-page') return;
+    if (d.type === 'ready') { log('info', 'Ready. Paste IDs and Scan.'); return; }
+    if (d.type === 'log') { log('info', d.payload); return; }
+    if (d.type === 'error') { log('err', d.payload); setStatus('Error — see log'); return; }
+    if (d.type === 'resolved') { reportResolution(d.payload); return; }
+    if (d.type === 'inspect') {
+      const text = d.payload || '';
+      console.log('%c[UZIO Inspect]\n' + text, 'color:#3b82f6');
+      try {
+        navigator.clipboard.writeText(text).then(
+          () => log('ok', 'Inspect report copied to clipboard — paste it back to me.'),
+          () => log('warn', 'Could not copy automatically — see DevTools console ([UZIO Inspect]).')
+        );
+      } catch (e) {
+        log('warn', 'Clipboard blocked — open DevTools console and copy the [UZIO Inspect] block.');
+      }
+      // Also dump into the panel log so it is visible/selectable.
+      text.split('\n').forEach(ln => log('info', ln));
+      setStatus('Inspect done — report copied / in console.');
+      return;
+    }
+    if (d.type === 'done') {
+      setStatus('Done.');
+      if (startBtn) { startBtn.disabled = false; startBtn.textContent = 'Start Downloads'; }
+    }
+  });
+
+  // Mounts the Employee-History tool's UI into a host-provided slot (the unified
+  // "UZIO Bot" shell owns the outer card/header/tabs/drag/minimize). Only the
+  // outer chrome moved to the host — every button, field and handler is intact.
+  function buildPanel(slot) {
+    if (!slot || slot.querySelector('.uzio-emp-body')) return;
+
+    const body = document.createElement('div');
+    body.className = 'uzio-emp-body';
+    body.style.cssText = 'padding:12px;background:#1f2430;color:#e8e8e8;font:12px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;';
+
+    const help = document.createElement('div');
+    help.style.cssText = 'color:#9aa4b2;margin-bottom:8px;';
+    help.textContent = 'On the Employees grid, paste visible Employee IDs (e.g. VBP8L5UJZ), comma/newline separated. Click Scan to verify, then Start.';
+
+    const ta = document.createElement('textarea');
+    ta.placeholder = 'VBP8L5UJZ, J91PS1JQ0, H7UX37MD4';
+    ta.style.cssText = 'width:100%;height:80px;box-sizing:border-box;background:#141821;color:#e8e8e8;border:1px solid #3a4150;border-radius:6px;padding:8px;resize:vertical;font:12px monospace;';
+
+    const delayRow = document.createElement('div');
+    delayRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin:8px 0;';
+    const delayLabel = document.createElement('label');
+    delayLabel.textContent = 'Delay (ms):';
+    delayLabel.style.cssText = 'color:#9aa4b2;';
+    const delayInput = document.createElement('input');
+    delayInput.type = 'number'; delayInput.value = '5000'; delayInput.min = '500'; delayInput.step = '500';
+    delayInput.style.cssText = 'width:90px;background:#141821;color:#e8e8e8;border:1px solid #3a4150;border-radius:6px;padding:4px 6px;';
+    delayRow.appendChild(delayLabel); delayRow.appendChild(delayInput);
+
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;';
+    inspectBtn = document.createElement('button');
+    inspectBtn.textContent = 'Inspect';
+    inspectBtn.title = 'Dump the employee row outerHTML + data fields so the mapping can be fixed';
+    inspectBtn.style.cssText = 'background:#0d9488;color:#fff;border:0;border-radius:6px;padding:8px 10px;font-weight:600;cursor:pointer;';
+    traceBtn = document.createElement('button');
+    traceBtn.textContent = 'Trace 1 DL';
+    traceBtn.title = 'Trigger ONE download for the first ID and capture exactly what network/iframe it uses';
+    traceBtn.style.cssText = 'background:#9333ea;color:#fff;border:0;border-radius:6px;padding:8px 10px;font-weight:600;cursor:pointer;';
+    scanBtn = document.createElement('button');
+    scanBtn.textContent = 'Scan & Resolve';
+    scanBtn.style.cssText = 'background:#6b7280;color:#fff;border:0;border-radius:6px;padding:8px 10px;font-weight:600;cursor:pointer;';
+    startBtn = document.createElement('button');
+    startBtn.textContent = 'Start Downloads';
+    startBtn.style.cssText = 'flex:1;background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:8px;font-weight:600;cursor:pointer;';
+    const stopBtn = document.createElement('button');
+    stopBtn.textContent = 'Stop';
+    stopBtn.style.cssText = 'background:#ef4444;color:#fff;border:0;border-radius:6px;padding:8px 12px;font-weight:600;cursor:pointer;';
+    btnRow.appendChild(inspectBtn); btnRow.appendChild(traceBtn); btnRow.appendChild(scanBtn); btnRow.appendChild(startBtn); btnRow.appendChild(stopBtn);
+
+    statusEl = document.createElement('div');
+    statusEl.style.cssText = 'color:#9aa4b2;margin-bottom:6px;min-height:16px;';
+    statusEl.textContent = 'Idle.';
+
+    logEl = document.createElement('div');
+    logEl.style.cssText = 'background:#0f131b;border:1px solid #2a313e;border-radius:6px;padding:8px;height:150px;overflow:auto;font:11px monospace;';
+
+    body.appendChild(help); body.appendChild(ta); body.appendChild(delayRow);
+    body.appendChild(btnRow); body.appendChild(statusEl); body.appendChild(logEl);
+    slot.appendChild(body);
+
+    inspectBtn.addEventListener('click', () => {
+      const ids = parseIds(ta.value);
+      logEl.innerHTML = '';
+      setStatus('Inspecting…');
+      log('info', 'Inspecting page (paste at least one ID to target a specific row)…');
+      window.postMessage({ source: 'uzioBot-cs', type: 'inspect', ids: ids }, '*');
+    });
+
+    traceBtn.addEventListener('click', () => {
+      const ids = parseIds(ta.value);
+      if (!ids.length) { log('warn', 'Paste one Employee ID to trace.'); return; }
+      logEl.innerHTML = '';
+      setStatus('Tracing one download…');
+      log('info', 'Trace: triggering one download and watching network for ~7s…');
+      window.postMessage({ source: 'uzioBot-cs', type: 'trace', ids: ids }, '*');
+    });
+
+    scanBtn.addEventListener('click', () => {
+      const ids = parseIds(ta.value);
+      if (!ids.length) { log('warn', 'Paste at least one Employee ID.'); return; }
+      logEl.innerHTML = '';
+      setStatus('Scanning…');
+      window.postMessage({ source: 'uzioBot-cs', type: 'scan', ids: ids }, '*');
+    });
+
+    startBtn.addEventListener('click', () => {
+      const ids = parseIds(ta.value);
+      if (!ids.length) { setStatus('No IDs entered.'); log('warn', 'Paste at least one Employee ID.'); return; }
+      let delay = parseInt(delayInput.value, 10);
+      if (isNaN(delay) || delay < 500) delay = 3000;
+      logEl.innerHTML = '';
+      log('info', 'Resolving + downloading ' + ids.length + ' employee(s)…');
+      setStatus('Running…');
+      startBtn.disabled = true; startBtn.textContent = 'Running…';
+      window.postMessage({ source: 'uzioBot-cs', type: 'start', ids: ids, delay: delay }, '*');
+    });
+
+    stopBtn.addEventListener('click', () => {
+      window.postMessage({ source: 'uzioBot-cs', type: 'stop' }, '*');
+      setStatus('Stopping…'); log('warn', 'Stop requested.');
+      startBtn.disabled = false; startBtn.textContent = 'Start Downloads';
+    });
+  }
+
+  // ───────────────── init ─────────────────
+  // The page-context runner is injected once; the panel is mounted into the
+  // shared "UZIO Bot" host shell as the "Emp History" tab.
+  injectRunner();
+  if (window.__UZIO_HOST__) {
+    window.__UZIO_HOST__.register('emphistory', { label: 'Emp History', icon: '📄' }, buildPanel);
+  } else {
+    console.error('[UZIO Emp History] host shell not found — is the unified script loaded?');
   }
 })();

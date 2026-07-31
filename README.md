@@ -19,8 +19,7 @@ click yourself.
 | ------ | --- | ---- | ------------ |
 | [`paycom-reports.user.js`](paycom-reports.user.js) | 0.19.0 | `paycomonline.net/v4/cl/*` | Census report (full ARW wizard), Prior Payroll YTD (per-quarter / per-pay-period), Scheduled Deductions, Tax Profile, Qualified Premiums, and **Download All Documents** (Doc Dashboard bulk export) |
 | [`adp-reports.user.js`](adp-reports.user.js) | 1.1.4 | `workforcenow.adp.com/*` | Unified panel: report automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + **Export Documents** bot (auto-detect categories, sequential export, auto-download) |
-| [`uzio-employee-history.user.js`](uzio-employee-history.user.js) | 0.12.0 | `*.uzio.com/*` | Bulk **Employee Profile Change Report** downloader — paste visible Employee IDs, the bot resolves them to internal GUIDs from the grid and clicks each row's download button |
-| [`uzio-deductions.user.js`](uzio-deductions.user.js) | 0.36.0 | `app.uzio.com/*` | **Setup auto-create** — reads the Earnings / Deductions / Contributions tabs of the Payroll Setup Helper `.xlsx` and creates each item in UZIO, with verified saves and pause/skip/resume on failure |
+| [`uzio-bot.user.js`](uzio-bot.user.js) | 1.0.0 | `*.uzio.com/*` | **Unified UZIO Bot** — one panel, two tabs. **Setup** tab: reads the Earnings / Deductions / Contributions tabs of the Payroll Setup Helper `.xlsx` and creates each item in UZIO (verified saves, pause/skip/resume on failure). **Emp History** tab: bulk **Employee Profile Change Report** downloader — paste visible Employee IDs, the bot resolves them to internal GUIDs and triggers each download |
 
 ## Installation
 
