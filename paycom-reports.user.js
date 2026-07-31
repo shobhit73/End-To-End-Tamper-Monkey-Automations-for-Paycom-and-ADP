@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.19.0
+  // @version      0.19.1
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -416,6 +416,28 @@
       return direct;
     }
 
+    // Returns the filterCheckboxes that live inside a single category box (e.g. "HR",
+    // "Position Data"). Some field labels — notably "DOL Status" — appear in more than
+    // one box, so we need to disambiguate by which box a checkbox belongs to.
+    // Strategy: find the box header whose direct text matches exactly, then walk up to
+    // the nearest ancestor that actually contains checkboxes (that ancestor is the box
+    // wrapper) and return only that box's checkboxes.
+    function getSectionCheckboxes(headerText) {
+      const want = normalize(headerText);
+      const headers = Array.from(document.querySelectorAll('.filterHeader, .filterHeaderView, .underlinedHeader'));
+      const header = headers.find(h => normalize(h.textContent) === want);
+      if (!header) return [];
+
+      let container = header;
+      for (let i = 0; i < 10 && container; i++) {
+        container = container.parentElement;
+        if (!container) break;
+        const cbs = container.querySelectorAll('input.filterCheckbox[type="checkbox"]');
+        if (cbs && cbs.length > 0) return Array.from(cbs);
+      }
+      return [];
+    }
+
     function checkboxKey(cb) {
       return normalize(cb.getAttribute('aria-label') || cb.value || cb.getAttribute('value') || '');
     }
@@ -651,6 +673,14 @@
       const taxCbSet = new Set(getTaxSectionCheckboxes());
       log(`Tax section: ${taxCbSet.size} checkboxes`);
 
+      // "DOL Status" appears in both the HR box and the Position Data box. We want the
+      // HR one. Restrict that key to HR-box checkboxes — but only if we can actually
+      // find the HR "DOL Status", otherwise fall back to old (match-any) behaviour.
+      const DOL_KEY = normalize('DOL Status');
+      const hrCbSet = new Set(getSectionCheckboxes('HR'));
+      const restrictDolToHr = [...hrCbSet].some(cb => checkboxKey(cb) === DOL_KEY);
+      log(`HR section: ${hrCbSet.size} checkboxes; restrict DOL Status to HR box: ${restrictDolToHr}`);
+
       const allCbs = getAllFilterCheckboxes();
       log(`Total checkboxes: ${allCbs.length}`);
 
@@ -662,6 +692,8 @@
           await sleep(10);
           continue;
         }
+        // Skip a non-HR "DOL Status" so the HR-box one gets matched instead.
+        if (restrictDolToHr && key === DOL_KEY && !hrCbSet.has(cb)) continue;
         if (remaining.has(key)) {
           scrollAndClick(cb);
           remaining.delete(key);
@@ -675,6 +707,7 @@
           if (cb.checked) continue;
           const key = checkboxKey(cb);
           if (!key) continue;
+          if (restrictDolToHr && key === DOL_KEY && !hrCbSet.has(cb)) continue;
           for (const [norm, orig] of remaining) {
             if (key.includes(norm) || norm.includes(key)) {
               scrollAndClick(cb);
