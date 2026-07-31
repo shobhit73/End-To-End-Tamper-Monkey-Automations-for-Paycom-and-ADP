@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.19.1
+  // @version      0.20.1
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -3192,7 +3192,10 @@
           #paycom-bot-panel.running h4::before{background:#cad2c5;box-shadow:0 0 10px #cad2c5;
             animation:pcb-pulse 1.1s ease-in-out infinite}
           @keyframes pcb-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.5}}
-          #paycom-bot-panel .body{padding:12px 14px 14px}
+          #paycom-bot-panel .body{padding:12px 14px 14px;max-height:calc(100vh - 96px);overflow-y:auto;overflow-x:hidden}
+          #paycom-bot-panel .body::-webkit-scrollbar{width:8px}
+          #paycom-bot-panel .body::-webkit-scrollbar-thumb{background:rgba(132,169,140,.5);border-radius:8px}
+          #paycom-bot-panel .body::-webkit-scrollbar-track{background:transparent}
           #paycom-bot-panel .status{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0 0 6px;
             color:rgba(202,210,197,.65);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.6px}
           #paycom-bot-panel .status span{color:#cad2c5;font-weight:600;font-size:11px;text-transform:none;letter-spacing:0;
@@ -3209,7 +3212,9 @@
             margin:0;padding:0;flex:none;background:rgba(47,62,70,.45);color:#cad2c5;
             border:1px solid rgba(202,210,197,.4);border-radius:7px;font-size:15px;font-weight:700;line-height:1;cursor:pointer}
           #paycom-bot-panel .min-btn:hover{transform:none;box-shadow:none;background:rgba(47,62,70,.75)}
-          #paycom-bot-panel .start{background:linear-gradient(135deg,#52796f 0%,#3f5f56 100%);color:#cad2c5;margin-top:12px}
+          #paycom-bot-panel .start-all{background:linear-gradient(135deg,#84a98c 0%,#52796f 55%,#354f52 100%);color:#fff;
+            margin-top:12px;font-weight:700;letter-spacing:.3px;box-shadow:0 4px 14px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.15)}
+          #paycom-bot-panel .start{background:linear-gradient(135deg,#52796f 0%,#3f5f56 100%);color:#cad2c5;margin-top:8px}
           #paycom-bot-panel .start-pp{background:linear-gradient(135deg,#84a98c 0%,#6d9079 100%);color:#2f3e46}
           #paycom-bot-panel .start-sd{background:linear-gradient(135deg,#cad2c5 0%,#aebfb0 100%);color:#2f3e46}
           #paycom-bot-panel .start-tp{background:linear-gradient(135deg,#3f5f56 0%,#354f52 100%);color:#cad2c5}
@@ -3234,6 +3239,7 @@
           <div class="status">Sched Deductions <span class="sd-state"></span></div>
           <div class="status">Tax Profile <span class="tp-state"></span></div>
           <div class="status">Qual Premiums <span class="qp-state"></span></div>
+          <button class="start-all">⚡ Download All Reports</button>
           <button class="start">📊 Start Census Report</button>
           <button class="start-pp">🗓️ Run Prior Payroll</button>
           <button class="start-sd">💸 Run Scheduled Deductions</button>
@@ -3249,7 +3255,17 @@
       // Always start at the bottom-right home corner. (Previous versions saved a
       // dragged position that could restore off-screen — clear it once.)
       try { localStorage.removeItem('paycomBot.panelPos'); } catch (_) {}
+      panelEl.querySelector('.start-all').addEventListener('click', () => {
+        // Bulk sequential run. Guard against starting on top of anything already
+        // in flight; the batch driver (batchTick) chains the selected reports.
+        if (anyModeRunning() || batchActive()) {
+          alert('A report is already running. Click "Stop / reset" first, then try again.');
+          return;
+        }
+        showDownloadAllReportsDialog((keys) => startReportBatch(keys));
+      });
       panelEl.querySelector('.start').addEventListener('click', () => {
+        clearBatch();
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
@@ -3258,25 +3274,30 @@
         dispatch();
       });
       panelEl.querySelector('.start-pp').addEventListener('click', () => {
+        clearBatch();
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
         setQpState(QP_STATES.IDLE);
         startPriorPayroll();
       });
       panelEl.querySelector('.start-sd').addEventListener('click', () => {
+        clearBatch();
         setQpState(QP_STATES.IDLE);
         startScheduledDeductions();
       });
       panelEl.querySelector('.start-tp').addEventListener('click', () => {
+        clearBatch();
         setQpState(QP_STATES.IDLE);
         startTaxProfile();
       });
       panelEl.querySelector('.start-qp').addEventListener('click', () => {
+        clearBatch();
         startQualifiedPremiums();
       });
       panelEl.querySelector('.start-docs').addEventListener('click', () => {
         // Clear the other modes (this isn't part of their state machine) and
         // either start now (on Doc Dashboard) or navigate there + auto-start.
+        clearBatch();
         setState(STATES.IDLE);
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
@@ -3289,6 +3310,7 @@
       });
       panelEl.querySelector('.stop').addEventListener('click', () => {
         log('Stop / reset clicked — clearing state and tearing down UI');
+        clearBatch();
         setState(STATES.IDLE);
         setPpState(PP_STATES.IDLE);
         setSdState(SD_STATES.IDLE);
@@ -3459,10 +3481,211 @@
         isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning());
     }
 
+    // ───────────────── Download All Reports (sequential batch) ─────────────────
+    // Unlike ADP (one JS context, a simple loop), each Paycom report runs across
+    // several page reloads via its own state machine. So "run them all" is a
+    // queue in localStorage: batchTick() starts the head report, waits — across
+    // reloads — until every mode is IDLE (the invariant that means the report
+    // finished / errored / was cancelled), then advances to the next.
+    // NOTE: "Download All Documents" is intentionally NOT in this list — it's a
+    // separate document-dashboard job, not a report (per the user's request).
+    const PC_REPORTS = [
+      { key: 'census', icon: '📊', label: 'Census Report' },
+      { key: 'pp', icon: '🗓️', label: 'Prior Payroll' },
+      { key: 'sd', icon: '💸', label: 'Scheduled Deductions' },
+      { key: 'tp', icon: '🧾', label: 'Tax Profile' },
+      { key: 'qp', icon: '📋', label: 'Qualified Premiums' },
+    ];
+    const pcReport = (key) => PC_REPORTS.find(r => r.key === key);
+    const anyModeRunning = () => isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning();
+
+    // Persisted { key: bool } picker selection; anything missing defaults to on.
+    const PC_SEL_KEY = 'paycomBot.reportSelection';
+    function getReportSelection() {
+      let stored = {};
+      try { stored = JSON.parse(localStorage.getItem(PC_SEL_KEY) || '{}') || {}; } catch (_) { stored = {}; }
+      const sel = {};
+      for (const r of PC_REPORTS) sel[r.key] = stored[r.key] !== false;
+      return sel;
+    }
+    function setReportSelected(key, on) {
+      const sel = getReportSelection();
+      sel[key] = !!on;
+      try { localStorage.setItem(PC_SEL_KEY, JSON.stringify(sel)); } catch (_) { }
+    }
+
+    // The batch queue: { queue: [keys…], started: bool }. queue[0] is the report
+    // currently being run (once started === true).
+    const PC_BATCH_KEY = 'paycomBot.batch';
+    function getBatch() {
+      try {
+        const b = JSON.parse(localStorage.getItem(PC_BATCH_KEY) || 'null');
+        if (b && Array.isArray(b.queue)) return b;
+      } catch (_) { }
+      return null;
+    }
+    function setBatch(b) { try { localStorage.setItem(PC_BATCH_KEY, JSON.stringify(b)); } catch (_) { } }
+    function clearBatch() { try { localStorage.removeItem(PC_BATCH_KEY); } catch (_) { } }
+    const batchActive = () => { const b = getBatch(); return !!(b && b.queue.length); };
+
+    // Clear every mode, then kick off ONE report by key. Mirrors the individual
+    // panel buttons; must NOT clear the batch (it's the batch that calls this).
+    function startReportByKey(key) {
+      setState(STATES.IDLE);
+      setPpState(PP_STATES.IDLE);
+      setSdState(SD_STATES.IDLE);
+      setTpState(TP_STATES.IDLE);
+      setQpState(QP_STATES.IDLE);
+      switch (key) {
+        case 'census': setState(STATES.RUNNING); dispatch(); break;
+        case 'pp': startPriorPayroll(); break;
+        case 'sd': startScheduledDeductions(); break;
+        case 'tp': startTaxProfile(); break;
+        case 'qp': startQualifiedPremiums(); break;
+        default: log('[Batch] unknown report key: ' + key);
+      }
+    }
+
+    // Advance the batch. Called after dispatch() on every load, and once right
+    // after the user confirms the picker. No-ops when no batch exists.
+    async function batchTick() {
+      const batch = getBatch();
+      if (!batch || !batch.queue.length) return;
+      if (anyModeRunning()) return; // head report still working (across reloads)
+
+      if (!batch.started) {
+        // Kick off the head report.
+        batch.started = true;
+        setBatch(batch);
+        const key = batch.queue[0];
+        log(`[Batch] starting "${key}" — ${batch.queue.length} report(s) queued`);
+        showProgressBanner(`Download All Reports — starting ${pcReport(key)?.label || key}…`);
+        startReportByKey(key);
+        return;
+      }
+
+      // Head report was started and nothing is running now → it's done. Advance.
+      const finished = batch.queue.shift();
+      log(`[Batch] "${finished}" finished; ${batch.queue.length} report(s) left`);
+      if (batch.queue.length) {
+        batch.started = true;
+        setBatch(batch);
+        const key = batch.queue[0];
+        showProgressBanner(`Download All Reports — starting ${pcReport(key)?.label || key}…`);
+        startReportByKey(key);
+      } else {
+        clearBatch();
+        hideProgressBanner();
+        showSuccessBanner('✓ Download All Reports — all selected reports done');
+        log('[Batch] all reports complete');
+      }
+    }
+
+    // Store a fresh queue from the selected keys (ordered per PC_REPORTS) and go.
+    function startReportBatch(keys) {
+      if (!keys || !keys.length) return;
+      setBatch({ queue: keys.slice(), started: false });
+      log('[Batch] queue set: ' + keys.join(', '));
+      batchTick();
+    }
+
+    // Picker modal — same behaviour as ADP's dialog, styled to match the Paycom
+    // panel's confirm dialog. Calls onConfirm(selectedKeys) on "Download selected".
+    function showDownloadAllReportsDialog(onConfirm) {
+      const old = document.getElementById('paycom-bot-dlall');
+      if (old) old.remove();
+
+      const saved = getReportSelection();
+
+      const overlay = document.createElement('div');
+      overlay.id = 'paycom-bot-dlall';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2147483647;display:flex;align-items:center;justify-content:center;font:14px sans-serif;';
+
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#fff;border-radius:10px;padding:20px;max-width:460px;width:92%;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.35);';
+
+      const title = document.createElement('h3');
+      title.textContent = 'Download All Reports — choose reports';
+      title.style.cssText = 'margin:0 0 4px;color:#0b7dda;font-size:16px;';
+      box.appendChild(title);
+
+      const subtitle = document.createElement('div');
+      subtitle.textContent = 'They run one after another in this order. Untick any report to skip it.';
+      subtitle.style.cssText = 'color:#666;font-size:12px;margin-bottom:14px;';
+      box.appendChild(subtitle);
+
+      const list = document.createElement('div');
+      list.style.cssText = 'flex:1;overflow-y:auto;border:1px solid #e0e0e0;border-radius:6px;padding:6px 12px;margin-bottom:14px;';
+      const checkboxes = [];
+      PC_REPORTS.forEach((r, i) => {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;padding:9px 0;cursor:pointer;border-bottom:1px solid #f0f0f0;';
+        if (i === PC_REPORTS.length - 1) row.style.borderBottom = 'none';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = saved[r.key];
+        cb.style.cssText = 'margin-right:10px;transform:scale(1.2);';
+        checkboxes.push(cb);
+
+        const text = document.createElement('span');
+        text.textContent = r.icon + '  ' + r.label;
+        text.style.cssText = 'flex:1;color:#333;';
+
+        row.appendChild(cb);
+        row.appendChild(text);
+        list.appendChild(row);
+      });
+      box.appendChild(list);
+
+      const buttons = document.createElement('div');
+      buttons.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;align-items:center;';
+
+      const selectAllLink = document.createElement('a');
+      selectAllLink.textContent = 'select all / none';
+      selectAllLink.href = '#';
+      selectAllLink.style.cssText = 'color:#0b7dda;font-size:12px;margin-right:auto;text-decoration:underline;';
+      selectAllLink.onclick = (e) => {
+        e.preventDefault();
+        const allChecked = checkboxes.every(c => c.checked);
+        checkboxes.forEach(c => c.checked = !allChecked);
+      };
+      buttons.appendChild(selectAllLink);
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = 'padding:9px 18px;border:1px solid #bbb;background:#fff;border-radius:5px;cursor:pointer;font-size:13px;';
+      cancelBtn.onclick = () => overlay.remove();
+      buttons.appendChild(cancelBtn);
+
+      const confirmBtn = document.createElement('button');
+      confirmBtn.textContent = 'Download selected';
+      confirmBtn.style.cssText = 'padding:9px 18px;border:0;background:#0b7dda;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;font-size:13px;';
+      confirmBtn.onclick = () => {
+        PC_REPORTS.forEach((r, i) => setReportSelected(r.key, checkboxes[i].checked));
+        const selected = PC_REPORTS.filter((_, i) => checkboxes[i].checked).map(r => r.key);
+        if (!selected.length) { alert('Select at least one report or click Cancel.'); return; }
+        overlay.remove();
+        onConfirm(selected);
+      };
+      buttons.appendChild(confirmBtn);
+
+      box.appendChild(buttons);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    }
+
     function init() {
       if (location.href.includes('cl-login.php') || location.href.includes('two-factor')) return;
       ensurePanel();
-      if (isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning()) setTimeout(dispatch, 800);
+      if (anyModeRunning() || batchActive()) {
+        setTimeout(async () => {
+          // Drive whatever mode is running to completion, THEN let the batch
+          // advance. batchActive() with no mode running means "start the next".
+          try { await dispatch(); } catch (err) { if (!(err && err.aborted)) log('dispatch error: ' + (err && err.message)); }
+          try { await batchTick(); } catch (err) { log('batchTick error: ' + (err && err.message)); }
+        }, 800);
+      }
       // Auto-start the document download after navigating here from the panel button.
       if (/\/Doc\/Dashboard/i.test(location.href) && localStorage.getItem('paycomBot.docs.autostart') === '1') {
         localStorage.removeItem('paycomBot.docs.autostart');
