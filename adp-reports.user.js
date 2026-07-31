@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.5.10
+// @version      1.6.1
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -3405,42 +3405,187 @@
 
   // ───────────────── download all ─────────────────
 
+  // Canonical list of the reports the "Download All" hero runs, in run order.
+  // Each row in the panel gets a checkbox (persisted per key) so the user can
+  // run a subset — e.g. grab 5 of 7 and skip the rest. downloadAll() and the
+  // panel both read from this one list so the two never drift apart.
+  const ADP_REPORTS = [
+    { key: 'census', icon: '👥', label: 'Census', fn: downloadCensus },
+    { key: 'sitfit', icon: '🧾', label: 'SIT / FIT', fn: downloadSitFit },
+    { key: 'license', icon: '📜', label: 'License / EC', fn: downloadLicenseEC },
+    { key: 'payhist', icon: '💰', label: 'Payroll History', fn: downloadPayrollHistory },
+    { key: 'deduction', icon: '🧮', label: 'Deduction', fn: downloadDeductionReport },
+    { key: 'directdeposit', icon: '🏦', label: 'Direct Deposit', fn: downloadDirectDeposit },
+    { key: 'qualot', icon: '⏱️', label: 'Qualified Overtime', fn: downloadQualifiedOvertime },
+  ];
+
+  const REPORT_SEL_KEY = 'adpBot.reportSelection';
+  // Returns a { key: bool } map. Any report missing from storage defaults to
+  // selected (true), so first-run / newly-added reports are included by default.
+  function getReportSelection() {
+    let stored = {};
+    try { stored = JSON.parse(localStorage.getItem(REPORT_SEL_KEY) || '{}') || {}; } catch (_) { stored = {}; }
+    const sel = {};
+    for (const r of ADP_REPORTS) sel[r.key] = stored[r.key] !== false;
+    return sel;
+  }
+  function setReportSelected(key, on) {
+    const sel = getReportSelection();
+    sel[key] = !!on;
+    try { localStorage.setItem(REPORT_SEL_KEY, JSON.stringify(sel)); } catch (_) { }
+  }
+
+  // Modal: pick which reports "Download All" should run. Pre-ticked from the
+  // last saved selection (all on first run). Resolves to an array of selected
+  // report keys, or null if the user cancels / Stop is pressed. Persists the
+  // selection so it's remembered next time. Styled to match the cobalt panel.
+  function showDownloadAllDialog() {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('adp-downloadall-pick');
+      if (existing) existing.remove();
+
+      const saved = getReportSelection();
+
+      const overlay = document.createElement('div');
+      overlay.id = 'adp-downloadall-pick';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,8,22,.62);z-index:2147483647;' +
+        'display:flex;align-items:center;justify-content:center;font:14px "Segoe UI",system-ui,sans-serif;';
+
+      const box = document.createElement('div');
+      box.style.cssText = 'width:360px;max-width:92vw;color:#dce9ff;border-radius:16px;overflow:hidden;' +
+        'background:linear-gradient(165deg,rgba(2,20,46,.98),rgba(0,36,86,.96));' +
+        'border:1px solid rgba(90,159,255,.3);box-shadow:0 18px 50px rgba(0,0,0,.6);';
+
+      const head = document.createElement('div');
+      head.style.cssText = 'padding:14px 16px;font-weight:700;font-size:15px;color:#fff;' +
+        'background:linear-gradient(90deg,rgba(0,71,171,.45),rgba(0,100,241,.12));border-bottom:1px solid rgba(90,159,255,.2);';
+      head.textContent = 'Download All Reports — choose reports';
+      box.appendChild(head);
+
+      const body = document.createElement('div');
+      body.style.cssText = 'padding:12px 16px;';
+
+      const hint = document.createElement('div');
+      hint.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:10px;';
+      hint.textContent = 'Untick any report to skip it. They download in this order.';
+      body.appendChild(hint);
+
+      // Select all / none toggle.
+      const allRow = document.createElement('label');
+      allRow.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 11px;margin-bottom:10px;cursor:pointer;' +
+        'background:rgba(0,71,171,.12);border:1px dashed rgba(125,179,255,.3);border-radius:10px;';
+      const allCb = document.createElement('input');
+      allCb.type = 'checkbox';
+      allCb.style.cssText = 'width:16px;height:16px;accent-color:#0064f1;cursor:pointer;';
+      const allTxt = document.createElement('span');
+      allTxt.style.cssText = 'font-weight:600;color:#eaf2ff;font-size:12.5px;';
+      allTxt.textContent = 'Select all / none';
+      allRow.appendChild(allCb);
+      allRow.appendChild(allTxt);
+      body.appendChild(allRow);
+
+      const checks = [];
+      ADP_REPORTS.forEach((r) => {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:9px 11px;margin-bottom:7px;cursor:pointer;' +
+          'background:rgba(0,71,171,.22);border:1px solid rgba(125,179,255,.18);border-radius:10px;';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = saved[r.key];
+        cb.style.cssText = 'width:16px;height:16px;accent-color:#0064f1;cursor:pointer;';
+        const txt = document.createElement('span');
+        txt.style.cssText = 'font-weight:600;color:#eaf2ff;';
+        txt.textContent = r.icon + '  ' + r.label;
+        row.appendChild(cb);
+        row.appendChild(txt);
+        body.appendChild(row);
+        checks.push(cb);
+      });
+
+      const syncAllCb = () => {
+        allCb.checked = checks.every(c => c.checked);
+        allCb.indeterminate = !allCb.checked && checks.some(c => c.checked);
+      };
+      syncAllCb();
+      allCb.addEventListener('change', () => { checks.forEach(c => { c.checked = allCb.checked; }); });
+      checks.forEach(c => c.addEventListener('change', syncAllCb));
+
+      box.appendChild(body);
+
+      const btns = document.createElement('div');
+      btns.style.cssText = 'display:flex;gap:8px;padding:0 16px 16px;';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = 'flex:1;padding:10px;border:1px solid rgba(125,179,255,.35);background:transparent;' +
+        'color:#9fc2ff;border-radius:10px;cursor:pointer;font-weight:600;';
+      const confirmBtn = document.createElement('button');
+      confirmBtn.textContent = 'Download selected';
+      confirmBtn.style.cssText = 'flex:2;padding:10px;border:0;border-radius:10px;cursor:pointer;font-weight:700;color:#fff;' +
+        'background:linear-gradient(120deg,#0055ce,#0064f1 45%,#00a4cc);';
+      btns.appendChild(cancelBtn);
+      btns.appendChild(confirmBtn);
+      box.appendChild(btns);
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearInterval(poll);
+        overlay.remove();
+        resolve(val);
+      };
+      cancelBtn.addEventListener('click', () => finish(null));
+      confirmBtn.addEventListener('click', () => {
+        ADP_REPORTS.forEach((r, i) => setReportSelected(r.key, checks[i].checked));
+        finish(ADP_REPORTS.filter((_, i) => checks[i].checked).map(r => r.key));
+      });
+      // Stop/reset or external removal closes the dialog as a cancel.
+      const poll = setInterval(() => {
+        if (shouldAbort() || !document.body.contains(overlay)) finish(null);
+      }, 200);
+    });
+  }
+
   async function downloadAll(setStatus) {
     logInfo('=== Download All Reports ===');
 
-    const flows = [
-      { name: 'Census', fn: downloadCensus },
-      { name: 'SIT/FIT', fn: downloadSitFit },
-      { name: 'License/EC', fn: downloadLicenseEC },
-      { name: 'Payroll History', fn: downloadPayrollHistory },
-      { name: 'Deduction', fn: downloadDeductionReport },
-      { name: 'Direct Deposit', fn: downloadDirectDeposit },
-      { name: 'Qualified Overtime', fn: downloadQualifiedOvertime },
-    ];
+    // Only run the reports whose checkbox is ticked.
+    const sel = getReportSelection();
+    const flows = ADP_REPORTS.filter(r => sel[r.key]);
+
+    if (flows.length === 0) {
+      setStatus('No reports selected — tick at least one report');
+      logWarn('Download All: nothing selected — skipped');
+      return;
+    }
+    logInfo('Selected ' + flows.length + '/' + ADP_REPORTS.length + ' reports: ' + flows.map(f => f.label).join(', '));
 
     for (let i = 0; i < flows.length; i++) {
       const flow = flows[i];
 
       // Check if user pressed Stop during the previous flow
       if (aborted) {
-        setStatus('Download All stopped after ' + (i > 0 ? flows[i - 1].name : 'start'));
+        setStatus('Download All stopped after ' + (i > 0 ? flows[i - 1].label : 'start'));
         logWarn('Download All aborted — remaining reports skipped');
         return;
       }
 
-      logInfo('───── Starting ' + flow.name + ' (' + (i + 1) + '/' + flows.length + ') ─────');
-      setStatus('Download All: ' + flow.name + ' (' + (i + 1) + '/' + flows.length + ')…');
+      logInfo('───── Starting ' + flow.label + ' (' + (i + 1) + '/' + flows.length + ') ─────');
+      setStatus('Download All: ' + flow.label + ' (' + (i + 1) + '/' + flows.length + ')…');
 
       await flow.fn(setStatus);
 
       // Check abort again after the flow returned
       if (aborted) {
-        setStatus('Download All stopped during ' + flow.name);
-        logWarn('Download All aborted during ' + flow.name + ' — remaining reports skipped');
+        setStatus('Download All stopped during ' + flow.label);
+        logWarn('Download All aborted during ' + flow.label + ' — remaining reports skipped');
         return;
       }
 
-      logSuccess(flow.name + ' done (' + (i + 1) + '/' + flows.length + ')');
+      logSuccess(flow.label + ' done (' + (i + 1) + '/' + flows.length + ')');
 
       // Wait between flows for the page to settle before starting next
       if (i < flows.length - 1) {
@@ -3449,8 +3594,8 @@
       }
     }
 
-    setStatus('All ' + flows.length + ' reports downloaded ✓');
-    logSuccess('=== All reports complete! ===');
+    setStatus('All ' + flows.length + ' selected report(s) downloaded ✓');
+    logSuccess('=== All selected reports complete! ===');
   }
 
   // ───────────────── diagnostic ─────────────────
@@ -3745,33 +3890,38 @@
       };
     }
 
-    // Hero action: runs everything.
+    // Hero action: opens the report picker, then runs the selected reports.
     const downloadAllBtn = document.createElement('button');
     downloadAllBtn.className = 'adpbot-hero';
     downloadAllBtn.textContent = '⚡ Download All Reports';
-    downloadAllBtn.addEventListener('click', withRunGuard(downloadAll));
+    downloadAllBtn.addEventListener('click', async () => {
+      if (running) { logWarn('Already running — click Stop / reset to abort'); return; }
+      const picked = await showDownloadAllDialog();
+      if (picked === null) { logInfo('Download All cancelled'); return; }
+      if (picked.length === 0) {
+        logWarn('No reports selected — nothing to download');
+        status.textContent = 'No reports selected — pick at least one';
+        return;
+      }
+      withRunGuard(downloadAll)();
+    });
     btnRow.appendChild(downloadAllBtn);
 
-    // Report rows: icon chip + label, hover slide.
-    function mkItem(icon, label, handler) {
+    // Report rows: icon chip + label, hover slide. Clicking a row runs just that
+    // one report. (Bulk selection lives in the "Download All Reports" dialog.)
+    function mkItem(report, handler) {
       const b = document.createElement('button');
       b.className = 'adpbot-item';
       const ico = document.createElement('span');
       ico.className = 'adpbot-ico';
-      ico.textContent = icon;
+      ico.textContent = report.icon;
       b.appendChild(ico);
-      b.appendChild(document.createTextNode(label));
+      b.appendChild(document.createTextNode(report.label));
       b.addEventListener('click', handler);
       btnRow.appendChild(b);
       return b;
     }
-    mkItem('👥', 'Census', withRunGuard(downloadCensus));
-    mkItem('🧾', 'SIT / FIT', withRunGuard(downloadSitFit));
-    mkItem('📜', 'License / EC', withRunGuard(downloadLicenseEC));
-    mkItem('💰', 'Payroll History', withRunGuard(downloadPayrollHistory));
-    mkItem('🧮', 'Deduction', withRunGuard(downloadDeductionReport));
-    mkItem('🏦', 'Direct Deposit', withRunGuard(downloadDirectDeposit));
-    mkItem('⏱️', 'Qualified Overtime', withRunGuard(downloadQualifiedOvertime));
+    for (const r of ADP_REPORTS) mkItem(r, withRunGuard(r.fn));
 
     // Utility row: Stop + diagnostic as quiet ghost buttons.
     const utilRow = document.createElement('div');
