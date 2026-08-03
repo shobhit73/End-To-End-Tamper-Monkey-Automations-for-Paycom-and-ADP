@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.6.1
+// @version      1.6.2
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -3124,18 +3124,43 @@
     if (!got || !got.blob.size) throw new Error('file download returned an empty body');
     let viewerHtml = '';
     if (isHtml(got.resp)) {
-      // A viewer/launcher page, not the spreadsheet. Mine its HTML for the
-      // real file URL — a downloadTemplate link or a BIRT… instanceRefId.
+      // Not the spreadsheet yet. Known causes: we fetched the launcher page
+      // itself; the server wants the auditOutput.do launcher loaded in-session
+      // BEFORE serving the file; or the file simply isn't servable yet.
       try { viewerHtml = await got.blob.text(); } catch (_) { }
       logInfo(task.label + ': captured URL is a viewer page — mining it for the real file URL');
-      let fileUrl = '';
-      const mLink = viewerHtml.match(/[\w\/.:-]*downloadTemplate\/?\?[^"'<>\s\\]+/i);
-      const mId = viewerHtml.match(/instanceRefId['"=:\s]+["']?([\w.-]+)/i) || viewerHtml.match(/\b(BIRT[\w.-]+)\b/);
-      if (mLink) fileUrl = new URL(mLink[0].replace(/&amp;/g, '&'), abs).href;
-      else if (mId) fileUrl = new URL('/wfn/chr/reporting/downloadTemplate/?instanceRefId=' + encodeURIComponent(mId[1]), abs).href;
-      if (fileUrl) {
-        logInfo('Viewer page references the file: ' + fileUrl);
-        got = await phFetchBlob(fileUrl);
+      // Prime the session the way the real popup does: load the launcher
+      // before (re-)requesting the file.
+      const launcher = capturedUrls().map(u => { try { return new URL(u, baseHref).href; } catch (_) { return ''; } })
+        .find(u => u && /auditOutput\.do/i.test(u) && u !== abs);
+      if (launcher) { try { await fetch(launcher, { credentials: 'include' }); } catch (_) { } }
+      // Mine an HTML page for wherever the file actually is: an explicit
+      // downloadTemplate link, a BIRT… instanceRefId, or a redirect stub
+      // (meta refresh / location assignment).
+      const phMineHtml = (html, base) => {
+        const mLink = html.match(/[\w\/.:-]*downloadTemplate\/?\?[^"'<>\s\\]+/i);
+        if (mLink) { try { return new URL(mLink[0].replace(/&amp;/g, '&'), base).href; } catch (_) { } }
+        const mId = html.match(/instanceRefId['"=:\s]+["']?([\w.-]+)/i) || html.match(/\b(BIRT[\w.-]+)\b/);
+        if (mId) { try { return new URL('/wfn/chr/reporting/downloadTemplate/?instanceRefId=' + encodeURIComponent(mId[1]), base).href; } catch (_) { } }
+        const mRedir = html.match(/http-equiv=["']?refresh["'][^>]*url=([^"'>\s]+)/i)
+          || html.match(/location(?:\.href)?\s*=\s*["']([^"']+)["']/i)
+          || html.match(/location\.replace\(\s*["']([^"']+)/i);
+        if (mRedir) { try { return new URL(mRedir[1].replace(/&amp;/g, '&'), base).href; } catch (_) { } }
+        return '';
+      };
+      // Follow whatever each HTML response points at; when it points nowhere
+      // new, wait and re-request the same URL (report file may need a moment).
+      let cur = abs;
+      for (let att = 0; att < 6 && isHtml(got.resp); att++) {
+        checkAbort();
+        const next = phMineHtml(viewerHtml, cur);
+        if (next && next !== cur) { logInfo('Viewer page references: ' + next); cur = next; }
+        else await sleep(2500);
+        const r = await phFetchBlob(cur, launcher ? { referrer: launcher } : null);
+        if (r && r.blob.size) {
+          got = r;
+          if (isHtml(r.resp)) { try { viewerHtml = await r.blob.text(); } catch (_) { } }
+        }
       }
       // Still no spreadsheet? Replay any form submissions ADP made toward the
       // popup (POST forms carry their params outside the URL).
@@ -3154,13 +3179,21 @@
       }
     }
     if (!got || !got.blob.size || isHtml(got.resp)) {
+      // ADP's concurrent-session guard: the file server refuses downloads when
+      // the account is also logged in elsewhere (e.g. normal Chrome + incognito
+      // at once). No retry can fix this — the user must close the other session.
+      if (/logged in to ADP Workforce Now in another browser|another browser/i.test(viewerHtml)) {
+        logError(task.label + ': ADP refused the download — this account is logged in to ADP in ANOTHER browser/profile. Close the other ADP session (or log out there), then re-run.');
+        return false;
+      }
       // Everything above failed — log evidence for diagnosis, then fall back
       // to ADP's own behavior (viewer tab, default filename).
       logWarn(task.label + ': could not reach the real file — opening the viewer normally (default name)');
       logInfo('Diagnostics — URLs: ' + JSON.stringify(capturedUrls()) +
         ' | forms: ' + JSON.stringify(capturedForms().map(f => f.method + ' ' + f.action)) +
         ' | viewer HTML (' + viewerHtml.length + ' chars) mentions instanceRefId=' + /instanceRefId/i.test(viewerHtml) +
-        ' BIRT=' + /BIRT/.test(viewerHtml) + ' downloadTemplate=' + /downloadTemplate/i.test(viewerHtml));
+        ' BIRT=' + /BIRT/.test(viewerHtml) + ' downloadTemplate=' + /downloadTemplate/i.test(viewerHtml) +
+        ' | body: ' + JSON.stringify(viewerHtml.slice(0, 300)));
       try { window.open(abs); } catch (_) { }
       return false;
     }
