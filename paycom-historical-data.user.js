@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.7.0
+// @version      0.8.2
 // @description  Historical Data Bot — downloads Paycom Report-Center Time-Off reports as Excel for all employees, once per year (2025 + 2026). User opens Paycom, clicks Start; the bot navigates to each report's generate page, sets Excel + Select All employees + the date range, generates and downloads twice (previous year + current year). Separate from, and visually consistent with, the main "Paycom Bot" script. Currently: Employee Time-Off (184), Holiday/Blackout (185), Time-Off Audit (182), Time-Off Summary (186); Salary Time Off Absence Tracking (slug URL) pending. More historical-data sources to follow.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -16,17 +16,50 @@
   // rpt_ids are confirmed (Employee Time-Off, Holiday/Blackout, Salary Time Off
   // Absence Tracking, Time-Off Audit). rpt_id comes from the report's
   // rpt-generate.php?rpt_id=<N> URL — navigating there needs no session_nonce.
-  // fileBase drives the saved filename: `<fileBase>_<year>.xlsx`.
+  // fileBase drives the saved filename: `<fileBase>_<year>.xlsx`. section groups
+  // reports in the picker. Only standard rpt-generate.php reports are listed here
+  // (their rpt_id is the same across all Paycom employer accounts). Slug-based
+  // Report-Center reports (web.php/report-center/generate/<slug>) need separate
+  // handling and are tracked in PENDING_SLUG_REPORTS below.
   const REPORTS = [
-    { key: 'employee-timeoff', name: 'Employee Time-Off', rptId: 184, fileBase: 'EmployeeTimeOff' },
-    { key: 'holiday-blackout', name: 'Holiday/Blackout', rptId: 185, fileBase: 'HolidayBlackout' },
-    // Salary Time Off Absence Tracking (slug URL, not rpt_id) is inserted here
-    // once its generate-page form is confirmed — it uses
-    // web.php/report-center/generate/salary-time-off-absence-tracking-report
-    { key: 'timeoff-audit', name: 'Time-Off Audit', rptId: 182, fileBase: 'TimeOffAudit' },
-    { key: 'timeoff-summary', name: 'Time-Off Summary', rptId: 186, fileBase: 'TimeOffSummary' },
+    // ── Time-Off ──
+    { section: 'Time-Off', key: 'employee-timeoff', name: 'Employee Time-Off', rptId: 184, fileBase: 'EmployeeTimeOff' },
+    { section: 'Time-Off', key: 'holiday-blackout', name: 'Holiday/Blackout', rptId: 185, fileBase: 'HolidayBlackout' },
+    { section: 'Time-Off', key: 'timeoff-audit', name: 'Time-Off Audit', rptId: 182, fileBase: 'TimeOffAudit' },
+    { section: 'Time-Off', key: 'timeoff-summary', name: 'Time-Off Summary', rptId: 186, fileBase: 'TimeOffSummary' },
+    // ── Time & Attendance ──
+    { section: 'Time & Attendance', key: 'break-lunch-duration', name: 'Break/Lunch Duration', rptId: 401, fileBase: 'BreakLunchDuration' },
+    { section: 'Time & Attendance', key: 'employee-punch-change', name: 'Employee Punch Change', rptId: 419, fileBase: 'EmployeePunchChange' },
+    { section: 'Time & Attendance', key: 'employee-rates-by-allocation', name: 'Employee Rates by Allocation', rptId: 405, fileBase: 'EmployeeRatesByAllocation' },
+    { section: 'Time & Attendance', key: 'hours-worked-vs-threshold', name: 'Hours Worked vs Threshold', rptId: 406, fileBase: 'HoursWorkedVsThreshold' },
+    { section: 'Time & Attendance', key: 'labor-allocation', name: 'Labor Allocation', rptId: 407, fileBase: 'LaborAllocation' },
+    { section: 'Time & Attendance', key: 'labor-analysis-overtime', name: 'Labor Analysis/Overtime', rptId: 408, fileBase: 'LaborAnalysisOvertime' },
+    { section: 'Time & Attendance', key: 'missed-break-lunch', name: 'Missed Break/Lunch', rptId: 601, fileBase: 'MissedBreakLunch' },
+    { section: 'Time & Attendance', key: 'missing-punch', name: 'Missing Punch', rptId: 409, fileBase: 'MissingPunch' },
+    { section: 'Time & Attendance', key: 'pay-class-effective-date', name: 'Pay Class Effective Date', rptId: 417, fileBase: 'PayClassEffectiveDate' },
+    { section: 'Time & Attendance', key: 'punch-audit', name: 'Punch Audit', rptId: 410, fileBase: 'PunchAudit' },
+    { section: 'Time & Attendance', key: 'punches-outside-current-allocation', name: 'Punches Outside Current Allocation', rptId: 411, fileBase: 'PunchesOutsideCurrentAllocation' },
+    { section: 'Time & Attendance', key: 'time-between-shifts', name: 'Time Between Shifts', rptId: 600, fileBase: 'TimeBetweenShifts' },
+    { section: 'Time & Attendance', key: 'time-detail', name: 'Time Detail', rptId: 412, fileBase: 'TimeDetail' },
+    { section: 'Time & Attendance', key: 'timecard-approval', name: 'Timecard Approval', rptId: 413, fileBase: 'TimecardApproval' },
+    { section: 'Time & Attendance', key: 'total-hours-by-time-range', name: 'Total Hours by Time Range', rptId: 416, fileBase: 'TotalHoursByTimeRange' },
+    { section: 'Time & Attendance', key: 'total-hours-summary-by-allocation', name: 'Total Hours Summary by Allocation', rptId: 415, fileBase: 'TotalHoursSummaryByAllocation' },
+    { section: 'Time & Attendance', key: 'total-hours-summary', name: 'Total Hours Summary', rptId: 414, fileBase: 'TotalHoursSummary' },
+    { section: 'Time & Attendance', key: 'zero-hours-summary', name: 'Zero Hours Summary', rptId: 418, fileBase: 'ZeroHoursSummary' },
   ];
   const reportByKey = (k) => REPORTS.find(r => r.key === k);
+  // Distinct sections, in first-seen order — each gets its own Start button.
+  const SECTIONS = REPORTS.reduce((acc, r) => acc.includes(r.section) ? acc : acc.concat(r.section), []);
+  const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️' };
+
+  // Slug-based Report-Center reports still to wire (need slug navigation + their
+  // own form handling, like the pending Salary Time Off Absence Tracking report):
+  //   Time-Off:  Salary Time Off Absence Tracking → salary-time-off-absence-tracking-report
+  //   T&A:       Calc Detail → calc-detail-report
+  //   T&A:       Estimated Qualified Premiums CSV → estimated-qualified-overtime-ta-report
+  //   T&A:       Punch Change Request → punch-change-request-report
+  //   T&A:       Timecard Correction Comparison → timecard-correction-comparison-report
+  //   T&A:       Timecard Premium → timecard-premium-report
 
   // Each report is downloaded once per date range — previous year + current year.
   const YEARS = [
@@ -479,36 +512,37 @@
     // Guard against the redirect-loop: a report should be handled once (both
     // years on the same page). Landing on it 3+ times means its completion
     // redirects the page instead of showing an inline Download — bail loudly.
+    // Loop guard: a report should be handled once. Landing on it 3+ times means
+    // its completion redirects the page instead of showing an inline Download —
+    // skip it and move on (don't halt the whole batch).
     const attempt = bumpAttempt(idx);
     if (attempt > 2) {
-      hideBanner();
-      setState(STATES.IDLE);
-      clearQueue();
-      clearAttempts();
-      alert('Historical Data Bot: "' + report.name + '" keeps re-generating without an inline Download button ' +
-        '(Paycom redirects this report once it finishes, instead of offering a Download link on the same page). ' +
-        'This report needs the "Recent Reports" download method — tell me what the page shows after Generate and I\'ll wire it. Stopped to avoid a loop.');
-      log(`Loop guard tripped for ${report.name} (attempt ${attempt})`);
+      uiLog(`✕ Skipped ${report.name}: redirects instead of an inline Download (needs the Recent-Reports method)`);
+      advanceTo(idx + 1, queue);
       return;
     }
 
     try {
       await handleReport(report);
-      const next = idx + 1;
-      setIndex(next);
-      if (next < queue.length) {
-        const nextReport = reportByKey(queue[next]);
-        location.href = reportUrl(nextReport.rptId);
-      } else {
-        finishAll();
-      }
+      advanceTo(idx + 1, queue);
     } catch (err) {
       if (err && err.aborted) { log('Aborted by user'); hideBanner(); return; }
       hideBanner();
-      uiLog(`✕ Error in ${report.name}: ${err && err.message ? err.message : err}`);
-      alert('Historical Data Bot: ' + (err && err.message ? err.message : err));
-      setState(STATES.IDLE);
+      // Skip the failing report and keep going — one bad report shouldn't stop
+      // a long multi-report batch.
+      uiLog(`✕ Skipped ${report.name}: ${err && err.message ? err.message : err}`);
+      advanceTo(idx + 1, queue);
     }
+  }
+
+  // Move to the next queued report (navigate there), or finish if none left.
+  function advanceTo(next, queue) {
+    setIndex(next);
+    if (next < queue.length) {
+      const nextReport = reportByKey(queue[next]);
+      if (nextReport) { location.href = reportUrl(nextReport.rptId); return; }
+    }
+    finishAll();
   }
 
   // Start a run over the given report keys (from the picker).
@@ -543,12 +577,13 @@
     uiLog('✓ All selected reports downloaded (2025 + 2026)');
   }
 
-  // ───────────────── Report picker dialog ─────────────────
+  // ───────────────── Report picker dialog (one section at a time) ─────────────────
   // Same look as the main Paycom Bot's "Download All Reports" dialog: white card,
   // blue accent, checkbox per report + select-all/none. Selection persists.
-  function showPickerDialog(onConfirm) {
+  function showPickerDialog(section, onConfirm) {
     document.getElementById('histbot-picker')?.remove();
     const saved = getSelection();
+    const reports = REPORTS.filter(r => r.section === section);
 
     const overlay = document.createElement('div');
     overlay.id = 'histbot-picker';
@@ -558,7 +593,7 @@
     box.style.cssText = 'background:#fff;border-radius:10px;padding:20px;max-width:440px;width:92%;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.35);';
 
     const title = document.createElement('h3');
-    title.textContent = 'Historical Data — choose reports';
+    title.textContent = `${section} — choose reports`;
     title.style.cssText = 'margin:0 0 4px;color:#0b7dda;font-size:16px;';
     box.appendChild(title);
 
@@ -569,15 +604,15 @@
 
     const list = document.createElement('div');
     list.style.cssText = 'flex:1;overflow-y:auto;border:1px solid #e0e0e0;border-radius:6px;padding:6px 12px;margin-bottom:14px;';
-    const checkboxes = [];
-    REPORTS.forEach((r, i) => {
+    const checkboxes = [];      // aligned with `reports` index
+    reports.forEach((r, i) => {
       const row = document.createElement('label');
-      row.style.cssText = 'display:flex;align-items:center;padding:9px 0;cursor:pointer;border-bottom:1px solid #f0f0f0;';
-      if (i === REPORTS.length - 1) row.style.borderBottom = 'none';
+      row.style.cssText = 'display:flex;align-items:center;padding:8px 0;cursor:pointer;border-bottom:1px solid #f0f0f0;';
+      if (i === reports.length - 1) row.style.borderBottom = 'none';
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.checked = saved[r.key];
-      cb.style.cssText = 'margin-right:10px;transform:scale(1.2);';
+      cb.style.cssText = 'margin-right:10px;transform:scale(1.15);flex:0 0 auto;';
       checkboxes.push(cb);
       const text = document.createElement('span');
       text.textContent = r.name;
@@ -612,8 +647,8 @@
     confirmBtn.textContent = 'Download selected';
     confirmBtn.style.cssText = 'padding:9px 18px;border:0;background:#0b7dda;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;font-size:13px;';
     confirmBtn.onclick = () => {
-      REPORTS.forEach((r, i) => setSelected(r.key, checkboxes[i].checked));
-      const keys = REPORTS.filter((_, i) => checkboxes[i].checked).map(r => r.key);
+      reports.forEach((r, i) => setSelected(r.key, checkboxes[i].checked));
+      const keys = reports.filter((_, i) => checkboxes[i].checked).map(r => r.key);
       if (!keys.length) { alert('Select at least one report or click Cancel.'); return; }
       overlay.remove();
       onConfirm(keys);
@@ -625,9 +660,9 @@
     document.body.appendChild(overlay);
   }
 
-  function onStartClick() {
+  function onStartClick(section) {
     if (isRunning()) { log('Already running — Stop first'); return; }
-    showPickerDialog((keys) => startRun(keys));
+    showPickerDialog(section, (keys) => startRun(keys));
   }
 
   // ───────────────── Banner ─────────────────
@@ -775,8 +810,8 @@
       <div class="body">
         <div class="status">Status <span class="hb-state">Idle</span></div>
         <div class="hb-prog"></div>
-        <div class="note">Pick reports → Excel · all employees · 2025 + 2026<br>(Salary report pending)</div>
-        <button class="start">🗓️ Start Time-Off Downloads</button>
+        <div class="note">Excel · all employees · 2025 + 2026<br>(a few more report types coming soon)</div>
+        <div class="hb-starts"></div>
         <button class="inspect" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
         <button class="stop">⏹ Stop / reset</button>
         <div class="hb-loglabel">Activity</div>
@@ -784,7 +819,18 @@
       </div>
     `;
     document.body.appendChild(panelEl);
-    panelEl.querySelector('.start').addEventListener('click', onStartClick);
+
+    // One Start button per report section (Time-Off, Time & Attendance, …).
+    const starts = panelEl.querySelector('.hb-starts');
+    SECTIONS.forEach(sec => {
+      const b = document.createElement('button');
+      b.className = 'start';
+      b.dataset.label = `${SECTION_ICON[sec] || '▶'} ${sec} Reports`;
+      b.textContent = b.dataset.label;
+      b.addEventListener('click', () => onStartClick(sec));
+      starts.appendChild(b);
+    });
+
     panelEl.querySelector('.inspect').addEventListener('click', startInspectCapture);
     panelEl.querySelector('.stop').addEventListener('click', stopRun);
 
@@ -824,8 +870,11 @@
   function refreshPanel() {
     if (!panelEl) return;
     panelEl.classList.toggle('running', isRunning());
-    const startBtn = panelEl.querySelector('.start');
-    if (startBtn) startBtn.textContent = isRunning() ? '⏳ Running…' : '🗓️ Start Time-Off Downloads';
+    const running = isRunning();
+    panelEl.querySelectorAll('.start').forEach(b => {
+      b.disabled = running;
+      b.textContent = running ? '⏳ Running…' : (b.dataset.label || '▶ Start');
+    });
     const st = panelEl.querySelector('.hb-state');
     if (st) st.textContent = isRunning() ? 'Running' : 'Idle';
     const prog = panelEl.querySelector('.hb-prog');
