@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.14.2
-// @description  Historical Data Bot — downloads Paycom Report-Center Time-Off reports as Excel for all employees, once per year (2025 + 2026). User opens Paycom, clicks Start; the bot navigates to each report's generate page, sets Excel + Select All employees + the date range, generates and downloads twice (previous year + current year). Separate from, and visually consistent with, the main "Paycom Bot" script. Currently: Employee Time-Off (184), Holiday/Blackout (185), Time-Off Audit (182), Time-Off Summary (186); Salary Time Off Absence Tracking (slug URL) pending. More historical-data sources to follow.
+// @version      0.15.1
+// @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
 // @grant        none
@@ -21,9 +21,16 @@
   // (their rpt_id is the same across all Paycom employer accounts). Slug-based
   // Report-Center reports (web.php/report-center/generate/<slug>) need separate
   // handling and are tracked in PENDING_SLUG_REPORTS below.
-  // Prior Payroll goes back 3 full calendar years from whenever the script runs.
-  // Computed at load time so it's never hardcoded: 2026→2023, 2027→2024, and so on.
-  const STARTYEAR = new Date().getFullYear() - 3;
+  // All years are computed at load time — NOTHING is hardcoded, so the script
+  // stays correct forever:
+  //   THISYEAR/LASTYEAR → the default two-file year loop and HR & Audit ranges
+  //                        (in 2026: 2025+2026 · in 2027: 2026+2027 · …)
+  //   STARTYEAR (−3)    → the Prior Payroll wizard range
+  const THISYEAR = new Date().getFullYear();
+  const LASTYEAR = THISYEAR - 1;
+  const STARTYEAR = THISYEAR - 3;
+  // HR & Audit reports share one range: Jan 1 of LAST year → today.
+  const HR_AUDIT_RANGES = [{ label: `${LASTYEAR}-to-date`, from: `01/01/${LASTYEAR}`, to: 'TODAY' }];
 
   const REPORTS = [
     // ── Time-Off ──
@@ -62,27 +69,33 @@
       url: 'https://www.paycomonline.net/v4/cl/web.php/report-center/generate/historical-accrual-data',
       slug: 'historical-accrual-data', snapshot: true, selectAll: false, fileBase: 'HistoricalAccrualData',
     },
-    // ── HR & Audit ── (single date range: 01/01/2025 → today, one file each)
+    // ── HR & Audit ── (single dynamic date range: 01/01/<last year> → today)
     {
       section: 'HR & Audit', key: 'effective-dates', name: 'Effective Dates', rptId: 133, fileBase: 'EffectiveDates',
-      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+      ranges: HR_AUDIT_RANGES,
     },
     {
       section: 'HR & Audit', key: 'employee-changes', name: 'Employee Changes', rptId: 134, fileBase: 'EmployeeChanges',
-      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+      ranges: HR_AUDIT_RANGES,
       checks: ['Show Effective Date'], // tick this option before generating
     },
     {
       section: 'HR & Audit', key: 'employee-dates', name: 'Employee Dates', rptId: 1, fileBase: 'EmployeeDates',
-      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+      ranges: HR_AUDIT_RANGES,
     },
     {
       section: 'HR & Audit', key: 'rate-history', name: 'Rate History', rptId: 25, fileBase: 'RateHistory',
-      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+      ranges: HR_AUDIT_RANGES,
+    },
+    // No Date Range on this form (only Output Format + Accrual/Status options,
+    // which default to PTO + All) → snapshot: one file, Select-All employees.
+    {
+      section: 'HR & Audit', key: 'employee-accrual', name: 'Employee Accrual', rptId: 11,
+      snapshot: true, fileBase: 'EmployeeAccrual',
     },
     {
       section: 'HR & Audit', key: 'changed-contact', name: 'Changed Contact', rptId: 132, fileBase: 'ChangedContact',
-      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+      ranges: HR_AUDIT_RANGES,
     },
     // ── Payroll ── (Advanced Report Writer wizard — 3-year prior payroll)
     // Range is DYNAMIC: 01/01/(this year − 3) → today. So in 2026 it's 2023→today,
@@ -116,8 +129,8 @@
   // year (previous + current). A report can override with its own `ranges`, and a
   // range's `from`/`to` may use the token 'TODAY' → resolved to today's date.
   const YEARS = [
-    { label: '2025', from: '01/01/2025', to: '12/31/2025' },
-    { label: '2026', from: '01/01/2026', to: '12/31/2026' },
+    { label: `${LASTYEAR}`, from: `01/01/${LASTYEAR}`, to: `12/31/${LASTYEAR}` },
+    { label: `${THISYEAR}`, from: `01/01/${THISYEAR}`, to: `12/31/${THISYEAR}` },
   ];
 
   function todayMMDDYYYY() {
@@ -567,7 +580,7 @@
     await sleep(2500); // let the download commit before the next generate/navigation
   }
 
-  // Runs both years (2025 + 2026) on the same report page, no reload between them.
+  // Runs both years (last + current) on the same report page, no reload between them.
   async function handleReport(report) {
     showBanner(`${report.name}: loading form…`);
     await waitFor(() => findGenerateReportButton(), {
@@ -587,8 +600,8 @@
       return;
     }
 
-    // Date-range reports: one file per range. Default = 2025 + 2026; a report can
-    // override with its own `ranges` (e.g. a single 01/01/2025 → today range).
+    // Date-range reports: one file per range. Default = last + current year; a
+    // report can override with its own `ranges` (e.g. HR & Audit's <last>→today).
     const ranges = report.ranges || YEARS;
     for (const rng of ranges) {
       if (!isRunning()) return;
@@ -957,7 +970,7 @@
     clearAttempts();
     clearWz();
     clearLog();
-    uiLog(`Started ${keys.length} report(s): ${keys.map(k => (reportByKey(k) || {}).name || k).join(', ')} · 2025 + 2026`);
+    uiLog(`Started ${keys.length} report(s): ${keys.map(k => (reportByKey(k) || {}).name || k).join(', ')} · ${LASTYEAR} + ${THISYEAR}`);
     setState(STATES.RUNNING);
     dispatch();
   }
@@ -979,8 +992,8 @@
     clearQueue();
     clearAttempts();
     hideBanner();
-    showBanner('✓ Historical Data Bot — selected reports downloaded (2025 + 2026)', true);
-    uiLog('✓ All selected reports downloaded (2025 + 2026)');
+    showBanner(`✓ Historical Data Bot — selected reports downloaded (${LASTYEAR} + ${THISYEAR})`, true);
+    uiLog(`✓ All selected reports downloaded (${LASTYEAR} + ${THISYEAR})`);
   }
 
   // ───────────────── Report picker dialog (one section at a time) ─────────────────
@@ -1004,7 +1017,7 @@
     box.appendChild(title);
 
     const subtitle = document.createElement('div');
-    subtitle.textContent = 'Each ticked report downloads as Excel for all employees — 2025 and 2026.';
+    subtitle.textContent = `Each ticked report downloads as Excel for all employees — ${LASTYEAR} and ${THISYEAR}.`;
     subtitle.style.cssText = 'color:#666;font-size:12px;margin-bottom:14px;';
     box.appendChild(subtitle);
 
