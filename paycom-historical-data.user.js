@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.10.1
+// @version      0.14.2
 // @description  Historical Data Bot — downloads Paycom Report-Center Time-Off reports as Excel for all employees, once per year (2025 + 2026). User opens Paycom, clicks Start; the bot navigates to each report's generate page, sets Excel + Select All employees + the date range, generates and downloads twice (previous year + current year). Separate from, and visually consistent with, the main "Paycom Bot" script. Currently: Employee Time-Off (184), Holiday/Blackout (185), Time-Off Audit (182), Time-Off Summary (186); Salary Time Off Absence Tracking (slug URL) pending. More historical-data sources to follow.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -21,6 +21,10 @@
   // (their rpt_id is the same across all Paycom employer accounts). Slug-based
   // Report-Center reports (web.php/report-center/generate/<slug>) need separate
   // handling and are tracked in PENDING_SLUG_REPORTS below.
+  // Prior Payroll goes back 3 full calendar years from whenever the script runs.
+  // Computed at load time so it's never hardcoded: 2026→2023, 2027→2024, and so on.
+  const STARTYEAR = new Date().getFullYear() - 3;
+
   const REPORTS = [
     // ── Time-Off ──
     { section: 'Time-Off', key: 'employee-timeoff', name: 'Employee Time-Off', rptId: 184, fileBase: 'EmployeeTimeOff' },
@@ -58,11 +62,45 @@
       url: 'https://www.paycomonline.net/v4/cl/web.php/report-center/generate/historical-accrual-data',
       slug: 'historical-accrual-data', snapshot: true, selectAll: false, fileBase: 'HistoricalAccrualData',
     },
+    // ── HR & Audit ── (single date range: 01/01/2025 → today, one file each)
+    {
+      section: 'HR & Audit', key: 'effective-dates', name: 'Effective Dates', rptId: 133, fileBase: 'EffectiveDates',
+      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+    },
+    {
+      section: 'HR & Audit', key: 'employee-changes', name: 'Employee Changes', rptId: 134, fileBase: 'EmployeeChanges',
+      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+      checks: ['Show Effective Date'], // tick this option before generating
+    },
+    {
+      section: 'HR & Audit', key: 'employee-dates', name: 'Employee Dates', rptId: 1, fileBase: 'EmployeeDates',
+      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+    },
+    {
+      section: 'HR & Audit', key: 'rate-history', name: 'Rate History', rptId: 25, fileBase: 'RateHistory',
+      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+    },
+    {
+      section: 'HR & Audit', key: 'changed-contact', name: 'Changed Contact', rptId: 132, fileBase: 'ChangedContact',
+      ranges: [{ label: '2025-to-date', from: '01/01/2025', to: 'TODAY' }],
+    },
+    // ── Payroll ── (Advanced Report Writer wizard — 3-year prior payroll)
+    // Range is DYNAMIC: 01/01/(this year − 3) → today. So in 2026 it's 2023→today,
+    // in 2027 it's 2024→today, etc. The `name`/`fileBase` follow the same year so
+    // nothing is ever hardcoded. (STARTYEAR is computed once below.)
+    {
+      section: 'Payroll', key: 'prior-payroll-3yr', name: `Prior Payroll (${STARTYEAR} → today)`, wizard: true,
+      reportType: 'Payroll',
+      step1Fields: ['Employee Code', 'Employee Name', 'Pay Class Code'],
+      step2SelectAll: ['Earnings', 'Deductions', 'Taxes', 'Employer Liability', 'Accruals', 'Net', 'Taxable Wages'],
+      range: { from: `01/01/${STARTYEAR}`, to: 'TODAY' },
+      fileBase: `PriorPayroll_${STARTYEAR}-to-date`,
+    },
   ];
   const reportByKey = (k) => REPORTS.find(r => r.key === k);
   // Distinct sections, in first-seen order — each gets its own Start button.
   const SECTIONS = REPORTS.reduce((acc, r) => acc.includes(r.section) ? acc : acc.concat(r.section), []);
-  const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️', 'Accrual': '📈' };
+  const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️', 'Accrual': '📈', 'HR & Audit': '🧑‍💼', 'Payroll': '💵' };
 
   // Slug-based Report-Center reports still to wire (need slug navigation + their
   // own form handling, like the pending Salary Time Off Absence Tracking report):
@@ -74,11 +112,21 @@
   //   T&A:       Timecard Premium → timecard-premium-report
   //   Accrual:   Accrual Projection → accrual-projection
 
-  // Each report is downloaded once per date range — previous year + current year.
+  // Default date ranges — a report with no `ranges` of its own downloads once per
+  // year (previous + current). A report can override with its own `ranges`, and a
+  // range's `from`/`to` may use the token 'TODAY' → resolved to today's date.
   const YEARS = [
     { label: '2025', from: '01/01/2025', to: '12/31/2025' },
     { label: '2026', from: '01/01/2026', to: '12/31/2026' },
   ];
+
+  function todayMMDDYYYY() {
+    const t = new Date();
+    const mm = String(t.getMonth() + 1).padStart(2, '0');
+    const dd = String(t.getDate()).padStart(2, '0');
+    return `${mm}/${dd}/${t.getFullYear()}`;
+  }
+  const resolveDate = (d) => (d === 'TODAY' ? todayMMDDYYYY() : d);
 
   // A report is either standard (rptId → rpt-generate.php?rpt_id=N) or slug-based
   // (url/slug → web.php/report-center/generate/<slug>).
@@ -361,6 +409,41 @@
     else log('Employees: Select All already checked');
   }
 
+  // Find a report-option checkbox by its visible label text (e.g. "Show Effective
+  // Date"). Matched by label — never by the raw id — so it works on every client.
+  function findCheckboxByLabel(text) {
+    const want = String(text).toLowerCase();
+    for (const lb of document.querySelectorAll('label')) {
+      if (!(lb.textContent || '').trim().toLowerCase().includes(want)) continue;
+      const forId = lb.getAttribute('for');
+      if (forId) { const cb = document.getElementById(forId); if (cb && cb.type === 'checkbox' && visible(cb)) return cb; }
+      const inner = lb.querySelector('input[type="checkbox"]');
+      if (inner && visible(inner)) return inner;
+    }
+    // Fallback: a checkbox whose nearby wrapper text contains the label.
+    for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
+      if (!visible(cb)) continue;
+      let walker = cb.parentElement;
+      for (let i = 0; i < 3 && walker; i++) {
+        const t = (walker.innerText || '').trim().toLowerCase();
+        if (t.includes(want) && t.length < 60) return cb;
+        walker = walker.parentElement;
+      }
+    }
+    return null;
+  }
+
+  // Tick a report's extra option checkboxes (report.checks), e.g. Show Effective Date.
+  async function tickChecks(labels) {
+    if (!labels || !labels.length) return;
+    for (const label of labels) {
+      const cb = findCheckboxByLabel(label);
+      if (!cb) { uiLog(`⚠ Checkbox not found: "${label}"`); continue; }
+      if (!cb.checked) { clickEl(cb); uiLog(`Checked: ${label}`); await sleep(400); }
+      else log(`Checkbox "${label}" already checked`);
+    }
+  }
+
   // ── Download with a proper filename ──────────────────────────────────────
   // Paycom's "Download" is a <button class="js-report-download"> (no href), so
   // we can't just fetch a link. Instead we mirror the main bot's technique:
@@ -408,6 +491,17 @@
   function transidForButton(btn) {
     const item = btn.closest && btn.closest('[id^="queued-report-"]');
     if (item) { const m = /queued-report-(\d+)/.exec(item.id || ''); if (m) return m[1]; }
+    // ARW Recent-Reports tab: the Download control is an <a> (or wraps one) whose
+    // href / onclick carries transid=<n> — read it there so the file still gets
+    // OUR name instead of falling back to Paycom's default download.
+    const hay = [
+      btn.getAttribute && btn.getAttribute('href'),
+      btn.getAttribute && btn.getAttribute('onclick'),
+      btn.href,
+      (btn.closest && btn.closest('a[href]') || {}).href,
+      (btn.querySelector && btn.querySelector('a[href]') || {}).href,
+    ];
+    for (const h of hay) { if (h) { const m = /transid[=\/_-](\d{4,})/i.exec(h); if (m) return m[1]; } }
     let n = btn;
     for (let i = 0; n && i < 8; i++) { const m = /(?:report|transid)[-=_]?(\d{5,})/i.exec(n.id || ''); if (m) return m[1]; n = n.parentElement; }
     return '';
@@ -487,26 +581,32 @@
       if (!isRunning()) return;
       showBanner(`${report.name}: setting up…`);
       if (report.selectAll !== false) { await selectAllEmployees(); await sleep(400); }
+      await tickChecks(report.checks);
       await generateAndDownload(report.name, report.fileBase); // single file, no year suffix
       showBanner(`✓ ${report.name} downloaded`, true);
       return;
     }
 
-    for (const yr of YEARS) {
+    // Date-range reports: one file per range. Default = 2025 + 2026; a report can
+    // override with its own `ranges` (e.g. a single 01/01/2025 → today range).
+    const ranges = report.ranges || YEARS;
+    for (const rng of ranges) {
       if (!isRunning()) return;
-      const tag = `${report.name} ${yr.label}`;
+      const from = resolveDate(rng.from), to = resolveDate(rng.to);
+      const tag = `${report.name} ${rng.label}`;
       showBanner(`${tag}: setting up…`);
       ensureDateRangeMode();
       await sleep(200);
-      setDateRange(yr.from, yr.to);
+      setDateRange(from, to);
       await sleep(300);
-      await selectAllEmployees();
-      await sleep(400);
+      if (report.selectAll !== false) { await selectAllEmployees(); await sleep(400); }
+      await tickChecks(report.checks); // extra option checkboxes, e.g. Show Effective Date
       // Output format is set inside generateAndDownload (last, so it can't be
       // reset by the Select-All re-render).
-      await generateAndDownload(tag, `${report.fileBase}_${yr.label}`);
+      await generateAndDownload(tag, `${report.fileBase}_${rng.label}`);
     }
-    showBanner(`✓ ${report.name} — 2025 + 2026 downloaded`, true);
+    const summary = ranges.length === 1 ? ranges[0].label : ranges.map(r => r.label).join(' + ');
+    showBanner(`✓ ${report.name} — ${summary} downloaded`, true);
   }
 
   // ── Loop guard ──────────────────────────────────────────────────────────
@@ -523,6 +623,276 @@
   }
   const clearAttempts = () => { try { localStorage.removeItem(ATT_KEY); } catch (_) {} };
 
+  // ═════════════════ Advanced Report Writer (multi-step wizard) ═════════════════
+  // For custom reports built via the ARW (e.g. the 3-year Prior Payroll). Flow,
+  // mirrored from the main Paycom bot's Census mode:
+  //   any page → srw-reportwriter-savedReport.php (ARW landing)
+  //   landing  → click "Create New Report" → pick the report type → wizard page
+  //   wizard   → drive steps 1-5 in one context (SPA) → Generate → recent-reports
+  //   recent   → download the generated file with our name → advance the queue
+  const ARW_SAVED_URL = 'https://www.paycomonline.net/v4/cl/srw-reportwriter-savedReport.php?src=rptcenter&override-report-hub=1';
+
+  function normalizeText(s) {
+    return (s || '').replace(/ /g, ' ').replace(/[#_]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+  function findByText(selectors, text) {
+    const list = Array.isArray(selectors) ? selectors : [selectors];
+    const want = text.toLowerCase();
+    for (const sel of list) for (const el of document.querySelectorAll(sel)) {
+      if ((el.innerText || el.textContent || '').trim().toLowerCase() === want) return el;
+    }
+    for (const sel of list) for (const el of document.querySelectorAll(sel)) {
+      if ((el.innerText || el.textContent || '').trim().toLowerCase().includes(want)) return el;
+    }
+    return null;
+  }
+  const getAllFilterCheckboxes = () => Array.from(document.querySelectorAll('input.filterCheckbox[type="checkbox"]'));
+  const checkboxKey = (cb) => normalizeText(cb.getAttribute('aria-label') || cb.value || cb.getAttribute('value') || '');
+  const isOnRecentReportsTab = () =>
+    location.href.includes('/srw-reportwriter-savedReport.php') && location.search.includes('tab-index-advRptTab=1');
+
+  // The active wizard step number, read from the step tab bar (reliable):
+  //   <li class="tab completed tabActive" tabvalue="3. Filters">
+  function currentWizardStep() {
+    const a = document.querySelector('li.tab.tabActive');
+    const m = a && (a.getAttribute('tabvalue') || '').match(/^(\d)/);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+  // The wizard "Next" is <input class="js-button-next" value="Next">. Target that
+  // class directly (the field lists have their own paginated "Next" links too).
+  function findWizardNext() {
+    const byClass = Array.from(document.querySelectorAll('.js-button-next')).find(x => visible(x) && !x.disabled);
+    if (byClass) return byClass;
+    const c = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'))
+      .filter(el => visible(el) && !el.disabled && (el.value || el.innerText || el.textContent || '').trim() === 'Next');
+    c.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+    return c[0] || null;
+  }
+  async function clickWizardNext(label) {
+    const nx = await waitFor(() => findWizardNext(), { timeout: 15000, label: `${label} "Next" button` });
+    clickEl(nx);
+  }
+
+  // Paycom loads each wizard step's fields via AJAX and re-renders a beat later,
+  // so acting the instant the step tab flips misses everything. Resolve only once
+  // the visible interactive-element count has held steady across several polls —
+  // a cheap "the render finished" signal. Every long pause is abort-aware.
+  async function settleDom(maxMs = 9000) {
+    let last = -1, stable = 0;
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxMs) {
+      const n = document.querySelectorAll('input, .js-button-next, div[id^="prbox"]').length;
+      if (n > 0 && n === last) { if (++stable >= 3) return; } else { stable = 0; last = n; }
+      await sleep(220);
+    }
+  }
+  // Wait until the wizard is truly on step `n` (tab active) AND its content has
+  // settled. Optionally also wait for a per-step "ready" predicate.
+  async function waitForWizardStep(n, label, ready) {
+    await waitFor(() => currentWizardStep() === n, { timeout: 30000, label });
+    if (ready) await waitFor(ready, { timeout: 25000, label: `${label} content` });
+    await settleDom();
+  }
+
+  // The label for a field checkbox: aria-label / value first, else the nearest
+  // enclosing row's text (some boxes render the name as sibling text, not aria).
+  function fieldCheckboxLabel(cb) {
+    const direct = cb.getAttribute('aria-label') || cb.value || cb.getAttribute('value') || '';
+    if (direct && direct.trim()) return normalizeText(direct);
+    let w = cb.parentElement;
+    for (let i = 0; i < 3 && w; i++) {
+      const t = (w.innerText || w.textContent || '').trim();
+      if (t && t.length < 60) return normalizeText(t);
+      w = w.parentElement;
+    }
+    return '';
+  }
+  // Step 1 — select specific fields by name across the field categories. Only
+  // VISIBLE checkboxes count: Paycom keeps hidden duplicate copies in the DOM, and
+  // ticking a hidden copy leaves the real form empty.
+  async function wizardSelectFields(names) {
+    const wanted = names.map(normalizeText);
+    const found = new Set();
+    const boxes = getAllFilterCheckboxes().filter(visible);
+    for (const cb of boxes) {
+      const key = fieldCheckboxLabel(cb);
+      if (wanted.includes(key)) {
+        found.add(key);
+        if (!cb.checked) { clickEl(cb); uiLog(`  + field: ${cb.getAttribute('aria-label') || cb.value || key}`); await sleep(200); }
+      }
+    }
+    for (const w of wanted) if (!found.has(w)) uiLog(`⚠ Step-1 field not found: "${w}" (visible boxes: ${boxes.length})`);
+  }
+
+  // Step 2 — each payroll field category is a div#prbox<N>.payroll with a
+  // .filterSelectAll > input[name="selectcheck"]. Tick every one EXCEPT the
+  // "Calculated Fields" box. Clicking a Select-All re-renders the Selected-Fields
+  // panel (invalidating stale element refs), so we re-query FRESH each attempt
+  // and verify + retry per category.
+  // The Select-All checkbox that belongs to a specific box element.
+  const boxSelectAll = (box) => box && box.querySelector('.filterSelectAll input[type="checkbox"]');
+  async function wizardSelectAllCategories() {
+    // CRITICAL: Paycom renders a hidden DUPLICATE of every payroll box (the page
+    // shows two identical stacked panels). getElementById + naive querySelectorAll
+    // hit the hidden copies too — ticking those leaves the real form empty and
+    // still reports success. Work ONLY with VISIBLE box elements, by reference.
+    const boxes = Array.from(document.querySelectorAll('div[id^="prbox"].payroll'))
+      .filter(b => visible(b) && !(b.innerText || '').toLowerCase().includes('calculated field'));
+    uiLog(`  payroll categories: ${boxes.length} visible (${boxes.map(b => b.id).join(', ')})`);
+    if (!boxes.length) { uiLog('⚠ No visible payroll category boxes (div.payroll)'); return; }
+    // A Select-All click can silently REVERT while a category's field list is still
+    // loading, so sweep repeatedly (re-clicking any that fell back off) with a
+    // settle delay until every VISIBLE category truly sticks.
+    const isOn = (box) => { const c = boxSelectAll(box); return !!(c && c.checked); };
+    for (let sweep = 0; sweep < 8; sweep++) {
+      const remaining = boxes.filter(b => !isOn(b));
+      if (!remaining.length) break;
+      for (const box of remaining) {
+        const cb = boxSelectAll(box);
+        if (cb && !cb.checked) { clickEl(cb); await sleep(500); }
+      }
+      await sleep(1000); // let any reverts settle before re-checking
+    }
+    const done = boxes.filter(isOn);
+    uiLog(`  Select All → ${done.length}/${boxes.length} categories`);
+    const miss = boxes.filter(b => !isOn(b)).map(b => b.id);
+    if (miss.length) uiLog(`  ✕ still off: ${miss.join(', ')}`);
+  }
+
+  // Step 5 (Review) — output XLSX, Checks distribution (reveals Period Start/End),
+  // check those, set Specific Date Range dates, then Generate.
+  async function configureReviewAndGenerate(report) {
+    const xlsx = document.getElementById('outputFileFormat3') || (outputRowFor('xlsx') && outputRowFor('xlsx').radio);
+    if (xlsx && !xlsx.checked) { xlsx.click(); uiLog('  output: XLSX'); await sleep(300); }
+
+    const checks = document.getElementById('prlaboroption1');
+    if (checks && !checks.checked) { checks.click(); uiLog('  distribution: Checks'); await sleep(700); }
+
+    const ps = document.getElementById('chkPeriodStartDate');
+    if (ps && !ps.checked) { ps.click(); uiLog('  ✓ Period Start Date'); await sleep(200); }
+    const pe = document.getElementById('chkPeriodEndDate');
+    if (pe && !pe.checked) { pe.click(); uiLog('  ✓ Period End Date'); await sleep(200); }
+
+    const dtype = document.getElementById('selectDateType1');
+    if (dtype && String(dtype.value) !== '0') { setInputValue(dtype, '0'); await sleep(300); }
+
+    const from = resolveDate(report.range.from), to = resolveDate(report.range.to);
+    const fromInp = document.getElementById('prdate1from');
+    const toInp = document.getElementById('prdate1to');
+    if (fromInp) setInputValue(fromInp, from);
+    if (toInp) setInputValue(toInp, to);
+    uiLog(`  dates: ${from} → ${to}`);
+    await sleep(500);
+
+    // Ticking "Checks" / the period dates re-renders the review panel, so the
+    // Generate button may appear a beat later — wait for it instead of a snapshot.
+    const gen = await waitFor(() => findGenerateReportButton(),
+      { timeout: 15000, label: 'Generate Report button' });
+    uiLog('Wizard: Generate Report…');
+    clickEl(gen); // navigates to the recent-reports tab
+  }
+
+  // Drive the whole wizard on enh-srw-reportwriter.php (steps 1-4 transition via
+  // AJAX in one context; Generate on step 5 navigates away).
+  async function driveWizard(report) {
+    // Step 1 — Employee Information. Wait for the field checkboxes to actually be
+    // present AND the render to settle (not just the step tab) before selecting.
+    await waitForWizardStep(1, 'wizard Step 1 (Employee Information)',
+      () => getAllFilterCheckboxes().filter(visible).length > 0);
+    uiLog('Wizard Step 1: selecting fields…');
+    await wizardSelectFields(report.step1Fields);
+    await sleep(500);
+    await clickWizardNext('Step 1');
+
+    // Step 2 — Payroll Specific Fields. Wait for a VISIBLE payroll box to render.
+    await waitForWizardStep(2, 'wizard Step 2 (Payroll Specific Fields)',
+      () => Array.from(document.querySelectorAll('div[id^="prbox"].payroll')).some(visible));
+    await sleep(800); // let the field lists finish loading before Select-All
+    uiLog('Wizard Step 2: Select All categories…');
+    await wizardSelectAllCategories();
+    await sleep(500);
+    await clickWizardNext('Step 2');
+
+    // Step 3 — Filters (nothing to select)
+    await waitForWizardStep(3, 'wizard Step 3 (Filters)');
+    uiLog('Wizard Step 3: Filters → Next');
+    await clickWizardNext('Filters');
+
+    // Step 4 — Sorting Options (nothing to select)
+    await waitForWizardStep(4, 'wizard Step 4 (Sorting)');
+    uiLog('Wizard Step 4: Sorting → Next');
+    await clickWizardNext('Sorting');
+
+    // Step 5 — Review. Wait for the output-format controls to render.
+    await waitForWizardStep(5, 'wizard Step 5 (Review)',
+      () => document.getElementById('outputFileFormat3') || outputRowFor('xlsx'));
+    uiLog('Wizard Step 5: output + dates…');
+    await configureReviewAndGenerate(report);
+  }
+
+  // Download the generated ARW report from the recent-reports tab.
+  async function wizardDownload(report) {
+    showBanner(`${report.name}: waiting for the report to finish…`);
+    await sleep(1500);
+    const initial = getDownloadButtons().length;
+    await waitFor(() => getDownloadButtons().length > initial, {
+      timeout: 10 * 60 * 1000, interval: 900, label: 'wizard report Download',
+    });
+    await downloadNewest(report.fileBase);
+    showBanner(`✓ ${report.name} downloaded`, true);
+    uiLog(`✓ ${report.name} downloaded`);
+  }
+
+  // Page-based state machine for a wizard report. Guarded against runaway loops.
+  const WZ_KEY = 'histbot.wz';
+  const clearWz = () => { try { localStorage.removeItem(WZ_KEY); } catch (_) {} };
+  async function dispatchWizard(report, idx, queue) {
+    const loads = (parseInt(localStorage.getItem(WZ_KEY) || '0', 10) || 0) + 1;
+    try { localStorage.setItem(WZ_KEY, String(loads)); } catch (_) {}
+    if (loads > 25) {
+      uiLog(`✕ Skipped ${report.name}: wizard didn't finish after many page loads`);
+      clearWz(); advanceTo(idx + 1, queue); return;
+    }
+
+    const url = location.href;
+    try {
+      if (isOnRecentReportsTab()) {
+        await wizardDownload(report);
+        clearWz(); advanceTo(idx + 1, queue);
+        return;
+      }
+      if (url.includes('/srw-reportwriter-savedReport.php')) {
+        const createBtn = await waitFor(() => findByText(['button', 'a'], 'Create New Report'), { timeout: 20000, label: '"Create New Report"' });
+        uiLog(`▶ ${report.name} — Create New Report…`);
+        clickEl(createBtn); // open the menu (its items are <a class="ddbMenuItemLink" href="…">)
+        const link = await waitFor(() =>
+          Array.from(document.querySelectorAll('a.ddbMenuItemLink'))
+            .find(a => (a.textContent || '').trim().toLowerCase() === report.reportType.toLowerCase()),
+          { timeout: 15000, label: `report type "${report.reportType}"` });
+        const href = link.getAttribute('href');
+        uiLog(`  choosing type: ${report.reportType} → ${href || '(click)'}`);
+        // Navigate straight to the menu item's URL — most reliable (a plain click
+        // on the <a>/<li> sometimes doesn't fire the dropdown's navigation).
+        if (href) location.href = new URL(href, location.href).href;
+        else clickEl(link);
+        return;
+      }
+      if (url.includes('/enh-srw-reportwriter.php')) {
+        await driveWizard(report);
+        return;
+      }
+      // Anywhere else → open the ARW.
+      uiLog(`→ Opening Advanced Report Writer for ${report.name}…`);
+      showBanner(`Opening Advanced Report Writer…`);
+      location.href = ARW_SAVED_URL;
+    } catch (err) {
+      if (err && err.aborted) { log('Wizard aborted'); hideBanner(); return; }
+      hideBanner();
+      uiLog(`✕ Skipped ${report.name} (wizard): ${err && err.message ? err.message : err}`);
+      clearWz(); advanceTo(idx + 1, queue);
+    }
+  }
+
   // ───────────────── Page-router state machine ─────────────────
   // Iterates over the run queue (the report keys the user ticked in the picker).
   async function dispatch() {
@@ -533,6 +903,8 @@
 
     const report = reportByKey(queue[idx]);
     if (!report) { setIndex(idx + 1); dispatch(); return; }
+
+    if (report.wizard) { await dispatchWizard(report, idx, queue); return; }
 
     if (!isOnReportPage(report)) {
       uiLog(`→ Opening ${report.name}…`);
@@ -583,6 +955,7 @@
     setQueue(keys);
     setIndex(0);
     clearAttempts();
+    clearWz();
     clearLog();
     uiLog(`Started ${keys.length} report(s): ${keys.map(k => (reportByKey(k) || {}).name || k).join(', ')} · 2025 + 2026`);
     setState(STATES.RUNNING);
@@ -594,6 +967,7 @@
     setIndex(0);
     clearQueue();
     clearAttempts();
+    clearWz();
     hideBanner();
     document.getElementById('histbot-picker')?.remove();
     log('Stopped / reset');
@@ -842,7 +1216,7 @@
       <div class="body">
         <div class="status">Status <span class="hb-state">Idle</span></div>
         <div class="hb-prog"></div>
-        <div class="note">Excel · all employees · 2025 + 2026<br>(a few more report types coming soon)</div>
+        <div class="note">🤖 Hi! I'm your report-downloading assistant.<br>Pick a section below and I'll grab those reports for you.</div>
         <div class="hb-starts"></div>
         <button class="inspect" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
         <button class="stop">⏹ Stop / reset</button>
