@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.8.2
+// @version      0.10.1
 // @description  Historical Data Bot — downloads Paycom Report-Center Time-Off reports as Excel for all employees, once per year (2025 + 2026). User opens Paycom, clicks Start; the bot navigates to each report's generate page, sets Excel + Select All employees + the date range, generates and downloads twice (previous year + current year). Separate from, and visually consistent with, the main "Paycom Bot" script. Currently: Employee Time-Off (184), Holiday/Blackout (185), Time-Off Audit (182), Time-Off Summary (186); Salary Time Off Absence Tracking (slug URL) pending. More historical-data sources to follow.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -46,11 +46,23 @@
     { section: 'Time & Attendance', key: 'total-hours-summary-by-allocation', name: 'Total Hours Summary by Allocation', rptId: 415, fileBase: 'TotalHoursSummaryByAllocation' },
     { section: 'Time & Attendance', key: 'total-hours-summary', name: 'Total Hours Summary', rptId: 414, fileBase: 'TotalHoursSummary' },
     { section: 'Time & Attendance', key: 'zero-hours-summary', name: 'Zero Hours Summary', rptId: 418, fileBase: 'ZeroHoursSummary' },
+    // ── Accrual ── (these pages can differ slightly; a report that doesn't fit
+    // the XLSX + Date-Range + Select-All pattern is skipped and logged.)
+    { section: 'Accrual', key: 'accrual-balances', name: 'Accrual Balances', rptId: 187, fileBase: 'AccrualBalances' },
+    { section: 'Accrual', key: 'accrual-detail', name: 'Accrual Detail', rptId: 188, fileBase: 'AccrualDetail' },
+    { section: 'Accrual', key: 'accrual-summary', name: 'Accrual Summary', rptId: 190, fileBase: 'AccrualSummary' },
+    // Slug-based snapshot report: XLSX-only, no Date Range, all-employees default,
+    // the "as of" date is fixed by Paycom — so it's a single file, no year loop.
+    {
+      section: 'Accrual', key: 'historical-accrual-data', name: 'Historical Accrual Data',
+      url: 'https://www.paycomonline.net/v4/cl/web.php/report-center/generate/historical-accrual-data',
+      slug: 'historical-accrual-data', snapshot: true, selectAll: false, fileBase: 'HistoricalAccrualData',
+    },
   ];
   const reportByKey = (k) => REPORTS.find(r => r.key === k);
   // Distinct sections, in first-seen order — each gets its own Start button.
   const SECTIONS = REPORTS.reduce((acc, r) => acc.includes(r.section) ? acc : acc.concat(r.section), []);
-  const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️' };
+  const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️', 'Accrual': '📈' };
 
   // Slug-based Report-Center reports still to wire (need slug navigation + their
   // own form handling, like the pending Salary Time Off Absence Tracking report):
@@ -60,6 +72,7 @@
   //   T&A:       Punch Change Request → punch-change-request-report
   //   T&A:       Timecard Correction Comparison → timecard-correction-comparison-report
   //   T&A:       Timecard Premium → timecard-premium-report
+  //   Accrual:   Accrual Projection → accrual-projection
 
   // Each report is downloaded once per date range — previous year + current year.
   const YEARS = [
@@ -67,7 +80,18 @@
     { label: '2026', from: '01/01/2026', to: '12/31/2026' },
   ];
 
-  const reportUrl = (id) => `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${id}`;
+  // A report is either standard (rptId → rpt-generate.php?rpt_id=N) or slug-based
+  // (url/slug → web.php/report-center/generate/<slug>).
+  function reportNavUrl(report) {
+    if (report.url) return report.url;
+    return `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${report.rptId}`;
+  }
+  function isOnReportPage(report) {
+    if (report.slug) return location.href.includes('/report-center/generate/' + report.slug);
+    if (report.rptId) return location.href.includes('/rpt-generate.php')
+      && new RegExp(`[?&]rpt_id=${report.rptId}(?:[&#]|$)`).test(location.href);
+    return false;
+  }
 
   // ───────────────── State (survives page reloads) ─────────────────
   const STATE_KEY = 'histbot.state';
@@ -457,6 +481,17 @@
     });
     uiLog(`▶ ${report.name}`);
 
+    // Snapshot reports (e.g. Historical Accrual Data): XLSX-only, no Date Range,
+    // all-employees by default → a single file, no per-year loop.
+    if (report.snapshot) {
+      if (!isRunning()) return;
+      showBanner(`${report.name}: setting up…`);
+      if (report.selectAll !== false) { await selectAllEmployees(); await sleep(400); }
+      await generateAndDownload(report.name, report.fileBase); // single file, no year suffix
+      showBanner(`✓ ${report.name} downloaded`, true);
+      return;
+    }
+
     for (const yr of YEARS) {
       if (!isRunning()) return;
       const tag = `${report.name} ${yr.label}`;
@@ -499,13 +534,10 @@
     const report = reportByKey(queue[idx]);
     if (!report) { setIndex(idx + 1); dispatch(); return; }
 
-    const onPage = location.href.includes('/rpt-generate.php')
-      && new RegExp(`[?&]rpt_id=${report.rptId}(?:[&#]|$)`).test(location.href);
-
-    if (!onPage) {
+    if (!isOnReportPage(report)) {
       uiLog(`→ Opening ${report.name}…`);
       showBanner(`Opening ${report.name}…`);
-      location.href = reportUrl(report.rptId);
+      location.href = reportNavUrl(report);
       return;
     }
 
@@ -540,7 +572,7 @@
     setIndex(next);
     if (next < queue.length) {
       const nextReport = reportByKey(queue[next]);
-      if (nextReport) { location.href = reportUrl(nextReport.rptId); return; }
+      if (nextReport) { location.href = reportNavUrl(nextReport); return; }
     }
     finishAll();
   }
@@ -834,12 +866,18 @@
     panelEl.querySelector('.inspect').addEventListener('click', startInspectCapture);
     panelEl.querySelector('.stop').addEventListener('click', stopRun);
 
-    // Minimize toggle.
+    // Minimize toggle — persisted so it survives Paycom's page reloads.
     const minBtn = panelEl.querySelector('.min-btn');
+    const applyMin = (min) => {
+      panelEl.classList.toggle('minimized', min);
+      minBtn.textContent = min ? '+' : '–';
+    };
     minBtn.addEventListener('click', () => {
-      panelEl.classList.toggle('minimized');
-      minBtn.textContent = panelEl.classList.contains('minimized') ? '+' : '–';
+      const min = !panelEl.classList.contains('minimized');
+      try { min ? localStorage.setItem('histbot.min', '1') : localStorage.removeItem('histbot.min'); } catch (_) {}
+      applyMin(min);
     });
+    applyMin(localStorage.getItem('histbot.min') === '1'); // restore on (re)build
 
     // Drag by the header (minimize button excluded).
     (function makeDraggable() {
