@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.18.2
+// @version      0.18.3
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -424,9 +424,20 @@
     return { badge, row, radio, link };
   }
 
+  // Report-center slug pages have NO #rpt_output container — their radios are
+  // plain <input name="rpt_output" value="xlsx"> with STRING values (legacy
+  // pages use numeric values inside #rpt_output). Verified live on the Salary
+  // Time Off Absence Tracking form (CSV was default → files came out CSV).
+  function slugOutputRadio(cls) {
+    const r = document.querySelector(`input[type="radio"][name="rpt_output"][value="${cls}"]`);
+    return (r && visible(r)) ? r : null;
+  }
+
   function isExcelSelected() {
     const r = outputRowFor('xlsx') || outputRowFor('xls');
-    return !!(r && r.radio && r.radio.checked);
+    if (r && r.radio) return !!r.radio.checked;
+    const s = slugOutputRadio('xlsx') || slugOutputRadio('xls');
+    return !!(s && s.checked);
   }
 
   function selectOutputFormat() {
@@ -441,6 +452,15 @@
       }
       log(`Output format → ${cls.toUpperCase()} (radio checked=${r.radio.checked})`);
       return r.radio.checked;
+    }
+    // Slug-page fallback (no #rpt_output): string-valued rpt_output radios.
+    for (const cls of ['xlsx', 'xls']) {
+      const s = slugOutputRadio(cls);
+      if (!s) continue;
+      if (!s.checked) { try { s.click(); } catch (_) {} }
+      if (!s.checked) { s.checked = true; s.dispatchEvent(new Event('change', { bubbles: true })); }
+      log(`Output format → ${cls.toUpperCase()} via slug radio (checked=${s.checked})`);
+      return s.checked;
     }
     log('WARN: XLSX/XLS output radio not found (#rpt_output missing?)');
     return false;
@@ -620,14 +640,32 @@
   async function tryReportCenterDownload(btn, fileName) {
     try {
       const $ = window.jQuery || window.$;
-      if (!$) return false;
-      const $btn = $(btn);
-      const item = $btn.closest('.queued-item');
-      if (!item.length) return false;
-      const id = item.data('id');
-      const tmpl = $btn.data('url');
-      if (!id || !tmpl || !String(tmpl).includes('{{ID}}')) return false;
-      let url = String(tmpl).replace('{{ID}}', id);
+      // Row id via jQuery data first, else the queued-report-<id> DOM id (works
+      // even when the page's jQuery data store isn't populated).
+      let id = '', tmpl = '';
+      if ($) {
+        const $btn = $(btn);
+        const item = $btn.closest('.queued-item');
+        if (item.length) id = String(item.data('id') || '');
+        tmpl = String($btn.data('url') || '');
+      }
+      if (!id) {
+        const row = btn.closest && btn.closest('[id^="queued-report-"]');
+        const m = row && /queued-report-(\d+)/.exec(row.id || '');
+        if (m) id = m[1];
+      }
+      if (!id) return false;
+      let url;
+      if (tmpl && tmpl.includes('{{ID}}')) {
+        url = tmpl.replace('{{ID}}', id);
+      } else if (location.href.includes('/report-center/generate/')) {
+        // Slug page whose Download button carries no data('url') template (seen
+        // live on Salary Time Off Absence Tracking): the download endpoint is
+        // fixed — web.php/report-center/download/<id> (verified 200 octet-stream).
+        url = '/v4/cl/web.php/report-center/download/' + id;
+      } else {
+        return false; // legacy rpt-generate page → use the transid+nonce path
+      }
       if (!/^https?:/i.test(url)) { if (!url.startsWith('/')) url = '/' + url; url = location.origin + url; }
       const ctrl = new AbortController();
       const killer = setTimeout(() => ctrl.abort(), 180000);
