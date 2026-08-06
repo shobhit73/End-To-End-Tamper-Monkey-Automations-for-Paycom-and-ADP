@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         UZIO Bot (Unified) — Setup Auto-Create + Bulk Employee History
 // @namespace    https://uzio.com/
-// @version      1.0.0
+// @version      1.0.2
 // @description  One unified "UZIO Bot" panel with two tabs. SETUP tab: reads the Earnings/Deductions/Contributions tabs of the Payroll Setup Helper .xlsx and auto-creates each in UZIO (positively-verified saves; pause / Save & Continue / Resume / Skip on failure). EMP HISTORY tab: paste visible Employee IDs and bulk-trigger "Download Employee Profile Change Report" for each. Both tools' features are preserved unchanged; only the outer panel is shared.
-// @match        *://*.uzio.com/*
+// @match        https://app.uzio.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      cdn.jsdelivr.net
@@ -78,7 +78,15 @@
     (document.head || document.documentElement).appendChild(s);
   }
 
+  // The bot is only for the employer portal — the panel must exist only while
+  // the URL starts with https://app.uzio.com/employer/ (not on login, employee
+  // self-serve, etc.). SPA route changes are caught by keepAlive(), which
+  // shows/hides the shell as the URL moves in and out of /employer/.
+  const ROUTE_PREFIX = 'https://app.uzio.com/employer/';
+  function routeAllowed() { return location.href.indexOf(ROUTE_PREFIX) === 0; }
+
   function build() {
+    if (!routeAllowed()) return;
     if (shell && document.body && document.body.contains(shell)) return;
     if (!document.body) return;
     injectStyle();
@@ -178,10 +186,17 @@
   }
 
   // Re-mount the shell if UZIO's SPA tears it out of the DOM (route changes,
-  // re-renders). Same persistence strategy the standalone bots used.
+  // re-renders). Same persistence strategy the standalone bots used. Also
+  // enforces the /employer/ route gate: off-route the shell is hidden (not
+  // removed, so panel state — loaded xlsx, logs — survives route flips).
   function keepAlive() {
     if (!document.body) return;
-    if (!(shell && document.body.contains(shell))) build();
+    const ok = routeAllowed();
+    if (shell && document.body.contains(shell)) {
+      shell.style.display = ok ? '' : 'none';
+      return;
+    }
+    if (ok) build();
   }
   try {
     const mo = new MutationObserver(keepAlive);
@@ -1148,19 +1163,28 @@
 
   // Positive proof a save actually took — independent of the (possibly hidden)
   // company list and of whether an inline error was captured:
-  //   • Save & Add more  → the form must RESET (its name field clears).
+  //   • Save & Add more  → the form RESETS (name field clears) — but some UZIO
+  //     builds CLOSE the form instead (seen on Contributions after the
+  //     post-save popup), so a closed form counts as proof too.
   //   • Save & Exit       → the form must CLOSE (its anchor element disappears).
   // A failed save leaves the form populated/open, so this reliably catches the
   // "no error shown but nothing saved" case that slipped through before.
+  // Returns { took, formOpen } so the caller knows whether the next row can
+  // reuse the open blank form or must click "Add …" again. The window is
+  // generous (heavy saves — popups, formula tiers — reset late); polling exits
+  // the moment either proof appears, so good saves pay nothing extra.
   async function verifySaveTookEffect(cfg, clickedAddMore) {
+    const windowMs = CONFIG.formResetMs + 6500;
     if (clickedAddMore) {
-      const ok = await waitFor(() => (cfg.readNameField() === '' ? true : null),
-                               CONFIG.formResetMs + 1500, 200);
-      return !!ok;
+      const hit = await waitFor(() => {
+        if (!deepById(cfg.formAnchorId)) return 'closed';
+        if (cfg.readNameField() === '') return 'reset';
+        return null;
+      }, windowMs, 200);
+      return { took: !!hit, formOpen: hit === 'reset' };
     }
-    const ok = await waitFor(() => (!deepById(cfg.formAnchorId) ? true : null),
-                             CONFIG.formResetMs + 1500, 200);
-    return !!ok;
+    const ok = await waitFor(() => (!deepById(cfg.formAnchorId) ? true : null), windowMs, 200);
+    return { took: !!ok, formOpen: false };
   }
 
   // True if the form looks saved/cleared after a manual save (Resume path):
@@ -1219,9 +1243,9 @@
 
         // ── success (claimed) → PROVE it actually saved ──────────────────────
         if (res && res.ok) {
-          const took = await verifySaveTookEffect(cfg, !!res.formAlreadyOpen);
-          if (took) {
-            created++; expected.push(name); formAlreadyOpen = !!res.formAlreadyOpen;
+          const v = await verifySaveTookEffect(cfg, !!res.formAlreadyOpen);
+          if (v.took) {
+            created++; expected.push(name); formAlreadyOpen = v.formOpen;
             continue;
           }
           // The form didn't reset/close → the save silently failed. Convert to a
@@ -1263,13 +1287,13 @@
               continue; // re-pause
             }
             // Prove it took (form reset/closed). If not, it's still blocked — pause.
-            const took = await verifySaveTookEffect(cfg, sres.formAlreadyOpen);
-            if (!took) {
+            const v2 = await verifySaveTookEffect(cfg, sres.formAlreadyOpen);
+            if (!v2.took) {
               const errs = captureValidationErrors();
               warn(`   Save still didn't take for "${name}"${errs ? ` — ${errs}` : ` (form didn't ${sres.formAlreadyOpen ? 'reset' : 'close'})`}. Fix it, then Save & Continue again — or Skip.`);
               continue; // re-pause
             }
-            created++; expected.push(name); formAlreadyOpen = !!sres.formAlreadyOpen;
+            created++; expected.push(name); formAlreadyOpen = v2.formOpen;
             log(`   ▶ saved "${name}" for you — continuing.`);
             resolved = true; break;
           }

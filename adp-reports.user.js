@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.6.2
-// @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
+// @version      1.6.4
+// @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
 // @run-at       document-idle
@@ -158,6 +158,25 @@
     "Contact Name (personal profile)",
     "Relationship Description (personal profile)",
     "Mobile Phone (personal profile)"
+  ];
+
+  const TAX_VALIDATION_COLUMNS = [
+    "Associate ID (Employment Profile)",
+    "Payroll Company Code (Employment Profile)",
+    "File Number (Employment Profile)",
+    "Legal First Name (Personal Profile)",
+    "Legal Last Name (Personal Profile)",
+    "Position Status (Employment Profile)",
+    "Primary Address: City (Personal Profile)",
+    "Primary Address: State / Territory Code (Personal Profile)",
+    "Worked in State Code (Tax Withholdings)",
+    "Lived in State Code (Tax Withholdings)",
+    "Worked in Local Jurisdiction Code (Tax Withholdings)",
+    "Worked in Local Jurisdiction Description (Tax Withholdings)",
+    "Lived in Local Jurisdiction Code (Tax Withholdings)",
+    "Lived in Local Jurisdiction Description (Tax Withholdings)",
+    "SUI/SDI Tax Code (Tax Withholdings)",
+    "SUI/SDI Tax Code Description (Tax Withholdings)"
   ];
 
   // Fields to select on the Payroll History "What's Displayed" panel.
@@ -1701,21 +1720,20 @@
   // ───────────────── payroll: appearance + quarterly download ─────────────────
 
   // Build the { quarter, label, from, to } descriptor for one quarter of a year.
-  // ADP requires start date +1 day and end date +1 day for correct filtering.
+  // Dates are the TRUE calendar quarter boundaries (1st of the quarter → last
+  // day of the quarter). An earlier +1-day-on-both-ends convention turned out
+  // to be a wrong understanding of ADP's filtering and was removed.
   function buildQuarterInfo(q, year) {
     const startMonth = (q - 1) * 3 + 1; // 1, 4, 7, 10
     const endMonth = q * 3;              // 3, 6, 9, 12
 
-    // From = quarter start + 1 day (e.g. Q1 = 01/02)
     const fromMM = String(startMonth).padStart(2, '0');
-    const from = fromMM + '/02/' + year;
+    const from = fromMM + '/01/' + year;
 
-    // To = quarter end + 1 day (rolls into next month's 1st)
-    let toMonth = endMonth + 1;
-    let toYear = year;
-    if (toMonth > 12) { toMonth = 1; toYear = year + 1; }
-    const toMM = String(toMonth).padStart(2, '0');
-    const to = toMM + '/01/' + toYear;
+    // Last day of the quarter's final month (new Date(y, m, 0) = last day of month m).
+    const lastDay = new Date(year, endMonth, 0).getDate();
+    const toMM = String(endMonth).padStart(2, '0');
+    const to = toMM + '/' + String(lastDay).padStart(2, '0') + '/' + year;
 
     return {
       quarter: q,                       // 1-4, used for selection + view logic
@@ -1729,15 +1747,15 @@
   // as a quarter task so the download loop runs it unchanged: quarter 0 is
   // always < the chosen current quarter, so it gets the closed-quarter
   // treatment (Associate ID sort, Group By, Totals Only, unmasked, custom
-  // dates). Dates follow the same +1-day ADP convention as the quarters.
+  // dates). Dates are the true calendar year boundaries, like the quarters.
   function buildYearInfo(year) {
     return {
       quarter: 0,                       // 0 = full-year task → always consolidated
       fullYear: true,
       year: year,
       label: 'FY ' + year,
-      from: '01/02/' + year,
-      to: '01/01/' + (year + 1)
+      from: '01/01/' + year,
+      to: '12/31/' + year
     };
   }
 
@@ -2574,6 +2592,16 @@
     });
   }
 
+  function downloadTaxValidation(setStatus) {
+    return runFullFlow({
+      type: 'Tax Validation',
+      columns: TAX_VALIDATION_COLUMNS,
+      title: 'Tax Validation Report',
+      unmaskSsn: false,
+      setStatus,
+    });
+  }
+
   // ───────────────── payroll history: pay-period dates → PriorPayroll filenames ─────────────────
   // Consolidated (Totals Only) quarter/FY files lack Pay Period Begin/End Date
   // and Pay Date, so the downstream Sanity Check tool reads them from the
@@ -2614,7 +2642,7 @@
   }
   function phCompact(s) { return (s || '').replace(/\//g, ''); }
 
-  // Real calendar bounds of a task (not the +1-day report dates).
+  // Real calendar bounds of a task (same boundaries the report dates now use).
   function phTaskRange(task, calendarYear) {
     if (task.fullYear) return { s: new Date(task.year, 0, 1), e: new Date(task.year, 11, 31) };
     const q = task.quarter;
@@ -3446,6 +3474,7 @@
     { key: 'census', icon: '👥', label: 'Census', fn: downloadCensus },
     { key: 'sitfit', icon: '🧾', label: 'SIT / FIT', fn: downloadSitFit },
     { key: 'license', icon: '📜', label: 'License / EC', fn: downloadLicenseEC },
+    { key: 'taxval', icon: '✅', label: 'Tax Validation', fn: downloadTaxValidation },
     { key: 'payhist', icon: '💰', label: 'Payroll History', fn: downloadPayrollHistory },
     { key: 'deduction', icon: '🧮', label: 'Deduction', fn: downloadDeductionReport },
     { key: 'directdeposit', icon: '🏦', label: 'Direct Deposit', fn: downloadDirectDeposit },
