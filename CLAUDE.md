@@ -4,7 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A single Tampermonkey userscript that drives end-to-end report downloads on Paycom, after the user has logged in manually in their normal Chrome. It is **not** a Node.js application — `package.json`, `package-lock.json`, `node_modules/`, and `user-data/` are leftover artifacts from an earlier Playwright-based attempt that was abandoned (see "Why a userscript" below). The only file that actually runs is [paycom-reports.user.js](paycom-reports.user.js).
+A family of Tampermonkey userscripts that drive end-to-end report downloads on Paycom/ADP and data entry on UZIO, after the user has logged in manually in their normal Chrome. It is **not** a Node.js application — `package.json`, `package-lock.json`, `node_modules/`, and `user-data/` are leftover artifacts from an earlier Playwright-based attempt that was abandoned (see "Why a userscript" below). Node IS useful for one thing: `node --check <file>.user.js` as a syntax gate before handing a modified script to the user.
+
+The scripts that actually run:
+
+- [paycom-reports.user.js](paycom-reports.user.js) — the original bot (Census wizard + Prior Payroll YTD loop + Scheduled Deductions + Tax Profile + doc download). Most of this document describes it.
+- [paycom-historical-data.user.js](paycom-historical-data.user.js) — "Historical Data Bot": batch-downloads ~30 historical reports (Time-Off / T&A / Accrual / HR & Audit / Payroll ARW) with clean file names. See "Historical Data Bot" section below.
+- [adp-reports.user.js](adp-reports.user.js) — ADP reports + export-documents automation.
+- [uzio-deductions.user.js](uzio-deductions.user.js) — reads a Payroll Setup Helper .xlsx and auto-creates Earnings/Deductions/Contributions in UZIO. Depends on the workbook's tab names (`Earnings`/`Deductions`/`Contributions`) and column headers (`Earning Name`/`UZIO Deduction Name`/`Contribution Name`) — never on file names.
 
 ## "Build" / "test" / "run"
 
@@ -80,6 +87,33 @@ The user always sees a confirmation dialog (`showTaskConfirmDialog`) listing eve
 ### The required-fields list
 
 The big `RAW_REQUIRED_FIELDS` template literal in the Census section was copy-pasted verbatim from the user's pre-existing standalone field-selection userscript. Preserve it exactly (including duplicates and odd casing — the matcher normalizes and de-duplicates) unless the user explicitly asks to edit it. Order is not significant; the matcher walks DOM-order checkboxes.
+
+## Historical Data Bot (`paycom-historical-data.user.js`)
+
+Same architecture as the main bot (localStorage state machine, page-router `dispatch()`, cooperative abort) but iterates a REPORTS config array: each entry is either `rptId`-based (`rpt-generate.php?rpt_id=N`) or slug-based (`web.php/report-center/generate/<slug>`), and either a **date-range** report (one file per year/range) or a **snapshot** (`snapshot: true`, single file, no Date Range).
+
+### Paycom has TWO download mechanisms — do not mix them up
+
+Discovered the hard way (Equifax TWN Feed kept saving under Paycom's default name, Aug 2026):
+
+1. **Legacy pages** (`rpt-generate.php?rpt_id=N`): file is fetched from `rpt-generateproc.php?session_nonce=<nonce>&download=1&transid=<n>`. The nonce is findable in hrefs/HTML; the transid comes from the `queued-report-<transid>` row id.
+2. **Report-center slug pages** (`web.php/report-center/generate/<slug>`): **`session_nonce` does not exist anywhere on these pages** — not in DOM, cookies, storage, or any network request. No amount of regex-broadening or XHR-sniffing will find one (v0.17.4 and v0.18.0 tried; both were dead ends). Paycom's own handler (`handleDownloadOrView` in `/v4/cl/js/report-center/generate.js`) reads a jQuery `data('url')` TEMPLATE off the Download button (`…/report-center/download/{{ID}}`), substitutes `{{ID}}` with the `.queued-item` row's `data('id')` (= transid), runs an OTP pre-check (`reportaction/one-time-password`, usually `isOTPRequired:false`), then navigates. These are **jQuery data-store values, not `data-*` attributes** — `el.dataset` is empty; you must read them via `window.jQuery(el).data(...)` (the script is `@grant none`, so the page's jQuery is directly accessible).
+
+`tryReportCenterDownload()` (v0.18.1) implements path 2 — substitute template + id, `fetch` with `credentials:'include'`, save the blob under OUR name — and `downloadNewest()` tries it FIRST, falling back to the legacy nonce path. Verified live: `GET web.php/report-center/download/<id>` → 200 `application/octet-stream`.
+
+### Snapshot vs date-range: verify on the live form, never assume
+
+A report whose form has no Date Range block must be `snapshot: true`, else `setDateRange` times out after 20s and the report is skipped ("Timed out waiting for Date Range inputs"). But the split is NOT uniform within a family — e.g. **Accrual Balances is a snapshot while Accrual Detail and Accrual Summary DO have a Date Range**. Marking a whole section snapshot broke Detail/Summary (v0.17.2, reverted in v0.17.3). Open the actual report page and look before flipping the flag.
+
+### Change protocol for these scripts (learned from a full revert)
+
+A batch of three simultaneous "fixes" (multi-tab lock + nonce regex + date-range fallback, v0.16) broke the script outright and had to be entirely reversed. Since then the working rules are:
+
+1. **One fix per version, test, then next.** Bump `@version` every time; hand the file to the user via file-send after every change.
+2. **Debug live in the user's logged-in Chrome** (claude-in-chrome MCP) instead of guessing from code: `performance.getEntriesByType('resource')` lists every request URL the page made; fetching Paycom's own JS bundles and grepping them reveals the real handlers. Minutes of live inspection beat hours of speculative patching.
+3. The Chrome extension **blocks returning raw HTML or query-string data** from the page (`[BLOCKED: Cookie/query string data]`). Return only attribute NAMES, URL pathnames, `searchParams.keys()`, and heavily masked snippets (`.replace(/[A-Za-z0-9+\/]{16,}/g,'MASKED')`).
+4. `node --check` the script after every edit — it catches template-literal/escaping mistakes before the user pastes a broken file.
+5. Known multi-tab hazard (unfixed by design): run state is shared localStorage, so **two open Paycom tabs both resume the queue and download everything twice**. The attempted tab-lock fix broke the script and was reverted; the operational rule is simply: keep ONE Paycom tab while the bot runs.
 
 ## Memory directory
 

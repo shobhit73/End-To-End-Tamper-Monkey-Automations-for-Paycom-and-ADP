@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.15.1
+// @version      0.18.1
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -38,6 +38,15 @@
     { section: 'Time-Off', key: 'holiday-blackout', name: 'Holiday/Blackout', rptId: 185, fileBase: 'HolidayBlackout' },
     { section: 'Time-Off', key: 'timeoff-audit', name: 'Time-Off Audit', rptId: 182, fileBase: 'TimeOffAudit' },
     { section: 'Time-Off', key: 'timeoff-summary', name: 'Time-Off Summary', rptId: 186, fileBase: 'TimeOffSummary' },
+    // Slug-based (report-center) but a normal date-range report → two files, one
+    // per year. This form has no Employees "Select All" (only "Show Selected");
+    // in the report center an empty selection means ALL employees, and the bot
+    // just logs a WARN there and proceeds.
+    {
+      section: 'Time-Off', key: 'salary-timeoff-absence-tracking', name: 'Salary Time Off Absence Tracking',
+      url: 'https://www.paycomonline.net/v4/cl/web.php/report-center/generate/salary-time-off-absence-tracking-report',
+      slug: 'salary-time-off-absence-tracking-report', fileBase: 'SalaryTimeOffAbsenceTracking',
+    },
     // ── Time & Attendance ──
     { section: 'Time & Attendance', key: 'break-lunch-duration', name: 'Break/Lunch Duration', rptId: 401, fileBase: 'BreakLunchDuration' },
     { section: 'Time & Attendance', key: 'employee-punch-change', name: 'Employee Punch Change', rptId: 419, fileBase: 'EmployeePunchChange' },
@@ -59,7 +68,7 @@
     { section: 'Time & Attendance', key: 'zero-hours-summary', name: 'Zero Hours Summary', rptId: 418, fileBase: 'ZeroHoursSummary' },
     // ── Accrual ── (these pages can differ slightly; a report that doesn't fit
     // the XLSX + Date-Range + Select-All pattern is skipped and logged.)
-    { section: 'Accrual', key: 'accrual-balances', name: 'Accrual Balances', rptId: 187, fileBase: 'AccrualBalances' },
+    { section: 'Accrual', key: 'accrual-balances', name: 'Accrual Balances', rptId: 187, snapshot: true, fileBase: 'AccrualBalances' },
     { section: 'Accrual', key: 'accrual-detail', name: 'Accrual Detail', rptId: 188, fileBase: 'AccrualDetail' },
     { section: 'Accrual', key: 'accrual-summary', name: 'Accrual Summary', rptId: 190, fileBase: 'AccrualSummary' },
     // Slug-based snapshot report: XLSX-only, no Date Range, all-employees default,
@@ -93,6 +102,45 @@
       section: 'HR & Audit', key: 'employee-accrual', name: 'Employee Accrual', rptId: 11,
       snapshot: true, fileBase: 'EmployeeAccrual',
     },
+    // Slug-based; the form has ONLY Output Format (no Date Range, no Employee
+    // Filters) → snapshot, no Select-All. Single file.
+    {
+      section: 'HR & Audit', key: 'equifax-twn-feed', name: 'Equifax TWN Feed',
+      url: 'https://www.paycomonline.net/v4/cl/web.php/report-center/generate/efx-twn-report',
+      slug: 'efx-twn-report', snapshot: true, selectAll: false, fileBase: 'EquifaxTWNFeed',
+    },
+    // No Date Range (Output Format + Employee Filters w/ Select All) → snapshot.
+    {
+      section: 'HR & Audit', key: 'employee-3rd-party-payee', name: 'Employee 3rd Party Payee', rptId: 10,
+      snapshot: true, fileBase: 'Employee3rdPartyPayee',
+    },
+    // No Date Range on the form (verified live) → snapshot, Select-All employees.
+    {
+      section: 'HR & Audit', key: 'employee-rates', name: 'Employee Rates', rptId: 17,
+      snapshot: true, fileBase: 'EmployeeRates',
+    },
+    // Verified live: no Date Range → snapshot, Select-All employees.
+    {
+      section: 'HR & Audit', key: 'employee-position', name: 'Employee Position', rptId: 153,
+      snapshot: true, fileBase: 'EmployeePosition',
+    },
+    {
+      section: 'HR & Audit', key: 'position-discrepancy', name: 'Position Discrepancy', rptId: 168,
+      snapshot: true, fileBase: 'PositionDiscrepancy',
+    },
+    // Verified live: HAS a Date Range (prdate1from/to) → default two-year loop.
+    {
+      section: 'HR & Audit', key: 'position-management-audit', name: 'Position Management Audit', rptId: 113,
+      fileBase: 'PositionManagementAudit',
+    },
+    // Slug-based; "As of Date" defaults to today and XLSX is preselected (the
+    // output pills live outside #rpt_output, so the format WARN in the log is
+    // harmless). No employee Select-All on this form → snapshot, single file.
+    {
+      section: 'HR & Audit', key: 'point-in-time', name: 'Point-in-Time',
+      url: 'https://www.paycomonline.net/v4/cl/web.php/report-center/generate/point-in-time',
+      slug: 'point-in-time', snapshot: true, selectAll: false, fileBase: 'PointInTime',
+    },
     {
       section: 'HR & Audit', key: 'changed-contact', name: 'Changed Contact', rptId: 132, fileBase: 'ChangedContact',
       ranges: HR_AUDIT_RANGES,
@@ -116,8 +164,7 @@
   const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️', 'Accrual': '📈', 'HR & Audit': '🧑‍💼', 'Payroll': '💵' };
 
   // Slug-based Report-Center reports still to wire (need slug navigation + their
-  // own form handling, like the pending Salary Time Off Absence Tracking report):
-  //   Time-Off:  Salary Time Off Absence Tracking → salary-time-off-absence-tracking-report
+  // own form handling):
   //   T&A:       Calc Detail → calc-detail-report
   //   T&A:       Estimated Qualified Premiums CSV → estimated-qualified-overtime-ta-report
   //   T&A:       Punch Change Request → punch-change-request-report
@@ -402,9 +449,15 @@
     if (r && !r.checked) { clickEl(r); log('Date Range mode selected'); }
   }
 
-  function setDateRange(from, to) {
-    const dr = findDateRangeInputs();
-    if (!dr || !dr.from || !dr.to) throw new Error('Date Range inputs not found');
+  // The Generate button can render BEFORE the Date Range block on some forms
+  // (Employee Dates got skipped in the same second it loaded), so wait for the
+  // inputs instead of a one-shot lookup — re-asserting Date Range mode each poll.
+  async function setDateRange(from, to) {
+    const dr = await waitFor(() => {
+      ensureDateRangeMode();
+      const d = findDateRangeInputs();
+      return (d && d.from && d.to) ? d : null;
+    }, { timeout: 20000, interval: 400, label: 'Date Range inputs' });
     setInputValue(dr.from, from);
     setInputValue(dr.to, to);
     log(`Date range set: ${from} → ${to}`);
@@ -464,14 +517,48 @@
   // that transid and abort the request (so Paycom's own default-named download
   // never fires), then fetch rpt-generateproc.php?…&transid=N ourselves and save
   // the blob under our name. Falls back to a plain click if anything fails.
+  // Passive nonce sniffer: Paycom's own JS carries session_nonce in its XHR /
+  // fetch URLs (report generation, queue polling). Capture it as it flies by so
+  // slug forms (e.g. Equifax TWN Feed) that never render the nonce in the DOM
+  // still get named downloads. Purely observational — requests are never
+  // modified, blocked, or delayed.
+  let CAPTURED_NONCE = '';
+  const NONCE_RE = /session_nonce=([A-Za-z0-9._\-]+)/;
+  try {
+    const _xhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      try { const m = NONCE_RE.exec(String(url || '')); if (m) CAPTURED_NONCE = m[1]; } catch (_) {}
+      return _xhrOpen.apply(this, arguments);
+    };
+    const _fetch = window.fetch;
+    if (_fetch) window.fetch = function (input) {
+      try {
+        const u = (typeof input === 'string') ? input : ((input && input.url) || '');
+        const m = NONCE_RE.exec(u); if (m) CAPTURED_NONCE = m[1];
+      } catch (_) {}
+      return _fetch.apply(this, arguments);
+    };
+  } catch (_) { /* sniffer is best-effort; never break the page */ }
+
   function getSessionNonce() {
-    const re = /session_nonce=([A-Za-z0-9._\-]+)/;
-    for (const el of document.querySelectorAll('a[href*="session_nonce="], form[action*="session_nonce="]')) {
-      const m = ((el.getAttribute('href') || '') + ' ' + (el.getAttribute('action') || '')).match(re);
-      if (m) return m[1];
+    if (CAPTURED_NONCE) return CAPTURED_NONCE; // freshest: sniffed from Paycom's own requests
+    // Paycom exposes session_nonce in different shapes across report forms:
+    //   href/action query param:  session_nonce=abc
+    //   JS / JSON in a <script>:   session_nonce: "abc"  |  "session_nonce":"abc"
+    //   hidden input:              <input name="session_nonce" value="abc">
+    // The old code matched only the bare `session_nonce=` param, so slug forms
+    // (e.g. Equifax TWN Feed) fell back to Paycom's default-named download.
+    const patterns = [
+      /session_nonce=([A-Za-z0-9._\-]+)/,
+      /["']?session_nonce["']?\s*[:=]\s*["']([A-Za-z0-9._\-]+)["']/i,
+      /session_nonce["'\s:=]+([A-Za-z0-9._\-]{6,})/i,
+    ];
+    const tryHay = (hay) => { for (const re of patterns) { const m = (hay || '').match(re); if (m) return m[1]; } return ''; };
+    for (const el of document.querySelectorAll('a[href*="session_nonce"], form[action*="session_nonce"], input[name*="session_nonce"]')) {
+      const hit = tryHay((el.getAttribute('href') || '') + ' ' + (el.getAttribute('action') || '') + ' ' + (el.value || ''));
+      if (hit) return hit;
     }
-    const m = (location.href + ' ' + (document.documentElement.innerHTML || '')).match(re);
-    return m ? m[1] : '';
+    return tryHay(location.href + ' ' + (document.documentElement.innerHTML || '') + ' ' + (document.cookie || ''));
   }
 
   function saveBlob(blob, name) {
@@ -520,11 +607,50 @@
     return '';
   }
 
+  // Report-center pages (slug reports like Equifax TWN Feed) have NO
+  // session_nonce anywhere — their Download works differently: the Download
+  // button carries a jQuery data('url') template ('…/report-center/download/{{ID}}')
+  // and the .queued-item row carries data('id') (the transid). Paycom's own
+  // handler substitutes and navigates. We substitute, fetch with cookies, and
+  // save under OUR name. Verified live: GET web.php/report-center/download/<id>
+  // → 200 application/octet-stream. Returns true on success; false = caller
+  // falls back to the legacy transid+nonce path.
+  async function tryReportCenterDownload(btn, fileName) {
+    try {
+      const $ = window.jQuery || window.$;
+      if (!$) return false;
+      const $btn = $(btn);
+      const item = $btn.closest('.queued-item');
+      if (!item.length) return false;
+      const id = item.data('id');
+      const tmpl = $btn.data('url');
+      if (!id || !tmpl || !String(tmpl).includes('{{ID}}')) return false;
+      let url = String(tmpl).replace('{{ID}}', id);
+      if (!/^https?:/i.test(url)) { if (!url.startsWith('/')) url = '/' + url; url = location.origin + url; }
+      const ctrl = new AbortController();
+      const killer = setTimeout(() => ctrl.abort(), 180000);
+      const resp = await fetch(url, { credentials: 'include', signal: ctrl.signal });
+      clearTimeout(killer);
+      if (!resp.ok) { log('report-center download HTTP ' + resp.status + ' — falling back'); return false; }
+      const blob = await resp.blob();
+      if (blob.size <= 512 || /text\/html/i.test(blob.type || '')) { log('report-center download gave unexpected content — falling back'); return false; }
+      saveBlob(blob, fileName);
+      uiLog(`✓ Saved ${fileName} (${Math.round(blob.size / 1024)} KB)`);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   async function downloadNewest(baseName) {
     const dls = getDownloadButtons().sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
     const btn = dls[0];
     if (!btn) throw new Error('No Download button found');
     const fileName = `${baseName}.${extForButton(btn)}`;
+
+    // Report-center style first (slug reports); falls through to legacy path.
+    if (await tryReportCenterDownload(btn, fileName)) { return; }
+
     const transid = transidForButton(btn);
     const nonce = getSessionNonce();
 
@@ -608,9 +734,7 @@
       const from = resolveDate(rng.from), to = resolveDate(rng.to);
       const tag = `${report.name} ${rng.label}`;
       showBanner(`${tag}: setting up…`);
-      ensureDateRangeMode();
-      await sleep(200);
-      setDateRange(from, to);
+      await setDateRange(from, to); // waits for the inputs (they can render late)
       await sleep(300);
       if (report.selectAll !== false) { await selectAllEmployees(); await sleep(400); }
       await tickChecks(report.checks); // extra option checkboxes, e.g. Show Effective Date
@@ -1199,6 +1323,10 @@
         #histbot-panel .hb-loglabel{font-size:10px;font-weight:800;letter-spacing:.8px;color:rgba(202,210,197,.6);
           text-transform:uppercase;margin:10px 0 4px;display:flex;align-items:center;gap:8px}
         #histbot-panel .hb-loglabel::after{content:'';flex:1;height:1px;background:rgba(202,210,197,.18)}
+        #histbot-panel .hb-copylog{display:inline-flex;align-items:center;width:auto;margin:0;padding:2px 8px;
+          font-size:10px;font-weight:700;letter-spacing:.4px;border-radius:6px;cursor:pointer;
+          background:rgba(132,169,140,.15);color:#cad2c5;border:1px solid rgba(132,169,140,.35)}
+        #histbot-panel .hb-copylog:hover{transform:none;box-shadow:none;background:rgba(132,169,140,.3)}
         #histbot-panel .hb-log{height:118px;overflow:auto;padding:7px 9px;border-radius:9px;
           background:rgba(20,28,26,.6);border:1px solid rgba(132,169,140,.25);color:#c9d6cc;
           font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
@@ -1233,7 +1361,7 @@
         <div class="hb-starts"></div>
         <button class="inspect" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
         <button class="stop">⏹ Stop / reset</button>
-        <div class="hb-loglabel">Activity</div>
+        <div class="hb-loglabel">Activity <button class="hb-copylog" title="Copy the whole activity log to the clipboard">📋 Copy</button></div>
         <div class="hb-log"></div>
       </div>
     `;
@@ -1252,6 +1380,18 @@
 
     panelEl.querySelector('.inspect').addEventListener('click', startInspectCapture);
     panelEl.querySelector('.stop').addEventListener('click', stopRun);
+    panelEl.querySelector('.hb-copylog').addEventListener('click', () => {
+      const btn = panelEl.querySelector('.hb-copylog');
+      const txt = getLog().join('\n');
+      const done = (ok) => { btn.textContent = ok ? '✓ Copied' : '✕ Copy failed'; setTimeout(() => { btn.textContent = '📋 Copy'; }, 1600); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(() => done(true), () => done(false));
+      } else {
+        const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta);
+        ta.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (_) {}
+        ta.remove(); done(ok);
+      }
+    });
 
     // Minimize toggle — persisted so it survives Paycom's page reloads.
     const minBtn = panelEl.querySelector('.min-btn');
