@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.18.1
+// @version      0.18.2
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -88,9 +88,11 @@
       ranges: HR_AUDIT_RANGES,
       checks: ['Show Effective Date'], // tick this option before generating
     },
+    // Verified live (Aug 2026): this form has NO Date Range block at all — only
+    // Output Format + Employee Filters — so it's a snapshot, not a range report.
     {
-      section: 'HR & Audit', key: 'employee-dates', name: 'Employee Dates', rptId: 1, fileBase: 'EmployeeDates',
-      ranges: HR_AUDIT_RANGES,
+      section: 'HR & Audit', key: 'employee-dates', name: 'Employee Dates', rptId: 1,
+      snapshot: true, fileBase: 'EmployeeDates',
     },
     {
       section: 'HR & Audit', key: 'rate-history', name: 'Rate History', rptId: 25, fileBase: 'RateHistory',
