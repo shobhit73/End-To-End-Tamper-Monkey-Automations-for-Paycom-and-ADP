@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.1.3
+// @version      1.2.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -34,7 +34,7 @@
   // ───────────────────────────── constants ─────────────────────────────
 
   const PANEL_ID = 'hd-bot-panel';
-  const SCRIPT_VERSION = '1.1.3';
+  const SCRIPT_VERSION = '1.2.0';
 
   const YEARS_KEY = 'historicalBot.adp.years';
 
@@ -57,6 +57,14 @@
     'Time Off Request',
   ];
   const TIMEOFF_KEY = 'historicalBot.adp.timeoff';
+
+  // These two Time Off reports need an extra "Who Appears on This Report" pass
+  // — Employee List set to All Employees — before Run as Excel. The other two
+  // must NOT get it; their step list is unchanged.
+  const TIME_OFF_WHO_APPEARS = [
+    'Time Off Request',
+    'Time Off Policy Assignment',
+  ];
 
   // Extra settle before click-heavy Dojo steps. The Standard Reports pages are
   // slow to wire up their widgets; without this pad, clicks land on dead nodes
@@ -1194,6 +1202,123 @@
     return false;
   }
 
+  // "Who Appears on This Report" → Employee List → All Employees → Save.
+  // Only two of the Time Off reports need this; see TIME_OFF_WHO_APPEARS.
+  // Company Code / Home Department / Location filters are left untouched.
+  async function stepConfigureWhoAppears() {
+    // 1. Open the panel.
+    let target = null;
+    for (let i = 0; i < 20 && !target; i++) {
+      const clickables = deepQueryAll('a, button, [role="button"], [role="link"], sdf-button').filter(visible);
+      for (const el of clickables) {
+        if ((el.textContent || '').trim().includes('Who Appears on This Report')) { target = el; break; }
+      }
+      if (!target) await sleep(500);
+    }
+    if (!target) {
+      logError('"Who Appears on This Report" not found');
+      return false;
+    }
+    clickEl(target);
+    logSuccess('Clicked "Who Appears on This Report"');
+    await sleep(2000);
+
+    // 2. Expand Employee List — but ONLY if it is collapsed. ADP often renders
+    // this section already open, and clicking the header then closes it.
+    const selectVisible = () => deepQueryAll('#employeeFilterList, [id*="employeeFilter"], .MDFSelectBox__input')
+      .filter(visible).length > 0;
+
+    if (selectVisible()) {
+      logInfo('Employee List section is already expanded — not toggling it');
+    } else {
+      let empList = null;
+      for (let i = 0; i < 20 && !empList; i++) {
+        const els = deepQueryAll('div, span, a, button, [role="button"]').filter(visible);
+        for (const el of els) {
+          if ((el.textContent || '').trim() === 'Employee List') { empList = el; break; }
+        }
+        if (!empList) await sleep(500);
+      }
+      if (!empList) {
+        logError('"Employee List" section not found');
+        return false;
+      }
+      clickEl(empList);
+      logInfo('Expanded Employee List');
+      await sleep(1500);
+    }
+
+    // 3. Open the react-select dropdown.
+    let chevron = null;
+    const svgs = deepQueryAll('svg.css-8mmkcg, svg[class*="css-"]').filter(visible);
+    if (svgs.length > 0) {
+      chevron = svgs[0].closest('[class*="indicator"], [class*="dropdown"]') || svgs[0].parentElement;
+    }
+    if (!chevron) {
+      const selectInputs = deepQueryAll('#employeeFilterList, [id*="employeeFilter"], .MDFSelectBox__input').filter(visible);
+      if (selectInputs.length > 0) chevron = selectInputs[0];
+    }
+    if (chevron) {
+      clickEl(chevron);
+      logInfo('Opened the Employee List dropdown');
+      await sleep(1000);
+    } else {
+      logWarn('Dropdown control not found — trying to type into the input instead');
+    }
+
+    // 4. Pick "All Employees". Harmless if it is already the current value.
+    let found = false;
+    for (let attempt = 0; attempt < 10 && !found; attempt++) {
+      const options = deepQueryAll('[role="option"], [class*="option"], li, div[class*="menu"] div').filter(visible);
+      for (const opt of options) {
+        if ((opt.textContent || '').trim() === 'All Employees') {
+          clickEl(opt);
+          logSuccess('Selected "All Employees"');
+          found = true;
+          break;
+        }
+      }
+      if (!found) await sleep(500);
+    }
+
+    if (!found) {
+      const input = deepQueryAll('#employeeFilterList').filter(visible)[0];
+      if (input) {
+        input.focus();
+        setReactInputValue(input, 'All Employees');
+        await sleep(1000);
+        const options = deepQueryAll('[role="option"], [class*="option"]').filter(visible);
+        for (const opt of options) {
+          if ((opt.textContent || '').trim() === 'All Employees') {
+            clickEl(opt);
+            logSuccess('Selected "All Employees" (via type filter)');
+            found = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!found) {
+      logError('"All Employees" option not found in the Employee List dropdown');
+      return false;
+    }
+    await sleep(1000);
+
+    // 5. Save.
+    const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+    for (const btn of saveBtns) {
+      if (normalize(btn.textContent) === 'save') {
+        clickEl(btn);
+        logSuccess('Clicked Save on Who Appears');
+        await sleep(1500);
+        return true;
+      }
+    }
+    logError('Save button not found on Who Appears');
+    return false;
+  }
+
   // Step 8: submit the report.
   async function stepClickRunAsExcel() {
     let btn = null;
@@ -1612,7 +1737,7 @@
   // top each time, because running a report navigates away to Reports Output.
   function timeOffSteps(reportName, fromDate, toDate) {
     const fileName = safeFileName(reportName) + '.xlsx';
-    return [
+    const steps = [
       { name: 'Open Reports & Analytics menu', fn: () => stepOpenReportsMenu() },
       { name: 'Open All Standard Reports', fn: () => stepClickAllStandardReports() },
       { name: 'Open the ' + TIME_OFF_CATEGORY + ' category', fn: async () => { await sleep(DOJO_PAD); return stepClickStandardCategory(TIME_OFF_CATEGORY); } },
@@ -1639,6 +1764,17 @@
       { name: 'Select all fields', fn: () => stepSelectAllDisplayFields() },
       { name: 'Open Appearance settings', fn: async () => { await sleep(2000 + DOJO_PAD); return stepClickAppearanceSettings(); } },
       { name: 'Set date range ' + fromDate + ' → ' + toDate, fn: () => stepConfigureDateRangeOnly(fromDate, toDate) },
+    ];
+
+    // Extra pass for Time Off Request and Time Off Policy Assignment only.
+    if (TIME_OFF_WHO_APPEARS.some(n => normalize(n) === normalize(reportName))) {
+      steps.push({
+        name: 'Who Appears → All Employees',
+        fn: async () => { await sleep(1500); return stepConfigureWhoAppears(); },
+      });
+    }
+
+    steps.push(
       { name: 'Run as Excel', fn: async () => { await sleep(1500 + DOJO_PAD); return stepClickRunAsExcel(); } },
       { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
       {
@@ -1654,8 +1790,10 @@
             return true; // the report ran; a naming failure must not fail it
           }
         }
-      },
-    ];
+      }
+    );
+
+    return steps;
   }
 
   // ────────────────────────────── the flow ──────────────────────────────
