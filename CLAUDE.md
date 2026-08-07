@@ -113,7 +113,21 @@ A batch of three simultaneous "fixes" (multi-tab lock + nonce regex + date-range
 2. **Debug live in the user's logged-in Chrome** (claude-in-chrome MCP) instead of guessing from code: `performance.getEntriesByType('resource')` lists every request URL the page made; fetching Paycom's own JS bundles and grepping them reveals the real handlers. Minutes of live inspection beat hours of speculative patching.
 3. The Chrome extension **blocks returning raw HTML or query-string data** from the page (`[BLOCKED: Cookie/query string data]`). Return only attribute NAMES, URL pathnames, `searchParams.keys()`, and heavily masked snippets (`.replace(/[A-Za-z0-9+\/]{16,}/g,'MASKED')`).
 4. `node --check` the script after every edit — it catches template-literal/escaping mistakes before the user pastes a broken file.
-5. Known multi-tab hazard (unfixed by design): run state is shared localStorage, so **two open Paycom tabs both resume the queue and download everything twice**. The attempted tab-lock fix broke the script and was reverted; the operational rule is simply: keep ONE Paycom tab while the bot runs.
+5. Multi-tab hazard — now FIXED in code (v0.21.0+): a sessionStorage tab-id + localStorage heartbeat lock makes one tab the "driver"; other tabs stand by and take over only if the heartbeat goes stale. (An earlier v0.16 tab-lock attempt broke the script; this minimal heartbeat version works.)
+
+### Duplicate-instance war stories (Aug 2026, the Employee Punch Change saga)
+
+Every one of these produced the SAME symptom — doubled log lines / doubled generates / a panel that survives deletion — and each had a different cause. Check them in this order:
+
+1. **Tampermonkey BETA had a second copy of the script.** Two userscript-manager extensions (stable + beta) each injected once: two panels, 14 generates instead of 7, and a panel that persisted after the script was "deleted" (from the other manager). Diagnose with the TM toolbar-icon popup (lists scripts active on the page) or `chrome://extensions`. The script now also sets `window.__histbotLoaded` and exits if it's already set.
+2. **Paycom embeds same-origin iframes matching `/v4/cl/*`** — Tampermonkey injects into them too. The script now exits unless `window.top === window.self`.
+3. A deleted script's already-injected instance **stays alive until the tab reloads** — "deleted it but the panel is still there" usually just means the tab wasn't refreshed.
+
+### Serial > pipelined for multi-range downloads
+
+The queue-all-generates-then-harvest pipeline (v0.20.x–0.21.x) was reverted after repeatedly mislabeling files: row→label mapping broke via late-rendering junk queue rows, lazy tab panes, and the duplicate instances above. **Strictly serial** (generate one range → wait for ITS download → save → next) cannot mix labels up and is the shipped design. Reports whose full year is too large get quarterly `ranges` (`QUARTER_RANGES`) plus `pickRanges: true`, which pops a checkbox dialog so an interrupted run can resume with only the missing quarters. Download-button wait is 30 min (a ~71k-row quarter genuinely exceeded 10).
+
+Startup log line shows the running version (`Started 1 report(s) [v0.23.0]: …`) — check it FIRST when behavior doesn't match the code you just shipped; a stale Tampermonkey paste cost a debugging round.
 
 ## Memory directory
 

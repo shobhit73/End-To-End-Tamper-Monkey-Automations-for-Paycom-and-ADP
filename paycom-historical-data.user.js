@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.18.3
+// @version      0.23.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -10,6 +10,18 @@
 
 (function () {
   'use strict';
+
+  // ── Duplicate-instance guards ──
+  // 1) IFRAMES: Paycom pages embed same-origin iframes whose URLs also match
+  //    @match, so Tampermonkey injects a SECOND copy of this script inside the
+  //    frame — a second panel appears and every generate/download fires twice
+  //    (the iframe has its own window, and sessionStorage is shared, so neither
+  //    the window flag nor the tab lock can catch it). Only the top window runs.
+  try { if (window.top !== window.self) return; } catch (_) { return; }
+  // 2) Same-window double copy (e.g. two Tampermonkey entries): @grant none →
+  //    both copies share the page's window, so the second one exits here.
+  if (window.__histbotLoaded) { console.warn('[HistBot] duplicate script copy detected — this copy is standing down. Delete the extra entry in the Tampermonkey dashboard.'); return; }
+  window.__histbotLoaded = true;
 
   // ───────────────── Config ─────────────────
   // Reports to download, in order. Add the remaining four here once their
@@ -31,6 +43,19 @@
   const STARTYEAR = THISYEAR - 3;
   // HR & Audit reports share one range: Jan 1 of LAST year → today.
   const HR_AUDIT_RANGES = [{ label: `${LASTYEAR}-to-date`, from: `01/01/${LASTYEAR}`, to: 'TODAY' }];
+  // Quarterly ranges for reports whose full-year data is too large (e.g.
+  // Employee Punch Change): last + current year split per quarter, skipping
+  // quarters that haven't started yet. Files: <base>_2025-Q1.xlsx, …
+  const mmddyyyy = (d) => `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}`;
+  const QUARTER_RANGES = (() => {
+    const now = new Date(), out = [];
+    for (const y of [LASTYEAR, THISYEAR]) for (let q = 0; q < 4; q++) {
+      const from = new Date(y, q * 3, 1);
+      if (from > now) break;
+      out.push({ label: `${y}-Q${q + 1}`, from: mmddyyyy(from), to: mmddyyyy(new Date(y, q * 3 + 3, 0)) });
+    }
+    return out;
+  })();
 
   const REPORTS = [
     // ── Time-Off ──
@@ -49,7 +74,10 @@
     },
     // ── Time & Attendance ──
     { section: 'Time & Attendance', key: 'break-lunch-duration', name: 'Break/Lunch Duration', rptId: 401, fileBase: 'BreakLunchDuration' },
-    { section: 'Time & Attendance', key: 'employee-punch-change', name: 'Employee Punch Change', rptId: 419, fileBase: 'EmployeePunchChange' },
+    // Full-year data is too large for this one — pull it quarter by quarter.
+    // pickRanges: a dialog asks WHICH quarters to run (untick the ones already
+    // downloaded instead of re-running all seven after a partial run).
+    { section: 'Time & Attendance', key: 'employee-punch-change', name: 'Employee Punch Change', rptId: 419, fileBase: 'EmployeePunchChange', ranges: QUARTER_RANGES, pickRanges: true },
     { section: 'Time & Attendance', key: 'employee-rates-by-allocation', name: 'Employee Rates by Allocation', rptId: 405, fileBase: 'EmployeeRatesByAllocation' },
     { section: 'Time & Attendance', key: 'hours-worked-vs-threshold', name: 'Hours Worked vs Threshold', rptId: 406, fileBase: 'HoursWorkedVsThreshold' },
     { section: 'Time & Attendance', key: 'labor-allocation', name: 'Labor Allocation', rptId: 407, fileBase: 'LaborAllocation' },
@@ -266,6 +294,36 @@
     if (el) { el.textContent = getLog().join('\n'); el.scrollTop = el.scrollHeight; }
   }
 
+  // ───────────────── Single-tab lock ─────────────────
+  // Run state lives in shared localStorage, so TWO open Paycom tabs both resume
+  // the queue and everything fires twice (7 generates became 14 — "found 15").
+  // Only the lock-holding tab drives; any other tab stands by and takes over
+  // only if the driver's heartbeat goes stale (tab closed / crashed).
+  const TABID_KEY = 'histbot.tabid'; // sessionStorage: stable per TAB, survives reloads
+  let TAB_ID = '';
+  try {
+    TAB_ID = sessionStorage.getItem(TABID_KEY) || String(Math.random()).slice(2, 12);
+    sessionStorage.setItem(TABID_KEY, TAB_ID);
+  } catch (_) { TAB_ID = String(Math.random()).slice(2, 12); }
+  const LOCK_KEY = 'histbot.lock';
+  const readLock = () => { try { return JSON.parse(localStorage.getItem(LOCK_KEY) || 'null'); } catch (_) { return null; } };
+  const heartbeat = () => { try { localStorage.setItem(LOCK_KEY, JSON.stringify({ id: TAB_ID, ts: Date.now() })); } catch (_) {} };
+  function iAmDriver() {
+    const l = readLock();
+    if (!l || l.id === TAB_ID) return true;
+    return (Date.now() - (l.ts || 0)) > 8000; // stale lock → safe to take over
+  }
+  let hbTimer = null;
+  function becomeDriver() {
+    heartbeat();
+    if (!hbTimer) hbTimer = setInterval(heartbeat, 2000);
+  }
+  function releaseDriver() {
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    const l = readLock();
+    if (l && l.id === TAB_ID) { try { localStorage.removeItem(LOCK_KEY); } catch (_) {} }
+  }
+
   // ───────────────── Cooperative abort ─────────────────
   // Stop simply flips state to IDLE; every long wait polls this and bails.
   const shouldAbort = () => !isRunning();
@@ -416,7 +474,10 @@
   // (Paycom's own handler) AND hard-set the radio + fire change, matching the
   // format by its .filetype class (unambiguous).
   function outputRowFor(cls) {
-    const badge = document.querySelector(`#rpt_output .filetype.${cls}`);
+    // Prefer a VISIBLE badge — some pages keep hidden duplicate copies in the
+    // DOM (same trap as the ARW wizard), and ticking a hidden copy does nothing.
+    const badges = Array.from(document.querySelectorAll(`#rpt_output .filetype.${cls}`));
+    const badge = badges.find(visible) || badges[0];
     if (!badge) return null;
     const row = badge.closest('.smallMarginBottom') || badge.parentElement;
     const radio = row && row.querySelector('input[type="radio"][name="rpt_output"]');
@@ -686,6 +747,11 @@
     const dls = getDownloadButtons().sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
     const btn = dls[0];
     if (!btn) throw new Error('No Download button found');
+    return downloadViaButton(btn, baseName);
+  }
+
+  // Download the report behind a SPECIFIC Download button, saved as <baseName>.<ext>.
+  async function downloadViaButton(btn, baseName) {
     const fileName = `${baseName}.${extForButton(btn)}`;
 
     // Report-center style first (slug reports); falls through to legacy path.
@@ -724,26 +790,283 @@
     clickEl(btn); // fallback: Paycom's own download (default filename)
   }
 
+  // Is there any XLSX/XLS output control on this form at all? (Some fixed-format
+  // pages have none — those generate XLSX regardless and must not be blocked.)
+  const hasExcelOutputControl = () =>
+    !!(outputRowFor('xlsx') || outputRowFor('xls') || slugOutputRadio('xlsx') || slugOutputRadio('xls'));
+
+  // Set Output Format LAST — right before Generate. "Select All" employees and
+  // date changes re-render the form and reset Output Format back to HTML.
+  // On slow forms (Employee Punch Change, 395 employees) that re-render can
+  // land AFTER a one-shot set + check, so LOCK the format: set, settle, and
+  // re-verify until XLSX survives the settle window. Generating in HTML is
+  // never acceptable — Paycom redirects HTML reports to a view page, which
+  // derails the whole queue — so if we can't lock XLSX, skip this report.
+  async function lockExcelOutput(tag) {
+    if (hasExcelOutputControl()) {
+      let locked = false;
+      for (let i = 0; i < 5 && !locked; i++) {
+        selectOutputFormat();
+        await sleep(400);
+        if (isExcelSelected()) {
+          await sleep(700); // survive a late re-render
+          locked = isExcelSelected();
+        }
+        if (!locked) log(`Excel not locked yet (try ${i + 1}/5)`);
+      }
+      if (!locked) throw new Error(`${tag}: could not lock XLSX output format (form keeps reverting)`);
+    } else {
+      selectOutputFormat(); // logs a WARN; fixed-format pages proceed fine
+      await sleep(300);
+    }
+  }
+
+  // Click Generate with a FINAL fully-synchronous format assert — no awaits
+  // between the check and the click, so no async re-render can flip the format
+  // back to HTML in between.
+  function clickGenerateAsserted(tag, gen) {
+    if (hasExcelOutputControl() && !isExcelSelected()) {
+      selectOutputFormat();
+      if (!isExcelSelected()) throw new Error(`${tag}: XLSX reverted right before Generate — skipped to avoid an HTML run`);
+    }
+    clickEl(gen);
+  }
+
   async function generateAndDownload(tag, baseName) {
-    // Set Output Format LAST — right before Generate. "Select All" employees and
-    // date changes re-render the form and reset Output Format back to HTML, so
-    // setting it here (after those steps) guarantees XLSX at generation time.
-    selectOutputFormat();
-    await sleep(300);
-    if (!isExcelSelected()) { log('Excel not selected — retrying'); selectOutputFormat(); await sleep(400); }
-    if (!isExcelSelected()) log('WARN: Excel still not confirmed selected right before Generate');
+    await lockExcelOutput(tag);
 
     const initial = getDownloadButtons().length;
     const gen = findGenerateReportButton();
     if (!gen) throw new Error(`${tag}: Generate Report button not found`);
     showBanner(`${tag}: generating…`);
     uiLog(`${tag}: generating…`);
-    clickEl(gen);
+    clickGenerateAsserted(tag, gen);
+    // 30 min: the biggest quarters (Punch Change 2025-Q4, ~71k rows) can take
+    // over 10 minutes to generate on Paycom's side — 10 min timed out for real.
     await waitFor(() => getDownloadButtons().length > initial, {
-      timeout: 10 * 60 * 1000, interval: 800, label: `${tag} Download button`,
+      timeout: 30 * 60 * 1000, interval: 800, label: `${tag} Download button`,
     });
     await downloadNewest(baseName);
     await sleep(2500); // let the download commit before the next generate/navigation
+  }
+
+  // ── Pipelined multi-range flow: queue ALL ranges first, download as ready ──
+  // Generating takes minutes per range; firing every Generate up-front lets
+  // Paycom build all of them in parallel, and we harvest the Download buttons
+  // as they appear. Mapping is by each queue row's creation TIMESTAMP: right
+  // after clicking Generate we wait for the new row's timestamp to show up and
+  // remember "that timestamp = this range" — so files get the right label no
+  // matter what order the reports finish in.
+  const QUEUE_STAMP_RE = /\d{2}\/\d{2}\/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M/;
+  function scanQueueStamps() {
+    const out = new Map(); // stamp text -> smallest row-ish element containing it
+    for (const el of document.querySelectorAll('div, li, tr')) {
+      const t = el.innerText || '';
+      if (!t || t.length > 600) continue;
+      const m = t.match(QUEUE_STAMP_RE);
+      if (m) out.set(m[0], el); // doc order: children overwrite parents → smallest block wins
+    }
+    return out;
+  }
+  // The stamp usually matches a tiny inner element (just the timestamp text);
+  // the row's Download button lives several ancestors up. Walk upward until an
+  // ancestor holds exactly ONE Download control — and stop the moment the
+  // ancestor spans MORE than one timestamp (that's the whole-list container,
+  // where picking a button would grab some OTHER row's file).
+  function downloadButtonInRow(row) {
+    const allStampsRe = new RegExp(QUEUE_STAMP_RE.source, 'g');
+    let n = row;
+    for (let i = 0; i < 8 && n; i++) {
+      const stamps = ((n.innerText || '').match(allStampsRe) || []).length;
+      if (stamps > 1) return null; // walked past the row into the list container
+      const btns = Array.from(n.querySelectorAll('button, a, input[type="button"]')).filter(el =>
+        visible(el) && (el.textContent || el.value || '').trim().toLowerCase() === 'download');
+      if (btns.length === 1) return btns[0];
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  // '08/06/2026 01:01:15 PM' → epoch ms (row creation time; TZ suffix ignored —
+  // only the ORDER matters and all rows share one TZ).
+  function parseStamp(s) {
+    const m = /(\d{2})\/(\d{2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})\s+([AP]M)/.exec(s);
+    if (!m) return 0;
+    let h = parseInt(m[4], 10) % 12; if (m[7] === 'PM') h += 12;
+    return new Date(+m[3], +m[1] - 1, +m[2], h, +m[5], +m[6]).getTime();
+  }
+
+  // Wait until the queue list has finished (lazily) rendering: the stamp count
+  // must hold steady across several polls. Without this the baseline right
+  // after a page load misses the old rows (they render late), and they then
+  // get counted as OURS — "expected 7, found 12" — wrecking the mapping.
+  async function settledQueueStamps(maxMs = 15000) {
+    let last = -1, stable = 0;
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxMs) {
+      const n = scanQueueStamps().size;
+      if (n === last) { if (++stable >= 3) break; } else { stable = 0; last = n; }
+      await sleep(450);
+    }
+    return scanQueueStamps();
+  }
+
+  // Pipeline state, persisted across page reloads: once the queue phase has
+  // fired all Generates, a reload must NOT re-queue 7 duplicates — it should
+  // resume watching for the same rows. Keyed by queue index.
+  const PIPE_KEY = 'histbot.pipe';
+  const getPipe = () => { try { return JSON.parse(localStorage.getItem(PIPE_KEY) || 'null'); } catch (_) { return null; } };
+  const setPipe = (o) => { try { localStorage.setItem(PIPE_KEY, JSON.stringify(o)); } catch (_) {} };
+  const clearPipe = () => { try { localStorage.removeItem(PIPE_KEY); } catch (_) {} };
+
+  async function handleReportPipelined(report, ranges) {
+    const qIdx = getIndex();
+    const saved = getPipe();
+    if (saved && saved.idx === qIdx && Array.isArray(saved.map) && saved.map.length) {
+      // Queue phase already ran (we reloaded mid-harvest) — just resume downloads.
+      uiLog(`▶ ${report.name} — resuming: waiting on ${saved.map.length} already-queued range(s)`);
+      await harvestPipeline(report, new Map(saved.map), qIdx);
+      return;
+    }
+
+    uiLog(`▶ ${report.name} — queueing ${ranges.length} ranges, downloading as they finish`);
+    // Identity invariant: pre-existing junk rows are always OLDER (by their
+    // creation timestamp) than anything this run creates — no baseline set
+    // needed, and junk rows that lazily render mid-run can't poison anything.
+    // Our rows = the ranges.length NEWEST stamps, which in chronological order
+    // exactly follow generate order.
+    for (let i = 0; i < ranges.length; i++) {
+      if (!isRunning()) return;
+      const rng = ranges[i];
+      const from = resolveDate(rng.from), to = resolveDate(rng.to);
+      const tag = `${report.name} ${rng.label}`;
+      showBanner(`${tag}: queueing (${i + 1}/${ranges.length})…`);
+      await setDateRange(from, to);
+      await sleep(300);
+      if (i === 0) { // employees + options stick across generates on the same form
+        if (report.selectAll !== false) { await selectAllEmployees(); await sleep(400); }
+        await tickChecks(report.checks);
+      }
+      await lockExcelOutput(tag);
+      const gen = await waitFor(() => findGenerateReportButton(), { timeout: 15000, label: `${tag} Generate button` });
+      // Newest stamp BEFORE this click — the new row must beat it.
+      let prevMax = 0;
+      for (const s of scanQueueStamps().keys()) prevMax = Math.max(prevMax, parseStamp(s));
+      clickGenerateAsserted(tag, gen);
+      uiLog(`${tag}: queued`);
+      // Wait for a strictly NEWER stamp to appear before touching the form
+      // again — it also guarantees consecutive ranges land on distinct seconds.
+      try {
+        await waitFor(() => {
+          for (const s of scanQueueStamps().keys()) if (parseStamp(s) > prevMax) return true;
+          return false;
+        }, { timeout: 25000, interval: 500, label: `${tag} queue row` });
+      } catch (e) {
+        if (e && e.aborted) throw e;
+        uiLog(`⚠ ${tag}: queue row slow to appear — continuing`);
+      }
+      await sleep(1600);
+    }
+
+    // Map rows → labels: the newest ranges.length stamps, oldest→newest =
+    // generate order. Older (junk) rows fall out no matter when they rendered.
+    const all = Array.from((await settledQueueStamps()).keys())
+      .sort((a, b) => parseStamp(b) - parseStamp(a));       // newest first
+    const ours = all.slice(0, ranges.length).reverse();      // generate order
+    if (ours.length < ranges.length)
+      uiLog(`⚠ ${report.name}: only ${ours.length}/${ranges.length} queue rows visible — mapping what's there`);
+    const stampToLabel = new Map();
+    for (let i = 0; i < ours.length; i++) stampToLabel.set(ours[i], ranges[i].label);
+    setPipe({ idx: qIdx, map: Array.from(stampToLabel) }); // survive a reload mid-harvest
+
+    await harvestPipeline(report, stampToLabel, qIdx);
+  }
+
+  // Harvest: poll the queue; whenever a mapped row's Download button appears,
+  // fetch it under its range's label. Order of completion doesn't matter. Each
+  // finished download is struck off the persisted state, so a reload resumes
+  // with only the remaining ranges.
+  async function harvestPipeline(report, stampToLabel, qIdx) {
+    const done = new Set();
+    const t0 = Date.now();
+    while (done.size < stampToLabel.size) {
+      if (!isRunning()) return;
+      if (Date.now() - t0 > 30 * 60 * 1000) {
+        const missing = Array.from(stampToLabel.entries()).filter(([s]) => !done.has(s)).map(([, l]) => l);
+        clearPipe();
+        throw new Error(`${report.name}: timed out waiting for ${missing.join(', ')}`);
+      }
+      const rows = scanQueueStamps();
+      for (const [stamp, label] of stampToLabel) {
+        if (done.has(stamp)) continue;
+        const row = rows.get(stamp);
+        const btn = row && downloadButtonInRow(row);
+        if (!btn) continue;
+        showBanner(`${report.name} ${label}: downloading…`);
+        await downloadViaButton(btn, `${report.fileBase}_${label}`);
+        done.add(stamp);
+        setPipe({ idx: qIdx, map: Array.from(stampToLabel).filter(([s]) => !done.has(s)) });
+        await sleep(2000); // let the download commit
+      }
+      const left = stampToLabel.size - done.size;
+      if (left) { showBanner(`${report.name}: ${left} report(s) still generating…`); await sleep(4000); }
+    }
+    clearPipe();
+    showBanner(`✓ ${report.name} — all ${stampToLabel.size} ranges downloaded`, true);
+    uiLog(`✓ ${report.name}: all ${stampToLabel.size} ranges downloaded`);
+  }
+
+  // For reports with pickRanges: ask WHICH ranges to run (all ticked by
+  // default). Lets the user untick already-downloaded quarters after a partial
+  // run instead of re-generating everything. Resolves null = skip the report.
+  function showRangePickDialog(report, ranges) {
+    return new Promise((resolve) => {
+      document.getElementById('histbot-rangepick')?.remove();
+      const overlay = document.createElement('div');
+      overlay.id = 'histbot-rangepick';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2147483647;display:flex;align-items:center;justify-content:center;font:14px sans-serif;';
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#fff;border-radius:10px;padding:20px;max-width:400px;width:92%;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.35);';
+      const title = document.createElement('h3');
+      title.textContent = `${report.name} — which ranges?`;
+      title.style.cssText = 'margin:0 0 4px;color:#0b7dda;font-size:16px;';
+      const sub = document.createElement('div');
+      sub.textContent = 'Untick the ones you already downloaded — only ticked ranges will be generated.';
+      sub.style.cssText = 'color:#666;font-size:12px;margin-bottom:12px;';
+      const list = document.createElement('div');
+      list.style.cssText = 'flex:1;overflow-y:auto;border:1px solid #e0e0e0;border-radius:6px;padding:6px 12px;margin-bottom:14px;';
+      const cbs = ranges.map((rng, i) => {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;padding:7px 0;cursor:pointer;border-bottom:1px solid #f0f0f0;';
+        if (i === ranges.length - 1) row.style.borderBottom = 'none';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox'; cb.checked = true;
+        cb.style.cssText = 'margin-right:10px;transform:scale(1.15);flex:0 0 auto;';
+        const t = document.createElement('span');
+        t.textContent = `${rng.label}  (${resolveDate(rng.from)} → ${resolveDate(rng.to)})`;
+        t.style.cssText = 'flex:1;color:#333;';
+        row.appendChild(cb); row.appendChild(t); list.appendChild(row);
+        return cb;
+      });
+      const btns = document.createElement('div');
+      btns.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;';
+      const cancel = document.createElement('button');
+      cancel.textContent = 'Skip report';
+      cancel.style.cssText = 'padding:9px 18px;border:1px solid #bbb;background:#fff;border-radius:5px;cursor:pointer;font-size:13px;';
+      cancel.onclick = () => { overlay.remove(); resolve(null); };
+      const ok = document.createElement('button');
+      ok.textContent = 'Run selected';
+      ok.style.cssText = 'padding:9px 18px;border:0;background:#0b7dda;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;font-size:13px;';
+      ok.onclick = () => {
+        const chosen = ranges.filter((_, i) => cbs[i].checked);
+        if (!chosen.length) { alert('Select at least one range, or click "Skip report".'); return; }
+        overlay.remove(); resolve(chosen);
+      };
+      btns.appendChild(cancel); btns.appendChild(ok);
+      box.appendChild(title); box.appendChild(sub); box.appendChild(list); box.appendChild(btns);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    });
   }
 
   // Runs both years (last + current) on the same report page, no reload between them.
@@ -768,7 +1091,19 @@
 
     // Date-range reports: one file per range. Default = last + current year; a
     // report can override with its own `ranges` (e.g. HR & Audit's <last>→today).
-    const ranges = report.ranges || YEARS;
+    // STRICTLY SERIAL — generate one range, wait for ITS download, save it under
+    // its label, then move to the next. The queue-all-then-harvest pipeline was
+    // tried (v0.20.x–0.21.x) and repeatedly mislabeled files (late-rendering
+    // junk rows, iframes, duplicate copies); serial is slower but can't mix
+    // labels up: the newest Download button right after OUR generate is OURS.
+    let ranges = report.ranges || YEARS;
+    if (report.pickRanges && ranges.length > 1) {
+      hideBanner();
+      const chosen = await showRangePickDialog(report, ranges);
+      if (!chosen) { uiLog(`↷ ${report.name}: skipped by user`); return; }
+      uiLog(`${report.name}: running ${chosen.length}/${ranges.length} range(s): ${chosen.map(r => r.label).join(', ')}`);
+      ranges = chosen;
+    }
     for (const rng of ranges) {
       if (!isRunning()) return;
       const from = resolveDate(rng.from), to = resolveDate(rng.to);
@@ -1013,7 +1348,7 @@
     await sleep(1500);
     const initial = getDownloadButtons().length;
     await waitFor(() => getDownloadButtons().length > initial, {
-      timeout: 10 * 60 * 1000, interval: 900, label: 'wizard report Download',
+      timeout: 30 * 60 * 1000, interval: 900, label: 'wizard report Download',
     });
     await downloadNewest(report.fileBase);
     showBanner(`✓ ${report.name} downloaded`, true);
@@ -1133,8 +1468,14 @@
     setIndex(0);
     clearAttempts();
     clearWz();
+    clearPipe();
     clearLog();
-    uiLog(`Started ${keys.length} report(s): ${keys.map(k => (reportByKey(k) || {}).name || k).join(', ')} · ${LASTYEAR} + ${THISYEAR}`);
+    // Version in the very first log line — so a stale Tampermonkey copy is
+    // obvious at a glance (we lost a debugging round to exactly that).
+    let ver = '';
+    try { ver = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? ` [v${GM_info.script.version}]` : ''; } catch (_) {}
+    uiLog(`Started ${keys.length} report(s)${ver}: ${keys.map(k => (reportByKey(k) || {}).name || k).join(', ')} · ${LASTYEAR} + ${THISYEAR}`);
+    becomeDriver(); // this tab drives; any other open Paycom tab stands by
     setState(STATES.RUNNING);
     dispatch();
   }
@@ -1145,8 +1486,11 @@
     clearQueue();
     clearAttempts();
     clearWz();
+    clearPipe();
+    releaseDriver();
     hideBanner();
     document.getElementById('histbot-picker')?.remove();
+    document.getElementById('histbot-rangepick')?.remove();
     log('Stopped / reset');
   }
 
@@ -1155,6 +1499,7 @@
     setIndex(0);
     clearQueue();
     clearAttempts();
+    releaseDriver();
     hideBanner();
     showBanner(`✓ Historical Data Bot — selected reports downloaded (${LASTYEAR} + ${THISYEAR})`, true);
     uiLog(`✓ All selected reports downloaded (${LASTYEAR} + ${THISYEAR})`);
@@ -1494,7 +1839,19 @@
   function init() {
     if (location.href.includes('cl-login.php') || location.href.includes('two-factor')) return;
     ensurePanel();
-    if (isRunning()) setTimeout(dispatch, 800);
+    if (!isRunning()) return;
+    if (iAmDriver()) {
+      becomeDriver();
+      setTimeout(dispatch, 800);
+    } else {
+      // Another tab is actively driving this run — stand by. Take over only if
+      // its heartbeat goes stale (that tab was closed mid-run).
+      log('standby: the bot is running in another Paycom tab');
+      const watch = setInterval(() => {
+        if (!isRunning()) { clearInterval(watch); return; }
+        if (iAmDriver()) { clearInterval(watch); becomeDriver(); dispatch(); }
+      }, 3000);
+    }
   }
 
   // Keep the panel alive across Paycom's re-renders.
