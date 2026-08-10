@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.2.0
+// @version      1.8.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -34,7 +34,9 @@
   // ───────────────────────────── constants ─────────────────────────────
 
   const PANEL_ID = 'hd-bot-panel';
-  const SCRIPT_VERSION = '1.2.0';
+  // 1.8.0 = merge of two parallel lines: Rohit's 1.2.0 (Who Appears filter for
+  // two Time Off reports) + the 1.2.x–1.7.x line (T&A timecards, Audit Trail).
+  const SCRIPT_VERSION = '1.8.0';
 
   const YEARS_KEY = 'historicalBot.adp.years';
 
@@ -65,6 +67,33 @@
     'Time Off Request',
     'Time Off Policy Assignment',
   ];
+
+  // Time & Attendance legacy reports: their run page is the LEGACY Dojo/UI4
+  // form (lstTimeFrame / calBegDate / calEndDate / ddlReportOutput /
+  // btnRunReport) — not the VDL "What's Displayed" style the Time Off reports
+  // use. All five share the exact same form and the same download pipeline
+  // (/mascsr/wfntlm/reports/v2/downloadreport?referenceId=…).
+  // One file each: 1 Jan of last year → today.
+  const TIMECARD_CATEGORY = 'Time & Attendance';
+  const TA_LEGACY_REPORTS = [
+    'Timecard Report with Supervisor Approval',
+    'Timecard Report with Notes',
+    'Timecard Exception Report',
+  ];
+  const TA_LEGACY_KEY = 'historicalBot.adp.taLegacy';
+
+  // Audit Trail: a VDL-style report (Payroll History family) inside the
+  // "Audit Trail" SIDEBAR CATEGORY. Not every employer has access — when the
+  // category/report is missing the flow logs a friendly note and skips instead
+  // of erroring. Two years of change history is huge, so it is pulled QUARTER
+  // BY QUARTER (picker: untick already-downloaded quarters to resume).
+  const AUDIT_CATEGORY = 'Audit Trail';
+  const AUDIT_REPORT = 'Audit Trail';
+  const AUDIT_KEY = 'historicalBot.adp.auditQtrs';
+  // Appearance settings (user-specified, Aug 2026):
+  const AUDIT_MENUS = ['My Team', 'Myself', 'People', 'Process']; // NOT Setup
+  const AUDIT_CATEGORIES = ['Employment', 'Personal Information', 'My Information', 'Pay', 'ACA', 'Statutory Compliance', 'HR'];
+  const AUDIT_FEATURES = ['EI-9 Management', 'Employment Profile', 'Job Profiles', 'Personal Profile', 'Form I-9', 'Profile', 'ACA Benefit Offerings', 'ACA Benefit Status', 'Record Of Employment'];
 
   // Extra settle before click-heavy Dojo steps. The Standard Reports pages are
   // slow to wire up their widgets; without this pad, clicks land on dead nodes
@@ -1420,7 +1449,12 @@
   // Returns { ok, sig }. The caller records `sig` so the NEXT year waits for a
   // genuinely new row; it is deliberately NOT recorded here, so that a paused
   // and resumed retry of this step can re-claim the same row.
-  async function downloadRenamed(fileName, label) {
+  // Optional `targetSig`: download the specific row whose Run Date-Time text
+  // equals it (used by the pipelined Audit Trail harvest — identity is locked
+  // at submit time, so completion order can never mislabel a file). Without
+  // it, the classic newest-Completed-row behaviour applies.
+  // Optional `waitMsOverride`: a longer completion wait for slow reports.
+  async function downloadRenamed(fileName, label, targetSig, waitMsOverride) {
     setStatus('Waiting for ' + label + ' to finish generating…');
     const completedNear = (top) => deepQueryAll('*').filter(visible).some(el =>
       (el.textContent || '').trim() === 'Completed' &&
@@ -1428,12 +1462,23 @@
 
     let trigger = null, topSig = '';
     let loggedProc = false, loggedPrev = false;
-    const maxPolls = Math.ceil(OUTPUT_WAIT_MS / OUTPUT_POLL_MS);
+    const maxPolls = Math.ceil((waitMsOverride || OUTPUT_WAIT_MS) / OUTPUT_POLL_MS);
     for (let i = 0; i < maxPolls && !trigger; i++) {
       checkAbort();
       const trigs = deepQueryAll('.fa-ellipsis-h').filter(visible)
         .map(t => t.closest('[role="button"], .revitButton') || t.parentElement || t)
         .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      if (targetSig) {
+        // Signature-targeted: wait for THE row carrying targetSig to complete.
+        const mine = trigs.find(t => rowSignatureNear(t.getBoundingClientRect().top) === targetSig);
+        if (mine && completedNear(mine.getBoundingClientRect().top)) {
+          trigger = mine; topSig = targetSig;
+          break;
+        }
+        if (!loggedProc && mine) { logInfo(label + ' (row ' + targetSig + ') is still processing…'); loggedProc = true; }
+        await sleep(OUTPUT_POLL_MS);
+        continue;
+      }
       if (trigs.length) {
         const topEl = trigs[0];
         const top = topEl.getBoundingClientRect().top;
@@ -1510,7 +1555,12 @@
     const findXlsAnchor = () =>
       deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0]
       || deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
-        .find(el => /view as xls/i.test((el.textContent || '').trim()) && (el.textContent || '').trim().length < 30)
+        .find(el => {
+          const t = (el.textContent || '').trim();
+          // Legacy T&A reports (e.g. Timecard w/ Supervisor Approval) label the
+          // menu item "Download" or "View as Excel" instead of "View as XLS".
+          return t.length < 30 && /view as xls|view as excel|^download$/i.test(t);
+        })
       || null;
     let anchor = null;
     for (let i = 0; i < 24 && !anchor; i++) {
@@ -1531,7 +1581,10 @@
     const baseHref = anchor.ownerDocument.baseURI;
     // The real spreadsheet lives at …/downloadTemplate/?instanceRefId=BIRT…;
     // the first thing ADP opens is usually a launcher page (auditOutput.do).
-    const isFileUrl = (u) => /downloadTemplate|instanceRefId|\.(xlsx?|csv)(\?|$)/i.test(u);
+    // Two file-URL shapes exist: BIRT reports (Payroll History etc.) use
+    // …/downloadTemplate/?instanceRefId=BIRT…; legacy T&A reports (Timecard w/
+    // Supervisor Approval) use /mascsr/wfntlm/reports/v2/downloadreport?referenceId=…
+    const isFileUrl = (u) => /downloadTemplate|instanceRefId|downloadreport|referenceId=|\.(xlsx?|csv)(\?|$)/i.test(u);
     const capturedUrls = () => sn1.urls.concat(sn2 ? sn2.urls : []);
     const capturedForms = () => sn1.forms.concat(sn2 ? sn2.forms : []);
     let url = '';
@@ -1923,11 +1976,735 @@
     }
   }
 
+  // ─────────── Timecard Report with Supervisor Approval (legacy form) ───────────
+
+  // One single range: 1 January of LAST year → today (same convention as the
+  // Time Off reports), derived from the system clock. If a ~19-month timecard
+  // extract ever proves too big for one run, reintroduce quarterly partitioning
+  // here (the Paycom bot's QUARTER_RANGES pattern).
+  function timecardRange() {
+    const now = new Date();
+    const y = now.getFullYear() - 1;
+    return {
+      label: y + '-to-date',
+      from: '01/01/' + y,
+      to: pad2(now.getMonth() + 1) + '/' + pad2(now.getDate()) + '/' + now.getFullYear(),
+      isoFrom: y + '-01-01',
+      isoTo: now.getFullYear() + '-' + pad2(now.getMonth() + 1) + '-' + pad2(now.getDate()),
+    };
+  }
+
+  // The legacy UI4 run form has rendered once its Time Frame select and Run
+  // button exist. The DATE inputs are NOT required here — with the default
+  // Time Frame ("Current Pay Period") they stay hidden until the frame is
+  // switched to "Define at Runtime"; requiring them up front timed out on the
+  // North Star client where that default applied.
+  async function stepWaitForLegacyRunForm() {
+    for (let i = 0; i < 40; i++) {
+      checkAbort();
+      const tf = deepQueryAll('#lstTimeFrame')[0];
+      const beg = deepQueryAll('#calBegDate')[0];
+      const run = deepQueryAll('#btnRunReport')[0];
+      if ((tf || beg) && run) { logSuccess('Legacy run form is up'); await sleep(DOJO_PAD); return true; }
+      await sleep(500);
+    }
+    logError('Legacy run form (lstTimeFrame / btnRunReport) did not load');
+    return false;
+  }
+
+  // Set one legacy dijit date field. Preferred: the Dojo widget API (updates the
+  // visible text AND the hidden ISO input together). Fallback: set the visible
+  // input plus the hidden `UI4:ctBody:…` input (ISO yyyy-mm-dd) by hand.
+  function setLegacyDate(id, hiddenName, mdy, iso) {
+    const inp = deepQueryAll('#' + id).filter(el => el.tagName === 'INPUT')[0];
+    if (!inp) { logError('#' + id + ' not found'); return false; }
+    const win = (inp.ownerDocument && inp.ownerDocument.defaultView) || window;
+    let done = false;
+    try {
+      if (win.dijit && win.dijit.byId) {
+        const w = win.dijit.byId(id);
+        if (w && w.set) {
+          const p = iso.split('-');
+          w.set('value', new win.Date(+p[0], +p[1] - 1, +p[2]));
+          done = true;
+          logInfo(id + ' → ' + mdy + ' (via Dojo widget)');
+        }
+      }
+    } catch (_) { }
+    if (!done) {
+      setReactInputValue(inp, mdy);
+      const hid = deepQueryAll('input[name="' + hiddenName + '"]')[0];
+      if (hid) hid.value = iso;
+      logInfo(id + ' → ' + mdy + ' (via input + hidden ISO)');
+    }
+    return true;
+  }
+
+  async function stepConfigureLegacyTimecardForm(rng) {
+    // Time Frame first: per client it can default to "Current Pay Period" — the
+    // From/To date inputs only APPEAR once it is "Define at Runtime" (USER).
+    // The inline onchange (ShowTimeFrameOptions etc.) runs off the change event.
+    const tf = deepQueryAll('#lstTimeFrame')[0];
+    if (tf && tf.value !== 'USER') {
+      tf.value = 'USER';
+      tf.dispatchEvent(new Event('change', { bubbles: true }));
+      logInfo('Time Frame → Define at Runtime');
+      await sleep(1200);
+    }
+    let dateReady = false;
+    for (let i = 0; i < 20 && !dateReady; i++) {
+      if (deepQueryAll('#calBegDate').filter(visible)[0]) { dateReady = true; break; }
+      await sleep(400);
+    }
+    if (!dateReady) { logError('Date inputs did not appear after switching to Define at Runtime'); return false; }
+
+    if (!setLegacyDate('calBegDate', 'UI4:ctBody:calBegDate', rng.from, rng.isoFrom)) return false;
+    await sleep(400);
+    if (!setLegacyDate('calEndDate', 'UI4:ctBody:calEndDate', rng.to, rng.isoTo)) return false;
+    await sleep(400);
+
+    // Employee Status: everyone in. Per client this section is either plain
+    // checkboxes, or three RADIOS where the "Include only employees who are:"
+    // option (Radio_EMPSTATUS_2, value USER) reveals the checkbox list — pick
+    // that radio first, then tick every box. chk_A Active · chk_I Inactive ·
+    // chk_S Sched-Term · chk_T Terminated · chk_H No-longer-T&A · chk_R Archived.
+    const userRadio = deepQueryAll('#Radio_EMPSTATUS_2')[0];
+    if (userRadio && userRadio.getAttribute('aria-checked') !== 'true') {
+      clickEl(userRadio);
+      await sleep(500);
+      logInfo('Employee Status → "Include only employees who are:" (checkbox list)');
+    }
+    for (const id of ['chk_A', 'chk_I', 'chk_S', 'chk_T', 'chk_H', 'chk_R']) {
+      const cb = deepQueryAll('#' + id)[0];
+      if (cb && cb.getAttribute('aria-checked') !== 'true') {
+        clickEl(cb);
+        await sleep(250);
+        logInfo('Ticked employee-status box ' + id);
+      }
+    }
+
+    // Output format: the select defaults to PDF — switch it to XLS. The visible
+    // overlay span is cosmetic; update it too so the page reads right.
+    const sel = deepQueryAll('#ddlReportOutput')[0];
+    if (!sel) { logError('#ddlReportOutput (output format select) not found'); return false; }
+    sel.value = 'XLS';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    const overlay = deepQueryAll('#select_ddlReportOutput')[0];
+    if (overlay) overlay.textContent = 'XLS';
+    if (sel.value !== 'XLS') { logError('Could not switch output format to XLS'); return false; }
+    logSuccess('Configured: ' + rng.from + ' → ' + rng.to + ', all statuses, output XLS');
+    await sleep(400);
+    return true;
+  }
+
+  async function stepClickLegacyRun() {
+    const btn = deepQueryAll('#btnRunReport').filter(visible)[0];
+    if (!btn) { logError('Run button (#btnRunReport) not found'); return false; }
+    clickEl(btn);
+    try { btn.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+    logSuccess('Clicked Run');
+    return true;
+  }
+
+  function taLegacySteps(reportName, rng) {
+    const fileName = safeFileName(reportName) + '_' + rng.label + '.xlsx';
+    return [
+      { name: 'Open Reports & Analytics menu', fn: () => stepOpenReportsMenu() },
+      { name: 'Open All Standard Reports', fn: () => stepClickAllStandardReports() },
+      { name: 'Open the ' + TIMECARD_CATEGORY + ' category', fn: async () => { await sleep(DOJO_PAD); return stepClickStandardCategory(TIMECARD_CATEGORY); } },
+      {
+        name: 'Select ' + reportName, fn: async () => {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            await sleep(1000);
+            if (await stepSelectStandardReportByTitle(reportName, REPORT_TYPE)) return true;
+            if (attempt < 3) {
+              logWarn('Attempt ' + attempt + '/3 found nothing — re-opening the ' + TIMECARD_CATEGORY + ' category');
+              await stepClickStandardCategory(TIMECARD_CATEGORY);
+            }
+          }
+          return false;
+        }
+      },
+      { name: 'Wait for legacy run form', fn: () => stepWaitForLegacyRunForm() },
+      { name: 'Configure ' + rng.label + ' (' + rng.from + ' → ' + rng.to + ', XLS)', fn: () => stepConfigureLegacyTimecardForm(rng) },
+      { name: 'Run', fn: async () => { await sleep(800); return stepClickLegacyRun(); } },
+      { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
+      {
+        name: 'Download ' + fileName, fn: async () => {
+          try {
+            const res = await downloadRenamed(fileName, reportName);
+            if (res && res.sig) downloadedSigs.add(res.sig);
+            return true;
+          } catch (err) {
+            if (err && (err.aborted || err.paused)) throw err;
+            logWarn('Download failed for ' + reportName + ' — fetch it from Reports Output manually (' +
+              ((err && err.message) || err) + ')');
+            return true; // the report ran; a naming failure must not fail it
+          }
+        }
+      },
+    ];
+  }
+
+  async function downloadTaLegacyReports() {
+    if (isRunning()) { logWarn('Already running — click Stop first.'); return; }
+
+    logInfo('=== Time & Attendance (Timecards & Hours) ===');
+    resetAbort();
+
+    const picked = await showItemPickDialog({
+      title: 'T&A Timecards & Hours — choose report(s)',
+      hint: 'One .xlsx each, 1 Jan last year → today. Untick the ones you already have.',
+      items: TA_LEGACY_REPORTS,
+      storageKey: TA_LEGACY_KEY,
+    });
+    if (picked === null) { setStatus('Cancelled'); logInfo('Report selection cancelled'); return; }
+    if (!picked.length) { setStatus('Nothing selected'); logWarn('No reports selected — nothing to download'); return; }
+
+    const rng = timecardRange();
+    setRunning(true);
+    downloadedSigs = new Set(); // fresh per run: de-dups Reports Output rows across reports
+    logInfo('Selected report(s): ' + picked.join(', '));
+    logInfo('Date range for every report: ' + rng.from + ' → ' + rng.to);
+
+    const succeeded = [];
+    const failed = [];
+
+    try {
+      for (let i = 0; i < picked.length; i++) {
+        const reportName = picked[i];
+        logInfo('───── ' + reportName + ' (' + (i + 1) + '/' + picked.length + ') ─────');
+        setStatus(reportName + ' (' + (i + 1) + '/' + picked.length + ')…');
+
+        try {
+          await runSteps(taLegacySteps(reportName, rng), { report: reportName });
+          succeeded.push(reportName);
+          logSuccess(reportName + ' complete');
+        } catch (err) {
+          if (err && err.aborted) throw err; // Stop kills the whole run
+          failed.push(reportName);
+          logError(reportName + ' failed: ' + ((err && err.message) || err));
+          logWarn(reportName + ' failed — continuing with the remaining reports');
+          try { dismissMegaMenuPanes(); } catch (_) { }
+          await sleep(3000);
+        }
+      }
+
+      const summary = 'Done: ' + succeeded.length + ' of ' + picked.length + ' succeeded' +
+        (failed.length ? '. Failed: ' + failed.join(', ') : '');
+      logSuccess('───── ' + summary + ' ─────');
+      setStatus(summary);
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Aborted by user');
+        logWarn('Flow aborted by user (Stop / reset)');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + ((err && err.message) || err));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  // ───────────────────────── Audit Trail (quarterly) ─────────────────────────
+
+  // Quarters of last year + current year, future quarters skipped; MM/DD/YYYY.
+  function auditQuarters() {
+    const now = new Date();
+    const out = [];
+    for (const y of [now.getFullYear() - 1, now.getFullYear()]) {
+      for (let q = 0; q < 4; q++) {
+        const from = new Date(y, q * 3, 1);
+        if (from > now) break;
+        const to = new Date(y, q * 3 + 3, 0);
+        out.push({
+          label: 'Q' + (q + 1) + '-' + y, // file-name convention: Q1-2025
+          from: pad2(from.getMonth() + 1) + '/' + pad2(from.getDate()) + '/' + y,
+          to: pad2(to.getMonth() + 1) + '/' + pad2(to.getDate()) + '/' + y,
+        });
+      }
+    }
+    return out;
+  }
+
+  // Client name for the file name, detected from the Run Report page's
+  // "Who Appears" chips ("0MJ - Flash Hub Delivery" → "Flash Hub Delivery").
+  // Detected once per run while the run page is open (the Reports Output page
+  // no longer shows it). Falls back to '' → file name simply omits the client.
+  let auditClientName = '';
+  function detectClientName() {
+    const texts = deepQueryAll('div, span, li, h1, h2, b').filter(visible)
+      .map(el => (el.textContent || '').trim())
+      .filter(t => t && t.length >= 4 && t.length < 60);
+    // 1) "0MJ - Flash Hub Delivery" style company-code chips (any case).
+    const chip = texts.find(t => /^[A-Za-z0-9.]{2,6}\s*-\s*[A-Za-z]/.test(t) && !/no company/i.test(t) && !/^https?:/i.test(t));
+    if (chip) return chip.replace(/^[A-Za-z0-9.]{2,6}\s*-\s*/, '').trim();
+    // 2) Top-bar brand: "ADP | <client>" renders as adjacent text; grab the
+    //    text right after a lone "ADP" logo text if present.
+    const brand = texts.find(t => /^ADP\s*\|\s*\S/.test(t));
+    if (brand) return brand.replace(/^ADP\s*\|\s*/, '').trim();
+    return '';
+  }
+  function tryDetectClient(where) {
+    if (auditClientName) return;
+    auditClientName = detectClientName();
+    if (auditClientName) logInfo('Client detected (' + where + '): ' + auditClientName);
+  }
+
+  const notAvailableError = (what) => { const e = new Error(what + ' not available on this employer'); e.notAvailable = true; return e; };
+
+  // Select the Audit Trail REPORT row. The generic matcher can't be used here:
+  // "Audit Trail" is ALSO the sidebar CATEGORY's name, and the text-based
+  // fallback kept clicking that nav item (title="") instead of the report —
+  // the flow then hung waiting for a Run page that never came. Only the real
+  // grid row button carries an exact title="Audit Trail" attribute (the nav
+  // item has aria-label but NO title), so match strictly on that.
+  async function selectAuditReportRow() {
+    for (let i = 0; i < 20; i++) {
+      checkAbort();
+      const btn = deepQueryAll('[title]').filter(visible).find(el =>
+        normalize(el.getAttribute('title')) === normalize(AUDIT_REPORT) &&
+        !el.closest('.revitLeftNav, [id^="ExternalRunStandard_item_"]'));
+      if (btn) {
+        clickEl(btn);
+        try { btn.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+        logSuccess('Selected ' + AUDIT_REPORT + ' (exact-title grid row)');
+        return true;
+      }
+      await sleep(500);
+    }
+    return false;
+  }
+
+  // Does the left sidebar even HAVE the Audit Trail category? (Access varies
+  // per employer.)
+  function auditCategoryPresent() {
+    return deepQueryAll('span[id^="ExternalRunStandard_item_"][role="menuitem"]')
+      .some(el => ((el.getAttribute('aria-label') || el.textContent || '').trim() === AUDIT_CATEGORY));
+  }
+
+  // Tick one VDL listbox item (Menus/Categories/Features) by its exact title.
+  // Items already selected are SKIPPED — clicking them again would unselect.
+  async function tickListboxItem(title) {
+    let li = null;
+    for (let i = 0; i < 10 && !li; i++) {
+      li = deepQueryAll('li.listboxitem-container').filter(visible)
+        .find(el => (el.getAttribute('title') || '').trim() === title);
+      if (!li) await sleep(300);
+    }
+    if (!li) { logWarn('Listbox item "' + title + '" not found'); return false; }
+    if (li.className.indexOf('listboxitem-container-selected') >= 0) {
+      logDebug('"' + title + '" already selected');
+      return true;
+    }
+    clickEl(li.querySelector('button') || li);
+    await sleep(350);
+    return true;
+  }
+  async function tickListboxItems(sectionName, titles) {
+    logInfo('Selecting ' + sectionName + ': ' + titles.join(', '));
+    for (const t of titles) { checkAbort(); await tickListboxItem(t); }
+    return true;
+  }
+
+  // ADP pops a "sensitive nature of Tax IDs… print full Tax IDs?" Warning
+  // dialog when Tax ID is set to Not masked. Confirm it with Yes (unmasked
+  // exports are deliberate here — the file feeds the migration). Returns
+  // quietly if no dialog shows up.
+  async function confirmTaxIdWarning(waitPolls) {
+    for (let i = 0; i < (waitPolls || 8); i++) {
+      const yes = deepQueryAll('sdf-button, button').filter(visible).find(b =>
+        normalize(b.textContent) === 'yes' ||
+        normalize((b.getAttribute && b.getAttribute('aria-label')) || '') === 'yes');
+      if (yes) {
+        clickEl(yes);
+        logInfo('Confirmed the full-Tax-ID warning (Yes)');
+        await sleep(800);
+        return true;
+      }
+      await sleep(400);
+    }
+    return false;
+  }
+
+  // Everything inside "Appearance and Other Settings", then Save:
+  // maskings → Not masked · Date when change occurred → Custom Date + quarter
+  // dates · Menus/Categories/Features ticks · Users untouched.
+  async function stepConfigureAuditAppearance(rng) {
+    await sleep(1000);
+
+    // 1) All three masking dropdowns (Tax ID / DOB / Bank) → Not masked. Each
+    // sweep flips whichever dropdown currently shows a masked value; misses
+    // are expected (already Not masked) and harmless.
+    for (let pass = 0; pass < 3; pass++) {
+      let changed = false;
+      for (const cur of ['Fully masked', 'Partially masked']) {
+        if (await selectVdlDropdownOption(cur, 'Not masked')) { changed = true; await sleep(700); }
+      }
+      if (!changed) break;
+      await confirmTaxIdWarning(3); // the warning can pop right on selection
+    }
+    logInfo('Masking dropdowns → Not masked');
+
+    // 2) "Date when change occurred" → Custom Date Range (the option's EXACT
+    // text — "Custom Date" alone matches nothing). Target the dropdown next to
+    // its LABEL — a bare current-text match ("Today") would also hit
+    // "Report information displayed as of".
+    const OPTION_TEXT = 'Custom Date Range';
+    let done = false;
+    const lbl = deepQueryAll('label, div, span').filter(visible)
+      .find(el => (el.textContent || '').trim() === 'Date when change occurred');
+    if (lbl) {
+      let scope = lbl.parentElement;
+      for (let i = 0; i < 4 && scope && !done; i++) {
+        const dd = Array.from(scope.querySelectorAll('.vdl-dropdown-list__input, [role="combobox"]')).filter(visible)[0];
+        if (dd) {
+          clickEl(dd);
+          await sleep(600);
+          const opt = deepQueryAll('li, [role="option"]').filter(visible)
+            .find(el => (el.textContent || '').trim() === OPTION_TEXT);
+          if (opt) { clickEl(opt); logInfo('Date when change occurred → ' + OPTION_TEXT); done = true; }
+        }
+        scope = scope.parentElement;
+      }
+    }
+    if (!done) {
+      // Fallback: first "Today" dropdown in DOM order IS "Date when change
+      // occurred" (it sits above "displayed as of" on this panel).
+      if (!(await selectVdlDropdownOption('Today', OPTION_TEXT))) {
+        logError('Could not switch "Date when change occurred" to ' + OPTION_TEXT);
+        return false;
+      }
+    }
+    await sleep(1200);
+
+    // 3) From / To quarter dates — exact ids first (requestedTimeOffDateRange
+    // .from/.to, confirmed live), placeholder pair as fallback.
+    let fromInp = deepQueryAll('input[id="requestedTimeOffDateRange.from"]').filter(visible)[0];
+    let toInp = deepQueryAll('input[id="requestedTimeOffDateRange.to"]').filter(visible)[0];
+    if (!fromInp || !toInp) {
+      const dateInputs = deepQueryAll('input').filter(visible).filter(inp =>
+        ((inp.getAttribute('placeholder') || '').toLowerCase()).includes('mm/dd/yyyy'));
+      if (dateInputs.length < 2) { logError('Custom-date inputs not found'); return false; }
+      fromInp = dateInputs[0]; toInp = dateInputs[1];
+    }
+    fromInp.focus(); await sleep(250);
+    setReactInputValue(fromInp, rng.from); await sleep(600);
+    toInp.focus(); await sleep(250);
+    setReactInputValue(toInp, rng.to); await sleep(600);
+    toInp.blur(); await sleep(400);
+    logInfo('Dates: ' + rng.from + ' → ' + rng.to);
+
+    // 4) Filter Screens.
+    await tickListboxItems('Menus', AUDIT_MENUS);
+    await tickListboxItems('Categories', AUDIT_CATEGORIES);
+    await tickListboxItems('Features', AUDIT_FEATURES);
+    // Select Users: deliberately untouched. Print Runtime Settings: left as-is.
+
+    // 5) Save.
+    await sleep(600);
+    const saveBtn = deepQueryAll('button, sdf-button, [role="button"]').filter(visible)
+      .find(b => normalize(b.textContent) === 'save');
+    if (!saveBtn) { logError('Save button not found on Appearance settings'); return false; }
+    clickEl(saveBtn);
+    logSuccess('Saved Appearance settings');
+    // The full-Tax-ID warning usually appears HERE, on Save — confirm it.
+    await confirmTaxIdWarning(10);
+    await sleep(2000);
+    return true;
+  }
+
+  // <client>_Audit_Trail_Report_<Qn-YYYY>.xlsx — client detected at run time.
+  function auditFileName(rng) {
+    return (auditClientName ? safeFileName(auditClientName) + '_' : '') +
+      'Audit_Trail_Report_' + rng.label + '.xlsx';
+  }
+
+  // Submit ONE quarter: navigate → configure → Run as Excel. No download here —
+  // the pipelined flow harvests every submitted row afterwards by signature.
+  function auditSubmitSteps(rng) {
+    return [
+      { name: 'Open Reports & Analytics menu', fn: () => stepOpenReportsMenu() },
+      { name: 'Open All Standard Reports', fn: () => stepClickAllStandardReports() },
+      {
+        name: 'Open the ' + AUDIT_CATEGORY + ' category', fn: async () => {
+          await sleep(DOJO_PAD);
+          await waitForGridToSettle();
+          if (!auditCategoryPresent()) throw notAvailableError('The "' + AUDIT_CATEGORY + '" category');
+          return stepClickStandardCategory(AUDIT_CATEGORY);
+        }
+      },
+      {
+        name: 'Select ' + AUDIT_REPORT, fn: async () => {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            await sleep(1000);
+            // The CATEGORY can exist while the REPORT itself is not licensed
+            // (seen live: Lazo had the category but only "EI-9 Audit" inside —
+            // the generic matcher then false-matched a title="" span and the
+            // flow hung waiting for a Run page that never comes). Require the
+            // exact report title in the settled grid BEFORE trying to select.
+            const names = await waitForGridToSettle();
+            if (names.length && !names.some(n => n.trim() === AUDIT_REPORT)) {
+              if (attempt < 3) {
+                logWarn('"' + AUDIT_REPORT + '" not in the category list (' + names.length + ' titles) — double-checking');
+                await stepClickStandardCategory(AUDIT_CATEGORY);
+                continue;
+              }
+              throw notAvailableError('The "' + AUDIT_REPORT + '" report');
+            }
+            if (await selectAuditReportRow()) return true;
+            if (attempt < 3) {
+              logWarn('Attempt ' + attempt + '/3 could not select — re-opening the ' + AUDIT_CATEGORY + ' category');
+              await stepClickStandardCategory(AUDIT_CATEGORY);
+            }
+          }
+          throw notAvailableError('The "' + AUDIT_REPORT + '" report');
+        }
+      },
+      { name: 'Wait for Run Report page', fn: () => stepWaitForRunReportPage() },
+      {
+        name: 'Wait for report sections', fn: async () => {
+          const ok = await stepWaitForSectionsPopulated();
+          await sleep(800);
+          tryDetectClient('run page'); // chips need a beat to render
+          return ok;
+        }
+      },
+      { name: 'Open Appearance settings', fn: async () => { await sleep(2000 + DOJO_PAD); tryDetectClient('pre-appearance'); return stepClickAppearanceSettings(); } },
+      {
+        name: 'Configure ' + rng.label + ' (' + rng.from + ' → ' + rng.to + ')', fn: async () => {
+          tryDetectClient('appearance panel'); // third look, panel keeps the chips behind it
+          if (!auditClientName) logWarn('Client name not detected — file name will omit it');
+          return stepConfigureAuditAppearance(rng);
+        }
+      },
+      { name: 'Run as Excel', fn: async () => { await sleep(1500 + DOJO_PAD); return stepClickRunAsExcel(); } },
+      { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
+    ];
+  }
+
+  // Right after a submission lands on Reports Output, the just-submitted row is
+  // the newest one. Capture its Run Date-Time signature — that stamp IS this
+  // quarter's identity for the harvest phase. `known` holds sigs of earlier
+  // submissions this run, so a still-rendering list can't hand back an old row.
+  async function captureSubmittedRowSig(known) {
+    const deadline = Date.now() + 90 * 1000;
+    while (Date.now() < deadline) {
+      checkAbort();
+      const trigs = deepQueryAll('.fa-ellipsis-h').filter(visible)
+        .map(t => t.closest('[role="button"], .revitButton') || t.parentElement || t)
+        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      for (const t of trigs.slice(0, 4)) {
+        const top = t.getBoundingClientRect().top;
+        const sig = rowSignatureNear(top);
+        if (!sig || known.has(sig)) continue;
+        // First submission has no baseline: require the candidate row to still
+        // be Processing (a fresh Audit Trail always is) so an OLD Completed row
+        // can't be claimed. Later submissions are covered by `known`.
+        const processing = deepQueryAll('*').filter(visible).some(el =>
+          /^Processing/i.test((el.textContent || '').trim()) &&
+          Math.abs(el.getBoundingClientRect().top - top) < 30);
+        if (known.size === 0 && !processing) continue;
+        return sig;
+      }
+      await sleep(1200);
+    }
+    return '';
+  }
+
+  // After the quarters are picked, ask HOW to download them. Two honest modes:
+  //   pipeline — submit everything first, harvest as each completes (fast);
+  //   serial   — one quarter start-to-finish at a time (steady, slower).
+  // Resolves 'pipeline' | 'serial' | null (cancel).
+  function showModePickDialog(count) {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('hd-mode-pick');
+      if (existing) existing.remove();
+
+      const overlay = document.createElement('div');
+      overlay.id = 'hd-mode-pick';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,8,22,.62);z-index:2147483647;display:flex;align-items:center;justify-content:center;';
+      const box = document.createElement('div');
+      box.style.cssText = "background:linear-gradient(165deg,rgba(2,20,46,.98),rgba(0,36,86,.96));color:#dce9ff;border:1px solid rgba(90,159,255,.35);border-radius:16px;padding:20px;width:460px;max-width:94%;font:13px/1.5 'Segoe UI',system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,12,30,.7);";
+
+      const h = document.createElement('div');
+      h.textContent = 'Download mode — ' + count + ' quarter(s)';
+      h.style.cssText = 'font-size:15px;font-weight:700;color:#fff;margin-bottom:12px;';
+      box.appendChild(h);
+
+      const mkOption = (icon, title, desc, value) => {
+        const card = document.createElement('button');
+        card.style.cssText = 'display:block;width:100%;text-align:left;margin-bottom:10px;padding:12px 14px;border-radius:12px;cursor:pointer;' +
+          'background:rgba(0,71,171,.22);border:1px solid rgba(125,179,255,.25);color:#dce9ff;transition:all .2s;font:inherit;';
+        card.onmouseenter = () => { card.style.background = 'rgba(0,100,241,.38)'; card.style.borderColor = 'rgba(125,179,255,.55)'; };
+        card.onmouseleave = () => { card.style.background = 'rgba(0,71,171,.22)'; card.style.borderColor = 'rgba(125,179,255,.25)'; };
+        const t = document.createElement('div');
+        t.textContent = icon + '  ' + title;
+        t.style.cssText = 'font-weight:700;font-size:13.5px;color:#fff;margin-bottom:4px;';
+        const d = document.createElement('div');
+        d.textContent = desc;
+        d.style.cssText = 'font-size:11.5px;color:#a8cbff;';
+        card.appendChild(t); card.appendChild(d);
+        card.addEventListener('click', () => { overlay.remove(); resolve(value); });
+        return card;
+      };
+
+      box.appendChild(mkOption('🚀', 'Pipeline — fast (recommended for 2+ quarters)',
+        'Submits ALL ' + count + ' quarters first (~2 min each); ADP generates them in parallel; each file is downloaded the moment it completes. Every file is matched to its quarter by the Output row captured at submit time, so names can never mix up. Total time ≈ the slowest single quarter.',
+        'pipeline'));
+      box.appendChild(mkOption('🐢', 'Serial — steady',
+        'One quarter start-to-finish at a time: submit → wait for it to generate → download → next. Simplest possible flow; total time = ALL quarters added together (can be several hours for Audit Trail).',
+        'serial'));
+
+      const cancel = document.createElement('button');
+      cancel.textContent = 'Cancel';
+      cancel.style.cssText = 'margin-top:2px;padding:8px 16px;border-radius:9px;border:1px solid rgba(234,241,247,.35);background:transparent;color:#dce9ff;cursor:pointer;font:inherit;';
+      cancel.addEventListener('click', () => { overlay.remove(); resolve(null); });
+      box.appendChild(cancel);
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    });
+  }
+
+  async function downloadAuditTrail() {
+    if (isRunning()) { logWarn('Already running — click Stop first.'); return; }
+
+    logInfo('=== Audit Trail (quarterly) ===');
+    resetAbort();
+    auditClientName = ''; // re-detect per run (the logged-in client can change)
+
+    const quarters = auditQuarters();
+    const picked = await showItemPickDialog({
+      title: 'Audit Trail — choose quarter(s)',
+      hint: 'One .xlsx per quarter. Untick the quarters you already downloaded. Skipped automatically if this employer has no Audit Trail access.',
+      items: quarters.map(q => q.label + '   (' + q.from + ' → ' + q.to + ')'),
+      storageKey: AUDIT_KEY,
+    });
+    if (picked === null) { setStatus('Cancelled'); logInfo('Quarter selection cancelled'); return; }
+    if (!picked.length) { setStatus('Nothing selected'); logWarn('No quarters selected — nothing to download'); return; }
+
+    const chosen = quarters.filter(q => picked.some(p => p.indexOf(q.label) === 0));
+
+    // One quarter → both modes are identical; don't bother asking.
+    let mode = 'serial';
+    if (chosen.length > 1) {
+      mode = await showModePickDialog(chosen.length);
+      if (mode === null) { setStatus('Cancelled'); logInfo('Mode selection cancelled'); return; }
+    }
+
+    setRunning(true);
+    downloadedSigs = new Set();
+    logInfo('Selected quarter(s): ' + chosen.map(q => q.label).join(', '));
+    logInfo(mode === 'pipeline'
+      ? 'PIPELINE mode: submitting every quarter first, then downloading as each completes'
+      : 'SERIAL mode: one quarter start-to-finish at a time');
+
+    const submitted = [];   // { rng, sig } — identity locked at submit time
+    const failed = [];
+
+    try {
+      // ── Phase 1: submit quarters. In SERIAL mode each one is downloaded
+      // immediately after its submit; in PIPELINE mode downloads wait for
+      // phase 2 while ADP generates everything in parallel. Either way the
+      // file's identity is the Output row signature captured at submit time.
+      const known = new Set();
+      for (let i = 0; i < chosen.length; i++) {
+        const rng = chosen[i];
+        logInfo('───── Submit ' + rng.label + ' (' + (i + 1) + '/' + chosen.length + ') ─────');
+        setStatus('Submitting ' + rng.label + ' (' + (i + 1) + '/' + chosen.length + ')…');
+
+        try {
+          await runSteps(auditSubmitSteps(rng), { quarter: rng.label });
+          const sig = await captureSubmittedRowSig(known);
+          if (sig) {
+            known.add(sig);
+            logSuccess(rng.label + ' submitted — row "' + sig + '"');
+            if (mode === 'pipeline') {
+              submitted.push({ rng: rng, sig: sig });
+              setStatus('Submitted ' + (i + 1) + '/' + chosen.length + ' — downloads start after the last submit');
+            } else {
+              logInfo('Waiting for ' + rng.label + ' to generate (serial mode)…');
+              const doneCount = i; // quarters fully finished so far
+              await downloadRenamed(auditFileName(rng),
+                rng.label + ' — ' + doneCount + '/' + chosen.length + ' done', sig, 90 * 60 * 1000);
+              downloadedSigs.add(sig);
+              logSuccess(rng.label + ' downloaded (' + (i + 1) + '/' + chosen.length + ' done)');
+              setStatus((i + 1) + '/' + chosen.length + ' quarters downloaded');
+            }
+          } else {
+            // Identity not confirmed — download THIS one right now (classic
+            // newest-completed path) so it can never be mislabeled later.
+            logWarn(rng.label + ': could not identify its Output row — downloading it right away instead');
+            const res = await downloadRenamed(auditFileName(rng), rng.label, '', 90 * 60 * 1000);
+            if (res && res.sig) { downloadedSigs.add(res.sig); known.add(res.sig); }
+          }
+        } catch (err) {
+          if (err && err.aborted) throw err;
+          if (err && err.notAvailable) {
+            logWarn(err.message + ' — skipping Audit Trail entirely on this employer');
+            setStatus('Audit Trail not available — skipped');
+            return;
+          }
+          failed.push(rng.label);
+          logError(rng.label + ' failed: ' + ((err && err.message) || err));
+          logWarn(rng.label + ' failed — continuing with the remaining quarters');
+          try { dismissMegaMenuPanes(); } catch (_) { }
+          await sleep(3000);
+        }
+      }
+
+      // ── Phase 2 (pipeline only): harvest each row by ITS OWN signature ──
+      let harvested = 0;
+      for (let i = 0; i < submitted.length; i++) {
+        const s = submitted[i];
+        const fileName = auditFileName(s.rng);
+        logInfo('───── Download ' + s.rng.label + ' (' + (i + 1) + '/' + submitted.length + ') — row "' + s.sig + '" ─────');
+        setStatus('Downloading ' + s.rng.label + ' — ' + harvested + '/' + submitted.length + ' done');
+        try {
+          await downloadRenamed(fileName,
+            s.rng.label + ' — ' + harvested + '/' + submitted.length + ' done', s.sig, 90 * 60 * 1000);
+          downloadedSigs.add(s.sig);
+          harvested++;
+          logSuccess(s.rng.label + ' downloaded (' + harvested + '/' + submitted.length + ' done)');
+          setStatus(harvested + '/' + submitted.length + ' quarters downloaded');
+        } catch (err) {
+          if (err && (err.aborted || err.paused)) throw err;
+          failed.push(s.rng.label);
+          logWarn(s.rng.label + ' download failed — fetch it from Reports Output manually (' +
+            ((err && err.message) || err) + ')');
+        }
+      }
+
+      const total = chosen.length;
+      const okCount = total - failed.length;
+      const summary = 'Done: ' + okCount + ' of ' + total + ' succeeded' +
+        (failed.length ? '. Failed: ' + failed.join(', ') : '');
+      logSuccess('───── ' + summary + ' ─────');
+      setStatus(summary);
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Aborted by user');
+        logWarn('Flow aborted by user (Stop / reset)');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + ((err && err.message) || err));
+    } finally {
+      setRunning(false);
+    }
+  }
+
   // Phase B adds a data set by appending one entry here plus one flow function.
   // The panel's button rail is generated from this list.
   const HISTORICAL_REPORTS = [
     { key: 'payhist', icon: '💰', label: 'Payroll History', fn: downloadPayrollHistoryByYear },
     { key: 'timeoff', icon: '🏖️', label: 'Time Off', fn: downloadTimeOffReports },
+    { key: 'timecard', icon: '🕒', label: 'T&A Timecards & Hours', fn: downloadTaLegacyReports },
+    { key: 'audittrail', icon: '🧾', label: 'Audit Trail (quarterly)', fn: downloadAuditTrail },
   ];
 
   // ───────────────────────────── year dialog ────────────────────────────
@@ -2162,6 +2939,117 @@
     });
   }
 
+  // ─────────────── Inspect Element HTML (shadow DOM + iframes) ───────────────
+  // Click the button, then click ANY element — its outerHTML + ancestor chain is
+  // copied to the clipboard, piercing shadow roots (composedPath) and every
+  // same-origin iframe. Esc cancels. For pasting selector evidence to Claude.
+  const inspClip = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) + ' …[+' + (s.length - n) + ' chars]' : s; };
+  function inspDescribe(el) {
+    if (!el || !el.tagName) return String((el && el.nodeName) || '?');
+    let d = el.tagName.toLowerCase();
+    if (el.id) d += '#' + el.id;
+    if (typeof el.className === 'string' && el.className.trim()) d += '.' + el.className.trim().split(/\s+/).slice(0, 3).join('.');
+    return d;
+  }
+  function inspAllDocs() {
+    const out = [document];
+    (function walk(doc) {
+      let frames = [];
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { return; }
+      for (const fr of frames) {
+        try { if (fr.contentDocument) { out.push(fr.contentDocument); walk(fr.contentDocument); } } catch (_) { }
+      }
+    })(document);
+    return out;
+  }
+  let inspActive = false;
+  const inspHooked = new Set();
+  let inspRehook = null;
+  function inspReport(e, doc) {
+    let target = e.target;
+    const path = (e.composedPath && e.composedPath()) || [];
+    for (const n of path) { if (n && n.tagName) { target = n; break; } }
+    const parts = [];
+    for (const n of path) {
+      if (n === window || n === document) break;
+      if (typeof ShadowRoot !== 'undefined' && n instanceof ShadowRoot) { parts.push('⇧shadow-root'); continue; }
+      if (n && n.tagName) { parts.push(inspDescribe(n)); if (parts.length > 18) break; }
+    }
+    try {
+      let w = doc.defaultView;
+      while (w && w !== w.parent) {
+        const fe = w.frameElement;
+        if (!fe) break;
+        parts.push('⇪iframe: ' + inspDescribe(fe));
+        w = w.parent;
+      }
+    } catch (_) { }
+    const out = [];
+    out.push('=== ADP HistBot Inspect ===');
+    out.push('page: ' + location.href);
+    out.push('ancestors: ' + parts.join('  <  '));
+    out.push('--- clicked element outerHTML ---');
+    out.push(inspClip(target.outerHTML, 6000));
+    const container = (target.closest && target.closest('[role="dialog"], .modal, table, tr, li, button, a, select, [class*="dialog" i], [class*="popup" i], [class*="report" i], [class*="grid" i]')) || target.parentElement;
+    if (container && container !== target) {
+      out.push('--- closest interesting container outerHTML ---');
+      out.push(inspClip(container.outerHTML, 10000));
+    }
+    const text = out.join('\n');
+    console.log('%c[HD Inspect]\n' + text, 'color:#00a4cc');
+    const done = (ok) => logInfo(ok ? '✓ HTML copied — paste it to Claude' : 'HTML logged to console ([HD Inspect])');
+    const fallback = () => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.cssText = 'position:fixed;left:-9999px';
+        document.body.appendChild(ta); ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove(); return ok;
+      } catch (_) { return false; }
+    };
+    try { navigator.clipboard.writeText(text).then(() => done(true), () => done(fallback())); }
+    catch (_) { done(fallback()); }
+  }
+  function inspOnClick(e) {
+    if (!inspActive) return;
+    const panel = document.getElementById(PANEL_ID);
+    if (panel && panel.contains(e.target)) return;
+    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+    const doc = e.currentTarget instanceof Document ? e.currentTarget : document;
+    inspStop();
+    inspReport(e, doc);
+  }
+  function inspOnKey(e) { if (e.key === 'Escape') { inspStop(); logInfo('Inspect cancelled'); } }
+  function inspHookAll() {
+    for (const doc of inspAllDocs()) {
+      if (inspHooked.has(doc)) continue;
+      try {
+        doc.addEventListener('click', inspOnClick, true);
+        doc.addEventListener('keydown', inspOnKey, true);
+        inspHooked.add(doc);
+      } catch (_) { }
+    }
+  }
+  function inspStart() {
+    if (inspActive) return;
+    inspActive = true;
+    const b = document.getElementById('hd-bot-inspect');
+    if (b) b.textContent = '⏹ Cancel Inspect';
+    logInfo('Inspect: click any element — shadow DOM & iframes covered (Esc cancels)');
+    inspHookAll();
+    inspRehook = setInterval(inspHookAll, 1500); // ADP loads frames lazily
+  }
+  function inspStop() {
+    inspActive = false;
+    const b = document.getElementById('hd-bot-inspect');
+    if (b) b.textContent = '🔍 Inspect Element HTML';
+    if (inspRehook) { clearInterval(inspRehook); inspRehook = null; }
+    for (const doc of inspHooked) {
+      try { doc.removeEventListener('click', inspOnClick, true); doc.removeEventListener('keydown', inspOnKey, true); } catch (_) { }
+    }
+    inspHooked.clear();
+  }
+
   // ─────────────────────────────── panel ────────────────────────────────
 
   function injectStyles() {
@@ -2170,55 +3058,57 @@
     css.id = 'hd-bot-style';
     css.textContent = [
       // Bottom-LEFT, so it never collides with the day-to-day ADP Bot panel.
+      // Cobalt-blue palette — matches the daily ADP Bot (adp-reports.user.js).
       '#hd-bot-panel{position:fixed;bottom:24px;left:24px;z-index:2147483646;width:324px;',
-      " font:13px/1.45 'Segoe UI',system-ui,-apple-system,sans-serif;color:#e4d9ff;",
-      ' background:linear-gradient(165deg,rgba(20,2,42,.97) 0%,rgba(48,0,80,.95) 55%,rgba(26,0,48,.97) 100%);',
-      ' border:1px solid rgba(170,120,255,.28);border-radius:18px;overflow:hidden;',
-      ' box-shadow:0 8px 40px rgba(10,0,30,.6),0 0 24px rgba(140,70,220,.18);backdrop-filter:blur(14px);}',
+      " font:13px/1.45 'Segoe UI',system-ui,-apple-system,sans-serif;color:#dce9ff;",
+      ' background:linear-gradient(165deg,rgba(2,20,46,.97) 0%,rgba(0,36,86,.95) 55%,rgba(0,24,57,.97) 100%);',
+      ' border:1px solid rgba(90,159,255,.28);border-radius:18px;overflow:hidden;',
+      ' box-shadow:0 8px 40px rgba(0,12,30,.6),0 0 24px rgba(0,100,241,.18);backdrop-filter:blur(14px);}',
       '#hd-bot-panel *{box-sizing:border-box;font-family:inherit;}',
       '.hdbot-head{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:move;user-select:none;',
-      ' background:linear-gradient(90deg,rgba(90,40,160,.45),rgba(140,70,220,.12));border-bottom:1px solid rgba(170,120,255,.15);}',
+      ' background:linear-gradient(90deg,rgba(0,71,171,.38),rgba(0,100,241,.10));border-bottom:1px solid rgba(90,159,255,.15);}',
       '.hdbot-avatar{width:34px;height:34px;border-radius:11px;flex:0 0 34px;display:flex;align-items:center;justify-content:center;',
-      ' background:linear-gradient(135deg,#8c46dc,#b26cf0);font-size:17px;color:#fff;',
-      ' box-shadow:0 0 14px rgba(140,70,220,.55);animation:hdbot-breathe 3.2s ease-in-out infinite;}',
-      '@keyframes hdbot-breathe{0%,100%{box-shadow:0 0 10px rgba(140,70,220,.45)}50%{box-shadow:0 0 22px rgba(178,108,240,.75)}}',
+      ' background:linear-gradient(135deg,#0064f1,#00a4cc);font-size:17px;color:#fff;',
+      ' box-shadow:0 0 14px rgba(0,100,241,.55);animation:hdbot-breathe 3.2s ease-in-out infinite;}',
+      '@keyframes hdbot-breathe{0%,100%{box-shadow:0 0 10px rgba(0,100,241,.45)}50%{box-shadow:0 0 22px rgba(0,164,204,.75)}}',
       '.hdbot-titlebox{flex:1;min-width:0;}',
       '.hdbot-title{margin:0;font-size:14px;font-weight:700;color:#fff;letter-spacing:.3px;}',
-      '.hdbot-sub{font-size:9.5px;color:#c2a8ff;letter-spacing:1px;text-transform:uppercase;}',
-      '.hdbot-ver{font-size:9px;color:#d3bcff;background:rgba(90,40,160,.4);padding:2px 7px;border-radius:999px;border:1px solid rgba(170,120,255,.22);}',
-      '.hdbot-chev{background:rgba(190,150,255,.1);border:1px solid rgba(190,150,255,.25);border-radius:8px;cursor:pointer;',
-      ' width:26px;height:26px;color:#cbb0ff;font-size:11px;transition:all .25s;display:flex;align-items:center;justify-content:center;}',
-      '.hdbot-chev:hover{background:rgba(190,150,255,.22);color:#fff;}',
+      '.hdbot-sub{font-size:9.5px;color:#7db3ff;letter-spacing:1px;text-transform:uppercase;}',
+      '.hdbot-ver{font-size:9px;color:#8fb9ff;background:rgba(0,71,171,.35);padding:2px 7px;border-radius:999px;border:1px solid rgba(90,159,255,.22);}',
+      '.hdbot-chev{background:rgba(125,179,255,.1);border:1px solid rgba(125,179,255,.25);border-radius:8px;cursor:pointer;',
+      ' width:26px;height:26px;color:#a0c7ff;font-size:11px;transition:all .25s;display:flex;align-items:center;justify-content:center;}',
+      '.hdbot-chev:hover{background:rgba(125,179,255,.22);color:#fff;}',
       '.hdbot-chev.min{transform:rotate(180deg);}',
       '.hdbot-statuschip{display:flex;align-items:center;gap:8px;margin:10px 14px 8px;padding:7px 11px;border-radius:10px;',
-      ' background:rgba(90,40,160,.22);border:1px solid rgba(170,120,255,.14);font-size:11px;color:#d3bcff;min-height:30px;}',
+      ' background:rgba(0,71,171,.18);border:1px solid rgba(90,159,255,.14);font-size:11px;color:#a8cbff;min-height:30px;}',
       '.hdbot-dot{width:8px;height:8px;border-radius:50%;background:#4ade80;flex:0 0 8px;',
       ' box-shadow:0 0 8px rgba(74,222,128,.8);animation:hdbot-pulse 2s ease-in-out infinite;}',
       '@keyframes hdbot-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.78)}}',
       '#hd-bot-btnrow{display:grid;grid-template-columns:1fr;gap:7px;padding:2px 14px 6px;}',
-      '.hdbot-item{display:flex;align-items:center;gap:10px;text-align:left;border:1px solid rgba(190,150,255,.16);',
-      ' border-radius:11px;padding:11px 12px;cursor:pointer;background:rgba(90,40,160,.26);color:#eadfff;',
+      '.hdbot-item{display:flex;align-items:center;gap:10px;text-align:left;border:1px solid rgba(125,179,255,.16);',
+      ' border-radius:11px;padding:11px 12px;cursor:pointer;background:rgba(0,71,171,.22);color:#d6e6ff;',
       ' font-weight:600;font-size:12.5px;transition:all .22s;}',
-      '.hdbot-item:hover{background:rgba(140,70,220,.42);border-color:rgba(190,150,255,.45);transform:translateX(3px);color:#fff;}',
+      '.hdbot-item:hover{background:rgba(0,100,241,.38);border-color:rgba(125,179,255,.45);transform:translateX(3px);color:#fff;}',
       '.hdbot-ico{width:26px;height:26px;border-radius:8px;flex:0 0 26px;display:flex;align-items:center;justify-content:center;',
-      ' background:rgba(140,70,220,.32);font-size:13px;}',
+      ' background:rgba(0,100,241,.28);font-size:13px;}',
       '.hdbot-util{display:grid;grid-template-columns:1fr 1fr;gap:7px;}',
-      '.hdbot-ghost{border:1px solid rgba(190,150,255,.3);background:transparent;border-radius:10px;padding:8px;color:#c2a8ff;',
+      '.hdbot-ghost{border:1px solid rgba(125,179,255,.3);background:transparent;border-radius:10px;padding:8px;color:#8fb9ff;',
       ' cursor:pointer;font-weight:600;font-size:11.5px;transition:all .22s;}',
       '.hdbot-ghost:disabled{opacity:.4;cursor:default;}',
       '.hdbot-ghost.pause:hover:not(:disabled){border-color:rgba(255,205,120,.55);color:#ffd79d;background:rgba(255,190,99,.1);}',
       '.hdbot-ghost.resume{border-color:rgba(120,230,150,.5);color:#8bf0ab;}',
       '.hdbot-ghost.resume:hover{background:rgba(99,255,150,.1);}',
       '.hdbot-ghost.stop:hover{border-color:rgba(255,120,120,.55);color:#ff9d9d;background:rgba(255,99,99,.1);}',
+      '.hdbot-ghost.diag:hover{border-color:rgba(0,164,204,.55);color:#7ee7ff;background:rgba(0,164,204,.1);}',
       '.hdbot-logrow{display:flex;align-items:center;justify-content:space-between;margin:4px 14px 4px;}',
-      '.hdbot-loglabel{font-size:9.5px;color:#a483d8;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;}',
-      '.hdbot-mini{padding:3px 9px;border:1px solid rgba(190,150,255,.25);background:rgba(90,40,160,.3);color:#dcc8ff;',
+      '.hdbot-loglabel{font-size:9.5px;color:#6f9fe0;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;}',
+      '.hdbot-mini{padding:3px 9px;border:1px solid rgba(125,179,255,.25);background:rgba(0,71,171,.25);color:#bcd6ff;',
       ' border-radius:7px;cursor:pointer;font-size:10px;transition:all .2s;margin-left:4px;}',
-      '.hdbot-mini:hover{background:rgba(140,70,220,.5);color:#fff;}',
-      "#hd-bot-log{height:130px;overflow-y:auto;margin:0 14px 14px;background:rgba(10,0,22,.55);",
-      " border:1px solid rgba(170,120,255,.14);border-radius:11px;padding:8px 10px;font:10.5px/1.45 'Cascadia Code',Consolas,monospace;}",
+      '.hdbot-mini:hover{background:rgba(0,100,241,.45);color:#fff;}',
+      "#hd-bot-log{height:130px;overflow-y:auto;margin:0 14px 14px;background:rgba(0,8,22,.55);",
+      " border:1px solid rgba(90,159,255,.14);border-radius:11px;padding:8px 10px;font:10.5px/1.45 'Cascadia Code',Consolas,monospace;}",
       '#hd-bot-log::-webkit-scrollbar,#hd-bot-content::-webkit-scrollbar{width:6px;}',
-      '#hd-bot-log::-webkit-scrollbar-thumb,#hd-bot-content::-webkit-scrollbar-thumb{background:rgba(170,120,255,.35);border-radius:3px;}',
+      '#hd-bot-log::-webkit-scrollbar-thumb,#hd-bot-content::-webkit-scrollbar-thumb{background:rgba(90,159,255,.35);border-radius:3px;}',
       '#hd-bot-log::-webkit-scrollbar-track,#hd-bot-content::-webkit-scrollbar-track{background:transparent;}',
       '#hd-bot-content{max-height:calc(100vh - 110px);overflow-y:auto;overflow-x:hidden;}',
     ].join('\n');
@@ -2399,6 +3289,18 @@
       });
       btnRow.appendChild(b);
     }
+
+    // ── Inspect Element HTML (full-width, above the utility row) ──
+    const inspectBtn = document.createElement('button');
+    inspectBtn.className = 'hdbot-ghost diag';
+    inspectBtn.id = 'hd-bot-inspect';
+    inspectBtn.textContent = '🔍 Inspect Element HTML';
+    inspectBtn.title = 'Click this, then click any element on the page — its HTML is copied to the clipboard (shadow DOM & iframes covered)';
+    inspectBtn.addEventListener('click', () => {
+      if (inspActive) { inspStop(); logInfo('Inspect cancelled'); }
+      else inspStart();
+    });
+    btnRow.appendChild(inspectBtn);
 
     // ── Pause / Stop ──
     const utilRow = document.createElement('div');
