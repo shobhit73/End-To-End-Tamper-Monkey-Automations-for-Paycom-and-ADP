@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.23.0
+// @version      0.24.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -43,6 +43,9 @@
   const STARTYEAR = THISYEAR - 3;
   // HR & Audit reports share one range: Jan 1 of LAST year → today.
   const HR_AUDIT_RANGES = [{ label: `${LASTYEAR}-to-date`, from: `01/01/${LASTYEAR}`, to: 'TODAY' }];
+  // Form I-9 Audit needs a deeper window: Jan 1 of (this year − 3) → today
+  // (in 2026: 01/01/2023 → today · in 2027: 01/01/2024 → today · …).
+  const I9_RANGES = [{ label: `${STARTYEAR}-to-date`, from: `01/01/${STARTYEAR}`, to: 'TODAY' }];
   // Quarterly ranges for reports whose full-year data is too large (e.g.
   // Employee Punch Change): last + current year split per quarter, skipping
   // quarters that haven't started yet. Files: <base>_2025-Q1.xlsx, …
@@ -174,6 +177,12 @@
     {
       section: 'HR & Audit', key: 'changed-contact', name: 'Changed Contact', rptId: 132, fileBase: 'ChangedContact',
       ranges: HR_AUDIT_RANGES,
+    },
+    // Has a Date Range (defaults 01/01/2023 → 12/31/<this year> on the live
+    // form); we override it with the 3-year I9_RANGES window. XLSX preselected.
+    {
+      section: 'HR & Audit', key: 'form-i9-audit', name: 'Form I-9 Audit', rptId: 171, fileBase: 'FormI9Audit',
+      ranges: I9_RANGES,
     },
     // ── Payroll ── (Advanced Report Writer wizard — 3-year prior payroll)
     // Range is DYNAMIC: 01/01/(this year − 3) → today. So in 2026 it's 2023→today,
