@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.6.4
+// @version      1.6.6
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -958,18 +958,20 @@
   // Step P6b: on the "What's Displayed" panel, clear all defaults then select
   // only the fields in PAYROLL_HISTORY_FIELDS. Finally click Save.
   async function stepSelectPayrollDisplayFields() {
-    // Wait for the field selection panel to appear
+    // Wait for the field selection panel to appear — up to 45s; slow tenants
+    // take well over the old 10s to render the slider.
     let panelReady = false;
-    for (let i = 0; i < 20 && !panelReady; i++) {
+    for (let i = 0; i < 90 && !panelReady; i++) {
       const labels = deepQueryAll('.checkactionbubble-text').filter(visible);
       if (labels.length > 5) {
         panelReady = true;
         break;
       }
+      if (i > 0 && i % 20 === 0) logInfo('Field panel still loading… (' + (i / 2) + 's)');
       await sleep(500);
     }
     if (!panelReady) {
-      logError('Field selection panel did not load');
+      logError('Field selection panel did not load (waited 45s)');
       return false;
     }
     logInfo('Field selection panel loaded');
@@ -1175,16 +1177,35 @@
     return true;
   }
 
-  // Select a single field on the "What's Displayed" panel WITHOUT clearing others
+  // Is the field already listed on the run page's "What's Displayed" CARD?
+  // The card shows Included Fields as plain text — when the field is already
+  // there, the whole panel trip is unnecessary (and on some tenants the slider
+  // never exposes the classic checkactionbubble markup at all, so skipping is
+  // the only way through).
+  function fieldAlreadyIncluded(fieldName) {
+    const re = new RegExp(fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*'), 'i');
+    for (const el of deepQueryAll('div, section, td, li')) {
+      if (!visible(el)) continue;
+      const t = (el.textContent || '');
+      if (t.length < 2000 && t.indexOf('Included Fields') >= 0 && re.test(t)) return true;
+    }
+    return false;
+  }
+
+  // Select a single field on the "What's Displayed" panel WITHOUT clearing others.
+  // Slow tenants (Lazo, North Star) take well over 10s to render the slider —
+  // the panel WAS loading fine, the old 10s wait just gave up too early. Wait
+  // up to 45s with progress notes.
   async function stepSelectSingleDisplayField(fieldName) {
     let panelReady = false;
-    for (let i = 0; i < 20 && !panelReady; i++) {
+    for (let i = 0; i < 90 && !panelReady; i++) {
       const labels = deepQueryAll('.checkactionbubble-text').filter(visible);
       if (labels.length > 3) { panelReady = true; break; }
+      if (i > 0 && i % 20 === 0) logInfo('Field panel still loading… (' + (i / 2) + 's)');
       await sleep(500);
     }
     if (!panelReady) {
-      logError('Field selection panel did not load');
+      logError('Field selection panel did not load (waited 45s)');
       return false;
     }
     await sleep(500);
@@ -1291,15 +1312,30 @@
       }
       await sleep(2000);
 
-      setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
       checkAbort();
-      if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
+      if (fieldAlreadyIncluded('Associate ID')) {
+        logSuccess('Associate ID is already in Included Fields — skipping the field panel (Steps 6-7)');
+      } else {
+        setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
+        if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
 
-      await sleep(1000);
+        await sleep(1000);
 
-      setStatus('Step 7: Selecting Associate ID…');
-      checkAbort();
-      if (!await stepSelectSingleDisplayField('Associate ID')) { setStatus('Step 7 failed — see log'); return; }
+        setStatus('Step 7: Selecting Associate ID…');
+        checkAbort();
+        let fieldOk = await stepSelectSingleDisplayField('Associate ID');
+        if (!fieldOk) {
+          // Slow tenant: the first click may have landed before the page was truly
+          // wired up. Re-open the panel once and try again.
+          logWarn('Retrying: re-opening "What\'s Displayed" and waiting again');
+          await sleep(2000);
+          if (await stepClickWhatsDisplayed()) {
+            await sleep(1000);
+            fieldOk = await stepSelectSingleDisplayField('Associate ID');
+          }
+        }
+        if (!fieldOk) { setStatus('Step 7 failed — see log'); return; }
+      }
 
       setStatus('Step 8: Running report…');
       checkAbort();
@@ -1675,14 +1711,29 @@
       }
       await sleep(2000);
 
-      setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
       checkAbort();
-      if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
-      await sleep(1000);
+      if (fieldAlreadyIncluded('Associate ID')) {
+        logSuccess('Associate ID is already in Included Fields — skipping the field panel (Steps 6-7)');
+      } else {
+        setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
+        if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
+        await sleep(1000);
 
-      setStatus('Step 7: Selecting Associate ID…');
-      checkAbort();
-      if (!await stepSelectSingleDisplayField('Associate ID')) { setStatus('Step 7 failed — see log'); return; }
+        setStatus('Step 7: Selecting Associate ID…');
+        checkAbort();
+        let fieldOk = await stepSelectSingleDisplayField('Associate ID');
+        if (!fieldOk) {
+          // Slow tenant: the first click may have landed before the page was truly
+          // wired up. Re-open the panel once and try again.
+          logWarn('Retrying: re-opening "What\'s Displayed" and waiting again');
+          await sleep(2000);
+          if (await stepClickWhatsDisplayed()) {
+            await sleep(1000);
+            fieldOk = await stepSelectSingleDisplayField('Associate ID');
+          }
+        }
+        if (!fieldOk) { setStatus('Step 7 failed — see log'); return; }
+      }
 
       setStatus('Step 8: Opening Appearance settings…');
       checkAbort();
