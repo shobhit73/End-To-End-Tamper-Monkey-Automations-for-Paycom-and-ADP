@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.6.6
+// @version      1.7.0
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1342,7 +1342,9 @@
       await sleep(1500);
       if (!await stepClickRunAsExcel()) { setStatus('Step 8 failed — see log'); return; }
 
-      setStatus('Deduction Report triggered ✓');
+      logSuccess('Deduction Report triggered — waiting for it on Reports Output');
+      const saved = await downloadFinishedReport('Deduction Report', setStatus);
+      setStatus(saved ? 'Deduction Report downloaded ✓' : 'Deduction Report triggered ✓ (download it from Reports Output)');
       logSuccess('=== Deduction Report complete ===');
 
     } catch (err) {
@@ -1412,7 +1414,9 @@
       checkAbort();
       if (!await stepClickRunAsExcel()) { setStatus('Step 6 failed — see log'); return; }
 
-      setStatus('Qualified Overtime Report triggered ✓');
+      logSuccess('Qualified Overtime Report triggered — waiting for it on Reports Output');
+      const saved = await downloadFinishedReport('Qualified Overtime Report', setStatus);
+      setStatus(saved ? 'Qualified Overtime Report downloaded ✓' : 'Qualified Overtime Report triggered ✓ (download it from Reports Output)');
       logSuccess('=== Qualified Overtime Wages and Tips complete ===');
 
     } catch (err) {
@@ -1754,7 +1758,9 @@
       await sleep(1500);
       if (!await stepClickRunAsExcel()) { setStatus('Step 11 failed — see log'); return; }
 
-      setStatus('Direct Deposit Report triggered ✓');
+      logSuccess('Direct Deposit Report triggered — waiting for it on Reports Output');
+      const saved = await downloadFinishedReport('Direct Deposit Report', setStatus);
+      setStatus(saved ? 'Direct Deposit Report downloaded ✓' : 'Direct Deposit Report triggered ✓ (download it from Reports Output)');
       logSuccess('=== Direct Deposit Report complete ===');
 
     } catch (err) {
@@ -3302,6 +3308,48 @@
     setTimeout(() => { try { URL.revokeObjectURL(bu); } catch (_) { } }, 15000);
     logSuccess('Saved ' + fname + ' (' + blob.size + ' bytes)');
     return true;
+  }
+
+  function safeFileName(name) {
+    return String(name || '').replace(/[^\w]+/g, '_').replace(/^_+|_+$/g, '');
+  }
+
+  // Client name for file prefixes, read from ADP's persistent top bar
+  // (same detection as the Historical Data bot).
+  function detectClientName() {
+    const texts = deepQueryAll('div, span, li, h1, h2, b').filter(visible)
+      .map(el => (el.textContent || '').trim())
+      .filter(t => t && t.length >= 4 && t.length < 60);
+    // 1) "0MJ - Flash Hub Delivery" style company-code chips (any case).
+    const chip = texts.find(t => /^[A-Za-z0-9.]{2,6}\s*-\s*[A-Za-z]/.test(t) && !/no company/i.test(t) && !/^https?:/i.test(t));
+    if (chip) return chip.replace(/^[A-Za-z0-9.]{2,6}\s*-\s*/, '').trim();
+    // 2) Top-bar brand: "ADP | <client>".
+    const brand = texts.find(t => /^ADP\s*\|\s*\S/.test(t));
+    if (brand) return brand.replace(/^ADP\s*\|\s*/, '').trim();
+    return '';
+  }
+
+  // End-of-run download for the single-report flows (Deduction / Direct
+  // Deposit / Qualified Overtime). After Run as Excel, ADP redirects to
+  // Reports Output on its own — wait for the new row to complete there and
+  // save it as <Client>_<Report>.xlsx (no prefix when the client chip can't
+  // be found). On any failure the file stays on Reports Output for a manual
+  // fetch; the flow itself still counts as triggered.
+  async function downloadFinishedReport(reportLabel, setStatus) {
+    await sleep(5000); // let ADP land on Reports Output and render the new row
+    phDownloadedSigs = new Set();
+    const client = detectClientName();
+    if (client) logInfo('Client detected: ' + client);
+    else logWarn('Client name not detected — file name will have no client prefix');
+    const fname = (client ? safeFileName(client) + '_' : '') + safeFileName(reportLabel) + '.xlsx';
+    try {
+      return await phDownloadRenamed({ label: reportLabel, phFileName: fname }, setStatus);
+    } catch (err) {
+      if (err && err.aborted) throw err;
+      logWarn('Download failed for ' + reportLabel + ' — fetch it from Reports Output manually (' +
+        ((err && err.message) || err) + ')');
+      return false;
+    }
   }
 
   // Payroll History uses a different flow: Standard Reports → search → select,
