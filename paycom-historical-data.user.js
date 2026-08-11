@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.24.0
-// @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
+// @version      0.26.0
+// @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
 // @grant        none
@@ -59,6 +59,10 @@
     }
     return out;
   })();
+
+  // Human Resources → E-Verify → E-Verify Cases. Same URL for both new E-Verify
+  // entries — it's a live grid page, not a per-report rpt_id/slug form.
+  const EVERIFY_CASES_URL = 'https://www.paycomonline.net/v4/cl/web.php/Everify/Index/caseList#!pcm-tab-1';
 
   const REPORTS = [
     // ── Time-Off ──
@@ -196,11 +200,22 @@
       range: { from: `01/01/${STARTYEAR}`, to: 'TODAY' },
       fileBase: `PriorPayroll_${STARTYEAR}-to-date`,
     },
+    // ── E-Verify ── (Human Resources → E-Verify → E-Verify Cases — a live
+    // DataTables grid, not a rpt-generate.php form, so both entries use their
+    // own `custom` flow instead of the generic date-range/snapshot handler.)
+    {
+      section: 'E-Verify', key: 'everify-cases-export', name: 'E-Verify Cases (grid export)',
+      url: EVERIFY_CASES_URL, custom: 'everifyCasesExport',
+    },
+    {
+      section: 'E-Verify', key: 'everify-case-details', name: 'E-Verify Case Details (all cases)',
+      url: EVERIFY_CASES_URL, custom: 'everifyCaseDetails',
+    },
   ];
   const reportByKey = (k) => REPORTS.find(r => r.key === k);
   // Distinct sections, in first-seen order — each gets its own Start button.
   const SECTIONS = REPORTS.reduce((acc, r) => acc.includes(r.section) ? acc : acc.concat(r.section), []);
-  const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️', 'Accrual': '📈', 'HR & Audit': '🧑‍💼', 'Payroll': '💵' };
+  const SECTION_ICON = { 'Time-Off': '🗓️', 'Time & Attendance': '⏱️', 'Accrual': '📈', 'HR & Audit': '🧑‍💼', 'Payroll': '💵', 'E-Verify': '🪪' };
 
   // Slug-based Report-Center reports still to wire (need slug navigation + their
   // own form handling):
@@ -1414,6 +1429,370 @@
     }
   }
 
+  // ═════════════════ E-Verify (Human Resources → E-Verify → E-Verify Cases) ═════════════════
+  // A live DataTables grid, not a rpt-generate.php form — two flows share it:
+  //   1. everifyCasesExport — one click: the grid's own "Export filtered
+  //      results as XLSX" action. Paycom names the file itself; we don't
+  //      intercept it (see note in exportEverifyCasesXlsx).
+  //   2. everifyCaseDetails — collect every case's (EE Code, Case Number) off
+  //      the grid across all its pages, confirm the count with the user (this
+  //      can be hundreds of pages), then visit each case's detail page and
+  //      build one CSV of every field on it.
+
+  function findEverifyGridTable() {
+    return Array.from(document.querySelectorAll('table')).find(t =>
+      visible(t) && /case number/i.test(t.textContent || '') && /ee code/i.test(t.textContent || ''));
+  }
+
+  // Column index lookup by header text, so a Paycom column-order change can't
+  // silently scramble which cell we read as which field.
+  function everifyColIndex(table, headerText) {
+    const ths = Array.from(table.querySelectorAll('thead th, thead td'));
+    return ths.findIndex(th => (th.textContent || '').trim().toLowerCase() === headerText);
+  }
+
+  function scrapeEverifyGridRows(table) {
+    const caseCol = everifyColIndex(table, 'case number');
+    const eeCol = everifyColIndex(table, 'ee code');
+    if (caseCol < 0 || eeCol < 0) return [];
+    const out = [];
+    for (const row of table.querySelectorAll('tbody tr')) {
+      if (!visible(row)) continue;
+      const cells = row.querySelectorAll('td');
+      const caseNumber = (cells[caseCol]?.textContent || '').trim();
+      const eeCode = (cells[eeCol]?.textContent || '').trim();
+      if (caseNumber && eeCode) out.push({ caseNumber, eeCode });
+    }
+    return out;
+  }
+
+  async function waitForEverifyGrid() {
+    const table = await waitFor(() => {
+      const t = findEverifyGridTable();
+      return (t && scrapeEverifyGridRows(t).length) ? t : null;
+    }, { timeout: 30000, label: 'E-Verify Cases grid' });
+    await sleep(400);
+    return table;
+  }
+
+  // A specific, fixed cutoff (not rolling) — the user wants every case since
+  // Jan 1, 2023, same for every client, every run. An unfiltered grid would
+  // include every case ever E-Verified, not just the migration-relevant set.
+  const EVERIFY_HIRE_DATE = { month: '01', day: '01', year: '2023' };
+
+  function everifyFilterAlreadyApplied() {
+    return Array.from(document.querySelectorAll('*')).some(el =>
+      el.children.length === 0 && visible(el) &&
+      /hire date is on and after\s*1\/1\/2023/i.test((el.textContent || '').replace(/\s+/g, ' ').trim()));
+  }
+
+  // Opens the Filters drawer, sets Hire Date → "Is on and After" → 01/01/2023,
+  // and clicks Apply. Skips the whole dance if that filter is already showing
+  // as an applied chip (some clients may have it saved from a prior session).
+  async function applyEverifyHireDateFilter() {
+    if (everifyFilterAlreadyApplied()) { uiLog('Hire Date filter already applied (≥ 1/1/2023) — skipping'); return; }
+    uiLog('Setting Hire Date filter: Is on and After 01/01/2023…');
+
+    const filterIcon = document.querySelector('svg[data-testid="filter-icon"]');
+    const filterBtn = filterIcon && (filterIcon.closest('button, [role="button"]') || filterIcon.parentElement);
+    if (!filterBtn) throw new Error('Filters button (funnel icon) not found');
+    clickEl(filterBtn);
+
+    const opInput = await waitFor(() => {
+      const el = document.querySelector('input[aria-label="Operator"]');
+      return (el && visible(el)) ? el : null;
+    }, { timeout: 15000, label: 'Hire Date "Operator" field' });
+    clickEl(opInput);
+
+    const opOption = await waitFor(() => {
+      const p = Array.from(document.querySelectorAll('[data-testid="typography"]'))
+        .find(el => visible(el) && (el.textContent || '').trim() === 'Is on and After');
+      return p ? (p.closest('[role="option"], li, div[tabindex]') || p) : null;
+    }, { timeout: 8000, label: '"Is on and After" option' });
+    clickEl(opOption);
+    await sleep(300);
+
+    const monthInput = await waitFor(() => document.querySelector('input[aria-label="Value - Date Month"]'),
+      { timeout: 8000, label: 'Hire Date month field' });
+    const dayInput = document.querySelector('input[aria-label="Value - Date Day"]');
+    const yearInput = document.querySelector('input[aria-label="Value - Date Year"]');
+    setInputValue(monthInput, EVERIFY_HIRE_DATE.month);
+    await sleep(150);
+    setInputValue(dayInput, EVERIFY_HIRE_DATE.day);
+    await sleep(150);
+    setInputValue(yearInput, EVERIFY_HIRE_DATE.year);
+    await sleep(150);
+
+    const applyBtn = await waitFor(() => {
+      const span = Array.from(document.querySelectorAll('span'))
+        .find(el => visible(el) && (el.textContent || '').trim() === 'Apply');
+      return span ? (span.closest('button, [role="button"]') || span) : null;
+    }, { timeout: 8000, label: '"Apply" button' });
+    clickEl(applyBtn);
+    await sleep(1500);
+    uiLog('Hire Date filter applied (Is on and After 01/01/2023)');
+  }
+
+  // DataTables pagination (same widget the daily bot's Doc Dashboard downloader
+  // already drives — ids follow the pattern <table-id>_next / _info): read the
+  // table's own id, then use its Next button + "Showing X to Y of Z" info text
+  // to detect when a page-turn actually rendered new rows.
+  const everifyGetInfoText = (tableId) => (document.getElementById(tableId + '_info')?.textContent || '').trim();
+  const everifyGetNextBtn = (tableId) => document.getElementById(tableId + '_next');
+  const everifyNextDisabled = (tableId) => {
+    const b = everifyGetNextBtn(tableId);
+    return !b || b.classList.contains('disabled') || b.getAttribute('aria-disabled') === 'true';
+  };
+  async function everifyWaitForPageChange(tableId, prevInfo) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 20000) {
+      await sleep(200);
+      const cur = everifyGetInfoText(tableId);
+      if (cur && cur !== prevInfo) return true;
+    }
+    return false;
+  }
+
+  // ── E-Verify Cases (grid export) ──
+  async function dispatchEverifyCasesExport(report, idx, queue) {
+    if (!location.href.includes('/web.php/Everify/Index/caseList')) {
+      uiLog(`→ Opening ${report.name}…`);
+      showBanner(`Opening ${report.name}…`);
+      location.href = EVERIFY_CASES_URL;
+      return;
+    }
+    try {
+      await waitForEverifyGrid();
+      showBanner(`${report.name}: setting Hire Date filter…`);
+      await applyEverifyHireDateFilter();
+      showBanner(`${report.name}: exporting…`);
+      await exportEverifyCasesXlsx();
+      uiLog(`✓ ${report.name}: export triggered — Paycom saves it under its own timestamped name`);
+      showBanner(`✓ ${report.name} exported`, true);
+      await sleep(2500); // let the browser's download start before we navigate away
+    } catch (err) {
+      if (err && err.aborted) { log('Aborted by user'); hideBanner(); return; }
+      hideBanner();
+      uiLog(`✕ Skipped ${report.name}: ${err && err.message ? err.message : err}`);
+    }
+    advanceTo(idx + 1, queue);
+  }
+
+  // The Actions trigger is a gear icon (no visible text — alt="Actions Gear
+  // Menu Carat Icon" on its dropdown-arrow image), opening a ddb-menu whose
+  // XLSX item is a stable id: #table-export-xlsx.
+  async function exportEverifyCasesXlsx() {
+    const trigger = await waitFor(() => {
+      const img = document.querySelector('img[alt="Actions Gear Menu Carat Icon"]')
+        || Array.from(document.querySelectorAll('img')).find(i => /carat_down\.png/i.test(i.src || ''));
+      const el = img && (img.closest('button, a, [role="button"], div[onclick], span[onclick]') || img.parentElement);
+      return (el && visible(el)) ? el : null;
+    }, { timeout: 20000, label: 'E-Verify Cases "Actions" trigger' });
+    clickEl(trigger);
+    let xlsxBtn = await waitFor(() => {
+      const b = document.getElementById('table-export-xlsx');
+      return (b && visible(b)) ? b : null;
+    }, { timeout: 8000, label: '"Export filtered results as XLSX"' }).catch(() => null);
+    if (!xlsxBtn) { // menu may have closed before render — reopen once
+      clickEl(trigger);
+      xlsxBtn = await waitFor(() => {
+        const b = document.getElementById('table-export-xlsx');
+        return (b && visible(b)) ? b : null;
+      }, { timeout: 8000, label: '"Export filtered results as XLSX" (retry)' });
+    }
+    clickEl(xlsxBtn);
+    await sleep(1500);
+  }
+
+  // ── E-Verify Case Details (all cases) ──
+  const EV_STATE_KEY = 'histbot.everify.state'; // '' | 'COLLECTING' | 'SCRAPING'
+  const EV_QUEUE_KEY = 'histbot.everify.queue'; // [{caseNumber, eeCode}, …] collected off the grid
+  const EV_IDX_KEY = 'histbot.everify.idx';     // index into the queue during SCRAPING
+  const EV_RESULTS_KEY = 'histbot.everify.results'; // [{field: value, …}, …] one per scraped case
+
+  function loadEverifyQueue() { try { return JSON.parse(localStorage.getItem(EV_QUEUE_KEY) || '[]'); } catch (_) { return []; } }
+  function saveEverifyQueue(arr) { try { localStorage.setItem(EV_QUEUE_KEY, JSON.stringify(arr)); } catch (_) {} }
+  function loadEverifyResults() { try { return JSON.parse(localStorage.getItem(EV_RESULTS_KEY) || '[]'); } catch (_) { return []; } }
+  function saveEverifyResults(arr) { try { localStorage.setItem(EV_RESULTS_KEY, JSON.stringify(arr)); } catch (_) {} }
+  function clearEverifyState() {
+    try {
+      localStorage.removeItem(EV_STATE_KEY);
+      localStorage.removeItem(EV_QUEUE_KEY);
+      localStorage.removeItem(EV_IDX_KEY);
+      localStorage.removeItem(EV_RESULTS_KEY);
+    } catch (_) {}
+  }
+
+  function everifyCaseUrl(c) {
+    return `https://www.paycomonline.net/v4/cl/web.php/EverifyV30/Index/viewCase/`
+      + `${encodeURIComponent(c.eeCode)}/${encodeURIComponent(c.caseNumber)}?fromNewHireId=0`;
+  }
+
+  // Confirmation dialog — shown ONLY after the full case count is known, since
+  // the user asked to see the real number ("286 cases") before committing to
+  // what will be a long, many-page pull.
+  function showEverifyConfirmDialog(count) {
+    return new Promise((resolve) => {
+      document.getElementById('histbot-everify-confirm')?.remove();
+      const overlay = document.createElement('div');
+      overlay.id = 'histbot-everify-confirm';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2147483647;display:flex;align-items:center;justify-content:center;font:14px sans-serif;';
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#fff;border-radius:10px;padding:20px;max-width:400px;width:92%;box-shadow:0 8px 32px rgba(0,0,0,0.35);';
+      const title = document.createElement('h3');
+      title.textContent = 'E-Verify Case Details';
+      title.style.cssText = 'margin:0 0 8px;color:#0b7dda;font-size:16px;';
+      const msg = document.createElement('div');
+      msg.textContent = `${count} case(s) found on the grid. Pulling full details for every one of them will take a while (roughly a couple of seconds per case, one page load each). Proceed?`;
+      msg.style.cssText = 'color:#333;font-size:13px;margin-bottom:16px;line-height:1.45;';
+      const btns = document.createElement('div');
+      btns.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;';
+      const cancel = document.createElement('button');
+      cancel.textContent = 'Cancel';
+      cancel.style.cssText = 'padding:9px 18px;border:1px solid #bbb;background:#fff;border-radius:5px;cursor:pointer;font-size:13px;';
+      cancel.onclick = () => { overlay.remove(); resolve(false); };
+      const ok = document.createElement('button');
+      ok.textContent = `Proceed — ${count} cases`;
+      ok.style.cssText = 'padding:9px 18px;border:0;background:#0b7dda;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;font-size:13px;';
+      ok.onclick = () => { overlay.remove(); resolve(true); };
+      btns.appendChild(cancel); btns.appendChild(ok);
+      box.appendChild(title); box.appendChild(msg); box.appendChild(btns);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    });
+  }
+
+  async function dispatchEverifyCaseDetails(report, idx, queue) {
+    try {
+      const state = localStorage.getItem(EV_STATE_KEY) || '';
+      if (!state) {
+        localStorage.setItem(EV_STATE_KEY, 'COLLECTING');
+        saveEverifyQueue([]);
+        uiLog(`→ Opening ${report.name}…`);
+        location.href = EVERIFY_CASES_URL;
+        return;
+      }
+      if (state === 'COLLECTING') {
+        if (!location.href.includes('/web.php/Everify/Index/caseList')) { location.href = EVERIFY_CASES_URL; return; }
+        await everifyCollectPhase(report, idx, queue);
+        return;
+      }
+      if (state === 'SCRAPING') {
+        await everifyScrapePhase(report, idx, queue);
+        return;
+      }
+      // Unknown/stale state — reset and bail rather than loop forever.
+      clearEverifyState(); advanceTo(idx + 1, queue);
+    } catch (err) {
+      if (err && err.aborted) { log('Aborted by user'); hideBanner(); return; }
+      hideBanner();
+      uiLog(`✕ ${report.name} failed: ${err && err.message ? err.message : err}`);
+      clearEverifyState();
+      advanceTo(idx + 1, queue);
+    }
+  }
+
+  // Walks every page of the grid (via its DataTables Next button), collecting
+  // {caseNumber, eeCode} off each one, then hands off to the confirm dialog.
+  async function everifyCollectPhase(report, idx, queue) {
+    showBanner(`${report.name}: collecting the case list…`);
+    await waitForEverifyGrid();
+    await applyEverifyHireDateFilter();
+    const table = await waitForEverifyGrid(); // grid re-renders after Apply — re-fetch the table reference
+    const tableId = table.id;
+    let collected = loadEverifyQueue();
+    const seen = new Set(collected.map(c => c.caseNumber));
+    let page = 1;
+    while (true) {
+      await sleep(0); // abort checkpoint — this file has no standalone checkAbort()
+      for (const r of scrapeEverifyGridRows(table)) {
+        if (!seen.has(r.caseNumber)) { seen.add(r.caseNumber); collected.push(r); }
+      }
+      saveEverifyQueue(collected);
+      uiLog(`${report.name}: ${collected.length} case(s) collected so far (page ${page})…`);
+      if (!tableId || everifyNextDisabled(tableId)) break;
+      const prevInfo = everifyGetInfoText(tableId);
+      clickEl(everifyGetNextBtn(tableId));
+      const moved = await everifyWaitForPageChange(tableId, prevInfo);
+      if (!moved) { uiLog(`${report.name}: pagination stopped responding — using what was collected`); break; }
+      page++;
+    }
+    uiLog(`${report.name}: ${collected.length} total case(s) found`);
+    hideBanner();
+    const proceed = await showEverifyConfirmDialog(collected.length);
+    if (!proceed || !collected.length) {
+      uiLog(`↷ ${report.name}: cancelled by user`);
+      clearEverifyState();
+      advanceTo(idx + 1, queue);
+      return;
+    }
+    localStorage.setItem(EV_STATE_KEY, 'SCRAPING');
+    localStorage.setItem(EV_IDX_KEY, '0');
+    saveEverifyResults([]);
+    location.href = everifyCaseUrl(collected[0]);
+  }
+
+  // Every field on a case's view page is `<span [value="…"] aria-label="Label">`
+  // inside a `div.row.formRowStandard#<field>-row` — a plain label→value walk.
+  function scrapeEverifyCaseDetail(caseNumber) {
+    const record = { 'Case Number': caseNumber };
+    const rows = document.querySelectorAll('#v30ViewCaseForm .row.formRowStandard[id$="-row"]');
+    for (const row of rows) {
+      const label = (row.querySelector('label')?.textContent || '').trim();
+      if (!label || label in record) continue;
+      const valEl = row.querySelector('[value]');
+      const value = valEl ? (valEl.getAttribute('value') || '').trim() : (row.querySelector('.formLine')?.textContent || '').trim();
+      record[label] = value;
+    }
+    return record;
+  }
+
+  async function everifyScrapePhase(report, idx, queue) {
+    const cases = loadEverifyQueue();
+    const i = parseInt(localStorage.getItem(EV_IDX_KEY) || '0', 10) || 0;
+    if (i >= cases.length) { await everifyFinishScrape(report, idx, queue); return; }
+    const current = cases[i];
+    showBanner(`${report.name}: ${i + 1}/${cases.length} (${current.caseNumber})…`);
+    try {
+      await waitFor(() => document.querySelector('#v30ViewCaseForm'), { timeout: 20000, label: `case ${current.caseNumber} detail page` });
+      await sleep(350);
+      const results = loadEverifyResults();
+      results.push(scrapeEverifyCaseDetail(current.caseNumber));
+      saveEverifyResults(results);
+    } catch (err) {
+      if (err && err.aborted) throw err;
+      uiLog(`⚠ Case ${current.caseNumber}: ${err.message} — skipped`);
+    }
+    const next = i + 1;
+    localStorage.setItem(EV_IDX_KEY, String(next));
+    if (next < cases.length) { location.href = everifyCaseUrl(cases[next]); return; }
+    await everifyFinishScrape(report, idx, queue);
+  }
+
+  function everifyResultsToCsv(records) {
+    const headers = [];
+    const seen = new Set();
+    for (const r of records) for (const k of Object.keys(r)) if (!seen.has(k)) { seen.add(k); headers.push(k); }
+    const esc = (v) => {
+      const s = String(v == null ? '' : v);
+      return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    const lines = [headers.map(esc).join(',')];
+    for (const r of records) lines.push(headers.map(h => esc(r[h])).join(','));
+    return lines.join('\r\n');
+  }
+
+  async function everifyFinishScrape(report, idx, queue) {
+    const results = loadEverifyResults();
+    const csv = everifyResultsToCsv(results);
+    const fname = `EVerifyCaseDetails_${THISYEAR}.csv`;
+    saveBlob(new Blob([csv], { type: 'text/csv;charset=utf-8;' }), fname);
+    uiLog(`✓ Saved ${fname} (${results.length} case(s))`);
+    showBanner(`✓ ${report.name} — ${results.length} case(s) downloaded`, true);
+    clearEverifyState();
+    advanceTo(idx + 1, queue);
+  }
+
   // ───────────────── Page-router state machine ─────────────────
   // Iterates over the run queue (the report keys the user ticked in the picker).
   async function dispatch() {
@@ -1426,6 +1805,8 @@
     if (!report) { setIndex(idx + 1); dispatch(); return; }
 
     if (report.wizard) { await dispatchWizard(report, idx, queue); return; }
+    if (report.custom === 'everifyCasesExport') { await dispatchEverifyCasesExport(report, idx, queue); return; }
+    if (report.custom === 'everifyCaseDetails') { await dispatchEverifyCaseDetails(report, idx, queue); return; }
 
     if (!isOnReportPage(report)) {
       uiLog(`→ Opening ${report.name}…`);
