@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.8.0
+// @version      1.9.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -36,7 +36,7 @@
   const PANEL_ID = 'hd-bot-panel';
   // 1.8.0 = merge of two parallel lines: Rohit's 1.2.0 (Who Appears filter for
   // two Time Off reports) + the 1.2.x–1.7.x line (T&A timecards, Audit Trail).
-  const SCRIPT_VERSION = '1.8.0';
+  const SCRIPT_VERSION = '1.9.0';
 
   const YEARS_KEY = 'historicalBot.adp.years';
 
@@ -94,6 +94,13 @@
   const AUDIT_MENUS = ['My Team', 'Myself', 'People', 'Process']; // NOT Setup
   const AUDIT_CATEGORIES = ['Employment', 'Personal Information', 'My Information', 'Pay', 'ACA', 'Statutory Compliance', 'HR'];
   const AUDIT_FEATURES = ['EI-9 Management', 'Employment Profile', 'Job Profiles', 'Personal Profile', 'Form I-9', 'Profile', 'ACA Benefit Offerings', 'ACA Benefit Status', 'Record Of Employment'];
+
+  // Form I-9 and E-Verify Information: a "Sample"-type report reached through
+  // the Dojo SEARCH BOX on All Standard Reports (it lives in no sidebar
+  // category). Its Run page is the revit Filter Builder style — nothing to
+  // configure, no date range; just click the #bttRun button. One file per run.
+  const I9_REPORT = 'Form I-9 and E-Verify Information';
+  const I9_TYPE = 'Sample';
 
   // Extra settle before click-heavy Dojo steps. The Standard Reports pages are
   // slow to wire up their widgets; without this pad, clicks land on dead nodes
@@ -2698,6 +2705,100 @@
     }
   }
 
+  // ───────────────────────── Form I-9 / E-Verify ─────────────────────────
+
+  // The I-9 run page shows none of the generic markers ("What's Displayed",
+  // "Run as Excel") and its heading is "Run Report - Form I-9 and E-Verify
+  // Information", so stepWaitForRunReportPage can't see it. Its one reliable
+  // constant is the revit Run button (#bttRun / PENDO_ADPR_RUN_REPORT_BTN).
+  function findI9RunButton() {
+    return deepQueryAll('#bttRun, [data-pendo-id="PENDO_ADPR_RUN_REPORT_BTN"]').filter(visible)[0] || null;
+  }
+
+  async function stepWaitForI9RunPage() {
+    for (let i = 0; i < 120; i++) { // up to 60s
+      checkAbort();
+      if (findI9RunButton()) { logSuccess('I-9 Run Report page is up'); await sleep(DOJO_PAD); return true; }
+      await sleep(500);
+    }
+    logError('I-9 Run Report page (#bttRun) did not load');
+    return false;
+  }
+
+  async function stepClickI9Run() {
+    const btn = findI9RunButton();
+    if (!btn) { logError('Run button (#bttRun) not found'); return false; }
+    clickEl(btn);
+    try { btn.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+    logSuccess('Clicked Run');
+    return true;
+  }
+
+  function i9Steps() {
+    return [
+      { name: 'Open Reports & Analytics menu', fn: () => stepOpenReportsMenu() },
+      { name: 'Open All Standard Reports', fn: () => stepClickAllStandardReports() },
+      { name: 'Search "' + I9_REPORT + '"', fn: async () => { await sleep(DOJO_PAD); return stepSearchDojoReport(I9_REPORT); } },
+      {
+        name: 'Select ' + I9_REPORT, fn: async () => {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            await sleep(1000);
+            if (await stepSelectStandardReportByTitle(I9_REPORT, I9_TYPE)) return true;
+            if (attempt < 3) {
+              logWarn('Attempt ' + attempt + '/3 found nothing — re-running the search');
+              await stepSearchDojoReport(I9_REPORT);
+            }
+          }
+          return false;
+        }
+      },
+      { name: 'Wait for Run Report page', fn: () => stepWaitForI9RunPage() },
+      { name: 'Detect client name', fn: async () => { tryDetectClient('I-9 run page'); return true; } },
+      { name: 'Run', fn: async () => { await sleep(800); return stepClickI9Run(); } },
+      { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
+      {
+        name: 'Download', fn: async () => {
+          const fileName = (auditClientName ? safeFileName(auditClientName) + '_' : '') +
+            'Form_I9_EVerify_Information.xlsx';
+          try {
+            const res = await downloadRenamed(fileName, I9_REPORT);
+            if (res && res.sig) downloadedSigs.add(res.sig);
+            return true;
+          } catch (err) {
+            if (err && (err.aborted || err.paused)) throw err;
+            logWarn('Download failed for ' + I9_REPORT + ' — fetch it from Reports Output manually (' +
+              ((err && err.message) || err) + ')');
+            return true; // the report ran; a naming failure must not fail it
+          }
+        }
+      },
+    ];
+  }
+
+  async function downloadFormI9() {
+    if (isRunning()) { logWarn('Already running — click Stop first.'); return; }
+    logInfo('=== Form I-9 / E-Verify ===');
+    resetAbort();
+    setRunning(true);
+    downloadedSigs = new Set();
+    auditClientName = ''; // fresh detection per run (shared with Audit Trail)
+    try {
+      await runSteps(i9Steps(), { report: I9_REPORT });
+      setStatus(I9_REPORT + ' downloaded ✓');
+      logSuccess('=== ' + I9_REPORT + ' complete ===');
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Aborted by user');
+        logWarn('Flow aborted by user (Stop / reset)');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + ((err && err.message) || err));
+    } finally {
+      setRunning(false);
+    }
+  }
+
   // Phase B adds a data set by appending one entry here plus one flow function.
   // The panel's button rail is generated from this list.
   const HISTORICAL_REPORTS = [
@@ -2705,6 +2806,7 @@
     { key: 'timeoff', icon: '🏖️', label: 'Time Off', fn: downloadTimeOffReports },
     { key: 'timecard', icon: '🕒', label: 'T&A Timecards & Hours', fn: downloadTaLegacyReports },
     { key: 'audittrail', icon: '🧾', label: 'Audit Trail (quarterly)', fn: downloadAuditTrail },
+    { key: 'formi9', icon: '🪪', label: 'Form I-9 / E-Verify', fn: downloadFormI9 },
   ];
 
   // ───────────────────────────── year dialog ────────────────────────────
