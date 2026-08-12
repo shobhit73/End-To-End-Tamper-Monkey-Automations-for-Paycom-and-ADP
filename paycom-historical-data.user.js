@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.27.0
+// @version      0.28.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -187,6 +187,11 @@
     {
       section: 'HR & Audit', key: 'form-i9-audit', name: 'Form I-9 Audit', rptId: 171, fileBase: 'FormI9Audit',
       ranges: I9_RANGES,
+    },
+    // Has a Date Range but caps at 1 year of data per pull → default two-file
+    // year loop (this year + last year), Select-All employees. XLSX preselected.
+    {
+      section: 'HR & Audit', key: 'garnishment-report', name: 'Garnishment Report', rptId: 20, fileBase: 'GarnishmentReport',
     },
     // ── Payroll ── (Advanced Report Writer wizard — 3-year prior payroll)
     // Range is DYNAMIC: 01/01/(this year − 3) → today. So in 2026 it's 2023→today,
