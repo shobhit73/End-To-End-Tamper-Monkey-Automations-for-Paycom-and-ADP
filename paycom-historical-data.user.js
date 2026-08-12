@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.26.0
+// @version      0.27.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -295,21 +295,51 @@
   }
 
   // ───────────────── Logging ─────────────────
-  const log = (...args) => console.log('[HistBot]', ...args);
+  // Also feeds the full session log (defined below) so lifecycle events that
+  // only ever went to the console before — Stop/reset, aborts, standby — are
+  // now in the downloadable log too.
+  const log = (...args) => {
+    console.log('[HistBot]', ...args);
+    try {
+      let t = ''; try { t = new Date().toLocaleTimeString(); } catch (_) {}
+      const msg = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+      appendFullLog((t ? t + '  ' : '') + msg);
+    } catch (_) {}
+  };
 
   // Live activity log, persisted so it survives the page reloads between reports
   // (the panel shows the last ~50 lines: which report/year is processing, saves…).
   const LOG_KEY = 'histbot.log';
   function getLog() { try { const a = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
   function clearLog() { try { localStorage.removeItem(LOG_KEY); } catch (_) {} renderLog(); }
+
+  // Separate FULL log, kept apart from the 50-line display log above: it is
+  // never trimmed to 50 lines and — unlike the display log — is NOT wiped by
+  // Stop/Reset or by starting a new run. A long flow (e.g. E-Verify Case
+  // Details across hundreds of pages) would otherwise lose most of its
+  // history by the time it finishes, and Stop/Reset would erase the rest.
+  // Only "Clear full log" in the panel empties it. Capped generously (5000
+  // lines) purely as a localStorage-quota safety valve, not a normal limit.
+  const FULL_LOG_KEY = 'histbot.fulllog';
+  function appendFullLog(line) {
+    let arr;
+    try { arr = JSON.parse(localStorage.getItem(FULL_LOG_KEY) || '[]'); if (!Array.isArray(arr)) arr = []; } catch (_) { arr = []; }
+    arr.push(line);
+    while (arr.length > 5000) arr.shift();
+    try { localStorage.setItem(FULL_LOG_KEY, JSON.stringify(arr)); } catch (_) {}
+  }
+  function clearFullLog() { try { localStorage.removeItem(FULL_LOG_KEY); } catch (_) {} }
+
   function uiLog(msg) {
     log(msg);
-    const arr = getLog();
     let t = '';
     try { t = new Date().toLocaleTimeString(); } catch (_) {}
-    arr.push((t ? t + '  ' : '') + msg);
+    const line = (t ? t + '  ' : '') + msg;
+    const arr = getLog();
+    arr.push(line);
     while (arr.length > 50) arr.shift();
     try { localStorage.setItem(LOG_KEY, JSON.stringify(arr)); } catch (_) {}
+    appendFullLog(line);
     renderLog();
   }
   function renderLog() {
@@ -2098,10 +2128,12 @@
         #histbot-panel .hb-loglabel{font-size:10px;font-weight:800;letter-spacing:.8px;color:rgba(202,210,197,.6);
           text-transform:uppercase;margin:10px 0 4px;display:flex;align-items:center;gap:8px}
         #histbot-panel .hb-loglabel::after{content:'';flex:1;height:1px;background:rgba(202,210,197,.18)}
-        #histbot-panel .hb-copylog{display:inline-flex;align-items:center;width:auto;margin:0;padding:2px 8px;
+        #histbot-panel .hb-copylog, #histbot-panel .hb-dllog, #histbot-panel .hb-clearlog{
+          display:inline-flex;align-items:center;width:auto;margin:0;padding:2px 8px;
           font-size:10px;font-weight:700;letter-spacing:.4px;border-radius:6px;cursor:pointer;
           background:rgba(132,169,140,.15);color:#cad2c5;border:1px solid rgba(132,169,140,.35)}
-        #histbot-panel .hb-copylog:hover{transform:none;box-shadow:none;background:rgba(132,169,140,.3)}
+        #histbot-panel .hb-copylog:hover, #histbot-panel .hb-dllog:hover, #histbot-panel .hb-clearlog:hover{
+          transform:none;box-shadow:none;background:rgba(132,169,140,.3)}
         #histbot-panel .hb-log{height:118px;overflow:auto;padding:7px 9px;border-radius:9px;
           background:rgba(20,28,26,.6);border:1px solid rgba(132,169,140,.25);color:#c9d6cc;
           font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
@@ -2136,7 +2168,11 @@
         <div class="hb-starts"></div>
         <button class="inspect" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
         <button class="stop">⏹ Stop / reset</button>
-        <div class="hb-loglabel">Activity <button class="hb-copylog" title="Copy the whole activity log to the clipboard">📋 Copy</button></div>
+        <div class="hb-loglabel">Activity
+          <button class="hb-copylog" title="Copy the whole activity log to the clipboard">📋 Copy</button>
+          <button class="hb-dllog" title="Download the FULL session log as a .txt file — this one is never cleared by Stop/reset or a new run">⬇ Log file</button>
+          <button class="hb-clearlog" title="Clear the saved full session log">🗑</button>
+        </div>
         <div class="hb-log"></div>
       </div>
     `;
@@ -2166,6 +2202,17 @@
         ta.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (_) {}
         ta.remove(); done(ok);
       }
+    });
+    panelEl.querySelector('.hb-dllog').addEventListener('click', () => {
+      let arr = [];
+      try { arr = JSON.parse(localStorage.getItem(FULL_LOG_KEY) || '[]'); if (!Array.isArray(arr)) arr = []; } catch (_) { arr = []; }
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      saveBlob(new Blob([arr.join('\n')], { type: 'text/plain;charset=utf-8;' }), `HistBotLog_${stamp}.txt`);
+    });
+    panelEl.querySelector('.hb-clearlog').addEventListener('click', () => {
+      clearFullLog();
+      const btn = panelEl.querySelector('.hb-clearlog');
+      btn.textContent = '✓'; setTimeout(() => { btn.textContent = '🗑'; }, 1200);
     });
 
     // Minimize toggle — persisted so it survives Paycom's page reloads.
