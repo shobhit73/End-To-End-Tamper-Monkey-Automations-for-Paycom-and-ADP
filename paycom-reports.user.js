@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.20.1
+  // @version      0.23.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -273,8 +273,43 @@
   `;
     // ====== END field list ======
 
+    // Activity log, persisted so it survives page reloads between steps. Two
+    // stores: a rolling ~50-line one the panel displays live, and a FULL one
+    // (5000-line safety cap, not a normal limit) that is never trimmed and is
+    // NOT cleared by Stop/reset or starting a new flow — only an explicit
+    // "Clear" in the panel empties it. Without this, a long flow (Prior
+    // Payroll across many pay periods, Download All Reports) would lose most
+    // of its history by the time it finished, and the only visible trace was
+    // ever a single rotating banner line with no history at all.
+    const LOG_KEY = 'paycomBot.log';
+    const FULL_LOG_KEY = 'paycomBot.fulllog';
+    function getLogLines() { try { const a = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+    function clearLogLines() { try { localStorage.removeItem(LOG_KEY); } catch (_) {} renderLogPanel(); }
+    function clearFullLog() { try { localStorage.removeItem(FULL_LOG_KEY); } catch (_) {} }
+    function appendFullLog(line) {
+      let arr;
+      try { arr = JSON.parse(localStorage.getItem(FULL_LOG_KEY) || '[]'); if (!Array.isArray(arr)) arr = []; } catch (_) { arr = []; }
+      arr.push(line);
+      while (arr.length > 5000) arr.shift();
+      try { localStorage.setItem(FULL_LOG_KEY, JSON.stringify(arr)); } catch (_) {}
+    }
+    function renderLogPanel() {
+      if (!panelEl) return;
+      const el = panelEl.querySelector('.pcb-log');
+      if (el) { el.textContent = getLogLines().join('\n'); el.scrollTop = el.scrollHeight; }
+    }
+
     const log = (...args) => {
       console.log('[PaycomBot]', ...args);
+      let t = ''; try { t = new Date().toLocaleTimeString(); } catch (_) {}
+      const msg = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+      const line = (t ? t + '  ' : '') + msg;
+      const arr = getLogLines();
+      arr.push(line);
+      while (arr.length > 50) arr.shift();
+      try { localStorage.setItem(LOG_KEY, JSON.stringify(arr)); } catch (_) {}
+      appendFullLog(line);
+      renderLogPanel();
       // Mirror single-string step messages to the on-screen banner while a flow
       // is running, so the user sees each step as it happens. Multi-arg logs
       // (e.g. "PP state →", s) are technical and skipped.
@@ -1740,47 +1775,76 @@
     }
 
     // Download the report file OURSELVES so we control the filename.
-    // Clicking Paycom's Download button fires an XHR to
+    //
+    // PRIMARY path (robust): every queue row is <div id="queued-report-N"
+    // class="queued-item">…<button class="js-report-download">…</div> — N
+    // *is* the transid. We read it straight off the DOM the moment the
+    // Download button appears, so we never have to click anything or wait on
+    // a click's side effect. This is what makes it reliable for reports
+    // Paycom auto-reformats for being "too big for the selected output" —
+    // for those, the Download click does NOT fire the one-time-password XHR
+    // the old code depended on (Paycom serves the file some other,
+    // unintercepted way under its own default name instead), which used to
+    // time out and force a manual rename every single time.
+    //
+    // FALLBACK path: if a queue row somehow lacks that id (different page
+    // layout, a future Paycom change), fall back to the old click + intercept
+    // technique — clicking fires an XHR to
     //   …/report-center/reportaction/one-time-password?…&transid=N
-    // and then Paycom navigates to rpt-generateproc.php to download the file
-    // (with its own default name). We hook that XHR to (a) capture the transid
-    // and (b) abort it so Paycom's success handler never runs — no Paycom-side
-    // download, hence no duplicate file. Then we fetch the file directly and
-    // save it as PriorPayroll_<dates>.csv. The fetch completing IS the
+    // which we hook to (a) capture the transid and (b) abort it so Paycom's
+    // own (default-named) download never happens.
+    //
+    // Either way we then fetch rpt-generateproc.php ourselves and save the
+    // file as PriorPayroll_<dates>.csv — the fetch completing IS the
     // "download done" signal, so the caller moves to the next task immediately.
     async function ppDownloadReportFile(task, downloadBtn) {
       const fileName = downloadFileName(task);
       const nonce = getSessionNonce();
       if (!nonce) throw new Error('Could not find session_nonce on the page');
 
-      let capturedTransid = '';
-      const proto = window.XMLHttpRequest.prototype;
-      const origOpen = proto.open;
-      const origSend = proto.send;
-      proto.open = function (method, url, ...rest) {
-        this.__ppUrl = url;
-        return origOpen.call(this, method, url, ...rest);
-      };
-      proto.send = function (...args) {
-        if (/one-time-password/i.test(this.__ppUrl || '')) {
-          const m = (this.__ppUrl || '').match(/transid=(\d+)/i);
-          if (m) capturedTransid = m[1];
-          log(`PP: captured transid=${capturedTransid} from one-time-password XHR; ` +
-            `aborting it to suppress Paycom's own (default-named) download`);
-          const r = origSend.apply(this, args);
-          try { this.abort(); } catch (_) {}
-          return r;
-        }
-        return origSend.apply(this, args);
-      };
-      const restore = () => { proto.open = origOpen; proto.send = origSend; };
+      const queueRow = downloadBtn.closest('[id^="queued-report-"]');
+      const rowMatch = queueRow && /^queued-report-(\d+)$/.exec(queueRow.id);
+      let capturedTransid = rowMatch ? rowMatch[1] : '';
 
-      try {
-        clickEl(downloadBtn); // fires Paycom's one-time-password XHR (intercepted)
-        await waitFor(() => !!capturedTransid,
-          { timeout: 10000, interval: 100, label: 'report transid (one-time-password XHR)' });
-      } finally {
-        restore();
+      if (capturedTransid) {
+        log(`PP: transid=${capturedTransid} read directly from the queue row's own id — no click needed`);
+      } else {
+        log('PP: queue row id not found (unexpected layout) — falling back to click + intercept');
+        const proto = window.XMLHttpRequest.prototype;
+        const origOpen = proto.open;
+        const origSend = proto.send;
+        proto.open = function (method, url, ...rest) {
+          this.__ppUrl = url;
+          return origOpen.call(this, method, url, ...rest);
+        };
+        proto.send = function (...args) {
+          if (/one-time-password/i.test(this.__ppUrl || '')) {
+            const m = (this.__ppUrl || '').match(/transid=(\d+)/i);
+            if (m) capturedTransid = m[1];
+            log(`PP: captured transid=${capturedTransid} from one-time-password XHR; ` +
+              `aborting it to suppress Paycom's own (default-named) download`);
+            const r = origSend.apply(this, args);
+            try { this.abort(); } catch (_) {}
+            return r;
+          }
+          return origSend.apply(this, args);
+        };
+        const restore = () => { proto.open = origOpen; proto.send = origSend; };
+
+        try {
+          clickEl(downloadBtn); // fires Paycom's one-time-password XHR (intercepted)
+          await waitFor(() => !!capturedTransid,
+            { timeout: 20000, interval: 100, label: 'report transid (one-time-password XHR)' });
+        } catch (waitErr) {
+          if (waitErr && waitErr.aborted) throw waitErr;
+          const e = new Error('No queue-row id and no one-time-password XHR fired for this report — '
+            + 'could not determine its transid. Check Downloads for a "…Employee_YTD_Balances_Report…" '
+            + 'file and rename it by hand if needed.');
+          e.otpNotFired = true;
+          throw e;
+        } finally {
+          restore();
+        }
       }
 
       const url = 'https://www.paycomonline.net/v4/cl/rpt-generateproc.php'
@@ -1866,9 +1930,19 @@
         // Script-controlled download: captures the transid, suppresses Paycom's
         // own download, fetches the file directly, saves it as PriorPayroll_*.csv.
         // Resolves the instant the file is fully fetched.
-        await ppDownloadReportFile(task, downloads[0]);
+        try {
+          await ppDownloadReportFile(task, downloads[0]);
+        } catch (dlErr) {
+          if (dlErr && dlErr.aborted) throw dlErr;
+          if (!dlErr || !dlErr.otpNotFired) throw dlErr;
+          // Non-fatal: this one task's file likely already saved itself under
+          // Paycom's own default name (see ppDownloadReportFile). Don't let one
+          // oversized report kill the rest of the batch — log it and move on.
+          log(`Task ${index + 1} (${task.label}): ${dlErr.message}`);
+          showProgressBanner(`⚠ Task ${index + 1}/${tasks.length} needs a manual rename — continuing…`);
+        }
 
-        // File downloaded — move straight to the next task in the lineup.
+        // Move straight to the next task in the lineup.
         setPpIndex(index + 1);
         await sleep(2000); // brief settle before next task
       }
@@ -3227,6 +3301,18 @@
           #paycom-bot-panel .doc-dl-section{border-top:1px dashed rgba(132,169,140,.3)!important;margin-top:12px!important;padding-top:8px!important}
           #paycom-bot-panel .doc-dl-section .status{display:block;text-transform:none;letter-spacing:0;font-size:12px;color:#cad2c5;font-weight:500}
           #paycom-bot-panel.minimized .body{display:none}
+          #paycom-bot-panel .pcb-loglabel{font-size:10px;font-weight:800;letter-spacing:.8px;color:rgba(202,210,197,.6);
+            text-transform:uppercase;margin:12px 0 4px;display:flex;align-items:center;gap:8px}
+          #paycom-bot-panel .pcb-loglabel::after{content:'';flex:1;height:1px;background:rgba(202,210,197,.18)}
+          #paycom-bot-panel .pcb-copylog, #paycom-bot-panel .pcb-dllog, #paycom-bot-panel .pcb-clearlog{
+            display:inline-flex;align-items:center;width:auto;margin:0;padding:2px 8px;
+            font-size:10px;font-weight:700;letter-spacing:.4px;border-radius:6px;cursor:pointer;
+            background:rgba(132,169,140,.15);color:#cad2c5;border:1px solid rgba(132,169,140,.35)}
+          #paycom-bot-panel .pcb-copylog:hover, #paycom-bot-panel .pcb-dllog:hover, #paycom-bot-panel .pcb-clearlog:hover{
+            transform:none;box-shadow:none;background:rgba(132,169,140,.3)}
+          #paycom-bot-panel .pcb-log{height:118px;overflow:auto;padding:7px 9px;border-radius:9px;
+            background:rgba(20,28,26,.6);border:1px solid rgba(132,169,140,.25);color:#c9d6cc;
+            font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
         </style>
         <div class="hdr">
           <h4>Paycom Bot</h4>
@@ -3249,6 +3335,12 @@
           <button class="inspect-html" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
           <button class="stop">⏹ Stop / reset</button>
           <div class="doc-dl-section" style="display:none"></div>
+          <div class="pcb-loglabel">Activity
+            <button class="pcb-copylog" title="Copy the visible activity log to the clipboard">📋 Copy</button>
+            <button class="pcb-dllog" title="Download the FULL session log as a .txt file — this one is never cleared by Stop/reset or a new run">⬇ Log file</button>
+            <button class="pcb-clearlog" title="Clear the saved full session log">🗑</button>
+          </div>
+          <div class="pcb-log"></div>
         </div>
       `;
       document.body.appendChild(panelEl);
@@ -3308,6 +3400,35 @@
       panelEl.querySelector('.inspect-html').addEventListener('click', () => {
         startInspectCapture();
       });
+      panelEl.querySelector('.pcb-copylog').addEventListener('click', () => {
+        const btn = panelEl.querySelector('.pcb-copylog');
+        const txt = getLogLines().join('\n');
+        const done = (ok) => { btn.textContent = ok ? '✓ Copied' : '✕ Copy failed'; setTimeout(() => { btn.textContent = '📋 Copy'; }, 1600); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(txt).then(() => done(true), () => done(false));
+        } else {
+          const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta);
+          ta.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (_) {}
+          ta.remove(); done(ok);
+        }
+      });
+      panelEl.querySelector('.pcb-dllog').addEventListener('click', () => {
+        let arr = [];
+        try { arr = JSON.parse(localStorage.getItem(FULL_LOG_KEY) || '[]'); if (!Array.isArray(arr)) arr = []; } catch (_) { arr = []; }
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const blob = new Blob([arr.join('\n')], { type: 'text/plain;charset=utf-8;' });
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl; a.download = `PaycomBotLog_${stamp}.txt`; a.style.display = 'none';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      });
+      panelEl.querySelector('.pcb-clearlog').addEventListener('click', () => {
+        clearFullLog();
+        const btn = panelEl.querySelector('.pcb-clearlog');
+        btn.textContent = '✓'; setTimeout(() => { btn.textContent = '🗑'; }, 1200);
+      });
+      renderLogPanel();
       panelEl.querySelector('.stop').addEventListener('click', () => {
         log('Stop / reset clicked — clearing state and tearing down UI');
         clearBatch();
