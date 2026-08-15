@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.30.0
+// @version      0.30.1
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -1155,7 +1155,10 @@
       box.style.cssText = 'background:#fff;border-radius:10px;padding:20px;max-width:440px;width:92%;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.35);';
       const title = document.createElement('h3');
       title.textContent = `${report.name} — how do you want to download it?`;
-      title.style.cssText = 'margin:0 0 14px;color:#0b7dda;font-size:16px;';
+      title.style.cssText = 'margin:0 0 4px;color:#0b7dda;font-size:16px;';
+      const sub = document.createElement('div');
+      sub.textContent = 'Both options give you the exact same data — only the number of files is different.';
+      sub.style.cssText = 'color:#666;font-size:12px;margin-bottom:14px;';
 
       const groupName = 'histbot-rangemode-choice';
       function makeOption(value, checked, headline, detail) {
@@ -1181,11 +1184,16 @@
       const yearlyExamples = yearly.map(r => `${report.fileBase}_${r.label}.xlsx`).join(', ');
 
       const opt1 = makeOption('combined', true,
-        '⚡ Combined — one file (fastest)',
-        `One pull covering the full range, ${combinedDates}. Fastest option and behaves exactly like before — use this for a normal/small client. Example: ${report.fileBase}_Combined.xlsx`);
+        '⚡ Combined — 1 file',
+        `Everything from ${combinedDates} in a single file. This is the quicker option, so try it first. `
+        + `If Paycom keeps loading for a very long time or the download fails (this happens with clients that have a lot of employees), come back and choose the other option instead. `
+        + `You'll get: ${report.fileBase}_Combined.xlsx`);
       const opt2 = makeOption('peryear', false,
-        `📅 Split by year — ${yearly.length} files`,
-        `One file per year (${yearly.map(r => r.label).join(', ')}). Slower overall — the wizard re-runs once per year — but each individual pull is much lighter, so it's less likely to be slow or time out. Use this for a large client. Example: ${yearlyExamples}`);
+        `📅 Year by year — ${yearly.length} separate files`,
+        `The same data, just split into one file per year (${yearly.map(r => r.label).join(', ')}). `
+        + `It takes longer overall, because the report is built ${yearly.length} times instead of once — but each file is much smaller, so it is far less likely to get stuck or fail. `
+        + `Choose this for a big client, or if "Combined" did not work. `
+        + `You'll get: ${yearlyExamples}`);
 
       const list = document.createElement('div');
       list.appendChild(opt1.row); list.appendChild(opt2.row);
@@ -1206,7 +1214,7 @@
       };
       btns.appendChild(cancel); btns.appendChild(ok);
 
-      box.appendChild(title); box.appendChild(list); box.appendChild(btns);
+      box.appendChild(title); box.appendChild(sub); box.appendChild(list); box.appendChild(btns);
       overlay.appendChild(box);
       document.body.appendChild(overlay);
     });
