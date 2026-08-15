@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.33.0
+// @version      0.34.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -750,13 +750,36 @@
 
   // The actual file extension Paycom used (it may auto-switch XLSX→CSV for very
   // large reports), read from the report row's .filetype pill next to the button.
+  // The file's real extension comes from the .filetype pill in the button's OWN
+  // row. Falling back to `document` (the old behaviour) reads the FIRST pill on
+  // the page — i.e. some other report's format — which is how a plain CSV got
+  // saved as EmployeePunchChange_2026-Q3.html. Never guess from the whole
+  // document: prefer the row, then the nearest ancestor holding exactly one
+  // pill, and otherwise say so and default to xlsx.
   function extForButton(btn) {
-    const row = (btn.closest && (btn.closest('.recentReport') || btn.closest('.queued-item'))) || document;
-    const ft = row.querySelector && row.querySelector('.filetype');
-    if (ft) {
-      const cls = Array.from(ft.classList).find(c => c !== 'filetype');
-      if (cls) return cls === 'txtcsv' ? 'csv' : cls;
+    const pillExt = (ft) => {
+      const cls = ft && Array.from(ft.classList).find(c => c !== 'filetype');
+      return cls ? (cls === 'txtcsv' ? 'csv' : cls) : '';
+    };
+    const row = btn.closest && (
+      btn.closest('.recentReport') ||
+      btn.closest('.queued-item') ||
+      btn.closest('[id^="queued-report-"]')   // legacy rpt-generate.php queue
+    );
+    if (row) {
+      const ext = pillExt(row.querySelector('.filetype'));
+      if (ext) return ext;
     }
+    // Unknown row markup: walk up until an ancestor holds exactly ONE pill —
+    // more than one means we've reached the list and would pick a stranger's.
+    let n = btn.parentElement;
+    for (let i = 0; i < 8 && n; i++) {
+      const pills = n.querySelectorAll ? n.querySelectorAll('.filetype') : [];
+      if (pills.length > 1) break;
+      if (pills.length === 1) { const ext = pillExt(pills[0]); if (ext) return ext; }
+      n = n.parentElement;
+    }
+    uiLog('  ⚠ could not read this report\'s file type from its row — assuming xlsx');
     return 'xlsx';
   }
 
@@ -837,12 +860,10 @@
     }
   }
 
-  async function downloadNewest(baseName) {
-    const dls = getDownloadButtons().sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-    const btn = dls[0];
-    if (!btn) throw new Error('No Download button found');
-    return downloadViaButton(btn, baseName);
-  }
+  // (Removed: downloadNewest — "take the topmost Download button on the page".
+  // It looks reasonable and is wrong whenever a previous range's row finishes
+  // first; it silently handed back that range's file. Every caller now resolves
+  // its OWN queue row by timestamp. Don't reintroduce it.)
 
   // Download the report behind a SPECIFIC Download button, saved as <baseName>.<ext>.
   async function downloadViaButton(btn, baseName) {
@@ -952,22 +973,73 @@
     return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
   }
 
+  // Generate the report currently configured on this page and download IT.
+  //
+  // "Wait for the Download-button count to rise, then take the topmost button"
+  // is NOT safe, even though this function snapshots the count on the same page
+  // right before clicking Generate. The count also rises when a PREVIOUS
+  // range's row finishes building, and at that moment the topmost row WITH a
+  // button is still that previous range — so we download its file under our
+  // name. Live failure: EmployeePunchChange_2026-Q3 was saved 39s after
+  // Generate (every real quarter took 4-8 min) and was byte-identical to
+  // 2026-Q2 (md5 c8cf48d92995). Q3 was never actually fetched.
+  //
+  // So: remember the newest queue-row timestamp before clicking, then wait for
+  // a row NEWER than that — which can only be ours — and download that row's
+  // own button. Stamps are compared to each other only, never to the clock
+  // (Paycom prints them in the client's timezone, not the browser's).
   async function generateAndDownload(tag, baseName) {
     await lockExcelOutput(tag);
 
-    const initial = getDownloadButtons().length;
     const gen = findGenerateReportButton();
     if (!gen) throw new Error(`${tag}: Generate Report button not found`);
+
+    // Let the queue finish rendering before the snapshot, or a late-rendering
+    // OLD row counts as "newer than prevMax" and gets grabbed as ours.
+    const before = await settledQueueStamps();
+    let prevMax = 0;
+    for (const s of before.keys()) prevMax = Math.max(prevMax, parseStamp(s));
+    // Some legacy queues carry no timestamps at all; there we have nothing to
+    // match on and must keep the old count-based behaviour.
+    const stamped = before.size > 0;
+    const initial = getDownloadButtons().length;
+
     showBanner(`${tag}: generating…`);
     uiLog(`${tag}: generating…`);
+    if (!stamped) uiLog(`  ⚠ ${tag}: queue rows carry no timestamps — falling back to newest-button matching`);
     const t0 = Date.now();
     clickGenerateAsserted(tag, gen);
-    await waitFor(() => getDownloadButtons().length > initial, {
-      timeout: QUEUE_TIMEOUT_MS, interval: 800, label: `${tag} Download button`,
-    });
+
+    let btn;
+    if (stamped) {
+      let lastDiag = 0;
+      const found = await waitFor(() => {
+        const mine = [...scanQueueStamps().entries()]
+          .map(([stamp, cands]) => ({ stamp, cands, t: parseStamp(stamp) }))
+          .filter(r => r.t > prevMax)          // only rows our click created
+          .sort((a, b) => b.t - a.t)[0];
+        const diag = (msg) => {
+          if (Date.now() - lastDiag < 30000) return;
+          lastDiag = Date.now();
+          uiLog(`  … waiting ${fmtElapsed(Date.now() - t0)} — ${msg}`);
+        };
+        if (!mine) { diag('our row has not appeared in the queue yet'); return null; }
+        const b = downloadButtonForStamp(mine.cands);
+        if (!b) { diag(`our row (${mine.stamp}) is still generating`); return null; }
+        return b;
+      }, { timeout: QUEUE_TIMEOUT_MS, interval: 900, label: `${tag} queue row` });
+      btn = found;
+    } else {
+      await waitFor(() => getDownloadButtons().length > initial, {
+        timeout: QUEUE_TIMEOUT_MS, interval: 800, label: `${tag} Download button`,
+      });
+      btn = getDownloadButtons().sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top)[0];
+      if (!btn) throw new Error(`${tag}: No Download button found`);
+    }
+
     const genMs = Date.now() - t0;
     uiLog(`  ⏱ ${tag}: Paycom took ${fmtElapsed(genMs)} to build the report`);
-    await downloadNewest(baseName);
+    await downloadViaButton(btn, baseName);
     uiLog(`  ⏱ ${tag}: total ${fmtElapsed(Date.now() - t0)} (build + download)`);
     resetAttempt(getIndex()); // real progress → this report isn't redirect-looping
     await sleep(2500); // let the download commit before the next generate/navigation
