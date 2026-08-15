@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.28.0
+// @version      0.29.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -46,6 +46,17 @@
   // Form I-9 Audit needs a deeper window: Jan 1 of (this year − 3) → today
   // (in 2026: 01/01/2023 → today · in 2027: 01/01/2024 → today · …).
   const I9_RANGES = [{ label: `${STARTYEAR}-to-date`, from: `01/01/${STARTYEAR}`, to: 'TODAY' }];
+  // Prior Payroll (ARW wizard): one combined 3.5-year pull can be very slow on
+  // large clients, so this offers a Combined option AND one range per year —
+  // the user picks via the same range-picker dialog the quarterly reports use.
+  // A small client can just tick Combined and run it exactly as before.
+  const PRIOR_PAYROLL_RANGES = [
+    { label: 'Combined', from: `01/01/${STARTYEAR}`, to: 'TODAY' },
+    { label: `${STARTYEAR}`, from: `01/01/${STARTYEAR}`, to: `12/31/${STARTYEAR}` },
+    { label: `${STARTYEAR + 1}`, from: `01/01/${STARTYEAR + 1}`, to: `12/31/${STARTYEAR + 1}` },
+    { label: `${STARTYEAR + 2}`, from: `01/01/${STARTYEAR + 2}`, to: `12/31/${STARTYEAR + 2}` },
+    { label: `${THISYEAR}-to-date`, from: `01/01/${THISYEAR}`, to: 'TODAY' },
+  ];
   // Quarterly ranges for reports whose full-year data is too large (e.g.
   // Employee Punch Change): last + current year split per quarter, skipping
   // quarters that haven't started yet. Files: <base>_2025-Q1.xlsx, …
@@ -202,8 +213,8 @@
       reportType: 'Payroll',
       step1Fields: ['Employee Code', 'Employee Name', 'Pay Class Code'],
       step2SelectAll: ['Earnings', 'Deductions', 'Taxes', 'Employer Liability', 'Accruals', 'Net', 'Taxable Wages'],
-      range: { from: `01/01/${STARTYEAR}`, to: 'TODAY' },
-      fileBase: `PriorPayroll_${STARTYEAR}-to-date`,
+      ranges: PRIOR_PAYROLL_RANGES, pickRanges: true,
+      fileBase: `PriorPayroll`,
     },
     // ── E-Verify ── (Human Resources → E-Verify → E-Verify Cases — a live
     // DataTables grid, not a rpt-generate.php form, so both entries use their
@@ -1332,7 +1343,7 @@
 
   // Step 5 (Review) — output XLSX, Checks distribution (reveals Period Start/End),
   // check those, set Specific Date Range dates, then Generate.
-  async function configureReviewAndGenerate(report) {
+  async function configureReviewAndGenerate(report, range) {
     const xlsx = document.getElementById('outputFileFormat3') || (outputRowFor('xlsx') && outputRowFor('xlsx').radio);
     if (xlsx && !xlsx.checked) { xlsx.click(); uiLog('  output: XLSX'); await sleep(300); }
 
@@ -1347,7 +1358,7 @@
     const dtype = document.getElementById('selectDateType1');
     if (dtype && String(dtype.value) !== '0') { setInputValue(dtype, '0'); await sleep(300); }
 
-    const from = resolveDate(report.range.from), to = resolveDate(report.range.to);
+    const from = resolveDate(range.from), to = resolveDate(range.to);
     const fromInp = document.getElementById('prdate1from');
     const toInp = document.getElementById('prdate1to');
     if (fromInp) setInputValue(fromInp, from);
@@ -1365,7 +1376,7 @@
 
   // Drive the whole wizard on enh-srw-reportwriter.php (steps 1-4 transition via
   // AJAX in one context; Generate on step 5 navigates away).
-  async function driveWizard(report) {
+  async function driveWizard(report, range) {
     // Step 1 — Employee Information. Wait for the field checkboxes to actually be
     // present AND the render to settle (not just the step tab) before selecting.
     await waitForWizardStep(1, 'wizard Step 1 (Employee Information)',
@@ -1398,43 +1409,94 @@
     await waitForWizardStep(5, 'wizard Step 5 (Review)',
       () => document.getElementById('outputFileFormat3') || outputRowFor('xlsx'));
     uiLog('Wizard Step 5: output + dates…');
-    await configureReviewAndGenerate(report);
+    await configureReviewAndGenerate(report, range);
   }
 
   // Download the generated ARW report from the recent-reports tab.
-  async function wizardDownload(report) {
-    showBanner(`${report.name}: waiting for the report to finish…`);
+  async function wizardDownload(report, range) {
+    showBanner(`${report.name} (${range.label}): waiting for the report to finish…`);
     await sleep(1500);
     const initial = getDownloadButtons().length;
     await waitFor(() => getDownloadButtons().length > initial, {
       timeout: 30 * 60 * 1000, interval: 900, label: 'wizard report Download',
     });
-    await downloadNewest(report.fileBase);
-    showBanner(`✓ ${report.name} downloaded`, true);
-    uiLog(`✓ ${report.name} downloaded`);
+    await downloadNewest(`${report.fileBase}_${range.label}`);
+    showBanner(`✓ ${report.name} (${range.label}) downloaded`, true);
+    uiLog(`✓ ${report.name} (${range.label}) downloaded`);
   }
 
   // Page-based state machine for a wizard report. Guarded against runaway loops.
   const WZ_KEY = 'histbot.wz';
-  const clearWz = () => { try { localStorage.removeItem(WZ_KEY); } catch (_) {} };
+  // A wizard report can offer multiple ranges (e.g. Prior Payroll: Combined vs
+  // one-year-at-a-time). The chosen ranges + which one is currently in flight
+  // are persisted here so they survive every page reload the wizard makes.
+  const WZ_RANGES_KEY = 'histbot.wz.ranges';
+  const WZ_RANGE_IDX_KEY = 'histbot.wz.rangeIdx';
+  const clearWz = () => {
+    try {
+      localStorage.removeItem(WZ_KEY);
+      localStorage.removeItem(WZ_RANGES_KEY);
+      localStorage.removeItem(WZ_RANGE_IDX_KEY);
+    } catch (_) {}
+  };
+  function getWzRanges() {
+    try { const a = JSON.parse(localStorage.getItem(WZ_RANGES_KEY) || 'null'); return (Array.isArray(a) && a.length) ? a : null; }
+    catch (_) { return null; }
+  }
+  function setWzRanges(ranges) { try { localStorage.setItem(WZ_RANGES_KEY, JSON.stringify(ranges)); } catch (_) {} }
+  function getWzRangeIdx() { return parseInt(localStorage.getItem(WZ_RANGE_IDX_KEY) || '0', 10) || 0; }
+  function setWzRangeIdx(n) { try { localStorage.setItem(WZ_RANGE_IDX_KEY, String(n)); } catch (_) {} }
+
   async function dispatchWizard(report, idx, queue) {
+    // First entry into this wizard report: if it offers multiple ranges, ask
+    // the user which to run — same picker dialog the quarterly-pipeline
+    // reports use (e.g. tick only "Combined" for a small client, or tick each
+    // year for a large one where one combined pull is too slow/heavy). The
+    // choice is persisted so it survives every reload for the rest of this run.
+    if (getWzRanges() === null) {
+      if (report.ranges && report.ranges.length > 1 && report.pickRanges) {
+        hideBanner();
+        const chosen = await showRangePickDialog(report, report.ranges);
+        if (!chosen) { uiLog(`↷ ${report.name}: skipped by user`); clearWz(); advanceTo(idx + 1, queue); return; }
+        uiLog(`${report.name}: running ${chosen.length}/${report.ranges.length} range(s): ${chosen.map(r => r.label).join(', ')}`);
+        setWzRanges(chosen);
+      } else {
+        setWzRanges(report.ranges || [report.range]);
+      }
+      setWzRangeIdx(0);
+    }
+    const ranges = getWzRanges() || [];
+    const range = ranges[getWzRangeIdx()] || ranges[0];
+
     const loads = (parseInt(localStorage.getItem(WZ_KEY) || '0', 10) || 0) + 1;
     try { localStorage.setItem(WZ_KEY, String(loads)); } catch (_) {}
     if (loads > 25) {
-      uiLog(`✕ Skipped ${report.name}: wizard didn't finish after many page loads`);
+      uiLog(`✕ Skipped ${report.name} (${range.label}): wizard didn't finish after many page loads`);
       clearWz(); advanceTo(idx + 1, queue); return;
     }
 
     const url = location.href;
     try {
       if (isOnRecentReportsTab()) {
-        await wizardDownload(report);
+        await wizardDownload(report, range);
+        // Move on to the NEXT range for this same report, if any — the wizard
+        // has to be re-driven from scratch per range (no in-page date-only
+        // re-generate like the non-wizard reports get). Only advance the
+        // outer queue once every chosen range has been generated.
+        const nextIdx = getWzRangeIdx() + 1;
+        if (nextIdx < ranges.length) {
+          setWzRangeIdx(nextIdx);
+          try { localStorage.setItem(WZ_KEY, '0'); } catch (_) {} // fresh loop-guard budget for the next pass
+          uiLog(`→ ${report.name}: next range "${ranges[nextIdx].label}"…`);
+          location.href = ARW_SAVED_URL;
+          return;
+        }
         clearWz(); advanceTo(idx + 1, queue);
         return;
       }
       if (url.includes('/srw-reportwriter-savedReport.php')) {
         const createBtn = await waitFor(() => findByText(['button', 'a'], 'Create New Report'), { timeout: 20000, label: '"Create New Report"' });
-        uiLog(`▶ ${report.name} — Create New Report…`);
+        uiLog(`▶ ${report.name} (${range.label}) — Create New Report…`);
         clickEl(createBtn); // open the menu (its items are <a class="ddbMenuItemLink" href="…">)
         const link = await waitFor(() =>
           Array.from(document.querySelectorAll('a.ddbMenuItemLink'))
@@ -1449,17 +1511,17 @@
         return;
       }
       if (url.includes('/enh-srw-reportwriter.php')) {
-        await driveWizard(report);
+        await driveWizard(report, range);
         return;
       }
       // Anywhere else → open the ARW.
-      uiLog(`→ Opening Advanced Report Writer for ${report.name}…`);
+      uiLog(`→ Opening Advanced Report Writer for ${report.name} (${range.label})…`);
       showBanner(`Opening Advanced Report Writer…`);
       location.href = ARW_SAVED_URL;
     } catch (err) {
       if (err && err.aborted) { log('Wizard aborted'); hideBanner(); return; }
       hideBanner();
-      uiLog(`✕ Skipped ${report.name} (wizard): ${err && err.message ? err.message : err}`);
+      uiLog(`✕ Skipped ${report.name} (${range.label}): ${err && err.message ? err.message : err}`);
       clearWz(); advanceTo(idx + 1, queue);
     }
   }
