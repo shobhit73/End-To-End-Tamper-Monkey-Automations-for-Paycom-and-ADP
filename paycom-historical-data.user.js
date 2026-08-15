@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.32.0
+// @version      0.32.1
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -954,14 +954,35 @@
   // matter what order the reports finish in.
   const QUEUE_STAMP_RE = /\d{2}\/\d{2}\/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M/;
   function scanQueueStamps() {
-    const out = new Map(); // stamp text -> smallest row-ish element containing it
+    // stamp text -> ALL row-ish elements containing it, in doc order.
+    // The same stamp can appear in MORE than one place — e.g. with
+    // override-report-hub=1 the legacy list is shown but the Report Hub keeps a
+    // HIDDEN copy of the same rows later in the DOM. Keeping only the last
+    // element (the old behavior) could hand back the hidden copy, whose
+    // Download button never passes visible() — and the watcher then waits
+    // forever while a perfectly clickable button sits on screen.
+    const out = new Map();
     for (const el of document.querySelectorAll('div, li, tr')) {
       const t = el.innerText || '';
       if (!t || t.length > 600) continue;
       const m = t.match(QUEUE_STAMP_RE);
-      if (m) out.set(m[0], el); // doc order: children overwrite parents → smallest block wins
+      if (!m) continue;
+      const list = out.get(m[0]) || [];
+      list.push(el);
+      out.set(m[0], list);
     }
     return out;
+  }
+  // Try every element bearing this stamp, innermost/lattermost first, until one
+  // yields a VISIBLE Download button. Hidden duplicates simply fail the
+  // visible() filter inside downloadButtonInRow and the next candidate wins.
+  function downloadButtonForStamp(candidates) {
+    if (!candidates) return null;
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const btn = downloadButtonInRow(candidates[i]);
+      if (btn) return btn;
+    }
+    return null;
   }
   // The stamp usually matches a tiny inner element (just the timestamp text);
   // the row's Download button lives several ancestors up. Walk upward until an
@@ -1094,8 +1115,7 @@
       const rows = scanQueueStamps();
       for (const [stamp, label] of stampToLabel) {
         if (done.has(stamp)) continue;
-        const row = rows.get(stamp);
-        const btn = row && downloadButtonInRow(row);
+        const btn = downloadButtonForStamp(rows.get(stamp));
         if (!btn) continue;
         showBanner(`${report.name} ${label}: downloading…`);
         await downloadViaButton(btn, `${report.fileBase}_${label}`);
@@ -1571,17 +1591,30 @@
     let lastStamp = '';
     try { lastStamp = localStorage.getItem(WZ_LAST_STAMP_KEY) || ''; } catch (_) {}
 
+    // Waiting here is normal (the report is generating) — but it must never be
+    // SILENT: log what the watcher sees every 30s so a detection failure is
+    // visible in the activity log instead of looking like a slow report.
+    let lastDiag = 0;
     const found = await waitFor(() => {
       const rows = [...scanQueueStamps().entries()]
-        .map(([stamp, el]) => ({ stamp, el, t: parseStamp(stamp) }))
+        .map(([stamp, cands]) => ({ stamp, cands, t: parseStamp(stamp) }))
         .sort((a, b) => b.t - a.t); // newest first
       const newest = rows[0];
-      if (!newest) return null;
+      const diag = (msg) => {
+        if (Date.now() - lastDiag < 30000) return;
+        lastDiag = Date.now();
+        uiLog(`  … queue watch: ${rows.length} row(s); ${msg}`);
+      };
+      if (!newest) { diag('no timestamped rows found on this page'); return null; }
       // Newest row is the one we just downloaded → our new report isn't in the
       // list yet. Keep waiting rather than handing back the same file again.
-      if (lastStamp && newest.stamp === lastStamp) return null;
-      const btn = downloadButtonInRow(newest.el);
-      return btn ? { btn, stamp: newest.stamp } : null; // still generating → wait
+      if (lastStamp && newest.stamp === lastStamp) {
+        diag(`newest (${newest.stamp}) is the previous range's row — ours not queued yet`);
+        return null;
+      }
+      const btn = downloadButtonForStamp(newest.cands);
+      if (!btn) { diag(`newest ${newest.stamp}: no visible Download button yet (still generating?)`); return null; }
+      return { btn, stamp: newest.stamp };
     }, { timeout: 30 * 60 * 1000, interval: 900, label: `${runLabel(report, range)} queue row` });
 
     await downloadViaButton(found.btn, `${report.fileBase}_${range.label}`);
