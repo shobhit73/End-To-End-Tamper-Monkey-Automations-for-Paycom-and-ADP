@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.9.0
+// @version      1.10.1
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -36,7 +36,7 @@
   const PANEL_ID = 'hd-bot-panel';
   // 1.8.0 = merge of two parallel lines: Rohit's 1.2.0 (Who Appears filter for
   // two Time Off reports) + the 1.2.x–1.7.x line (T&A timecards, Audit Trail).
-  const SCRIPT_VERSION = '1.9.0';
+  const SCRIPT_VERSION = '1.10.1';
 
   const YEARS_KEY = 'historicalBot.adp.years';
 
@@ -1559,16 +1559,35 @@
     clickTrigger();
     await sleep(800);
 
-    const findXlsAnchor = () =>
-      deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0]
-      || deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
+    const findXlsAnchor = () => {
+      const pendo = deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0];
+      if (pendo) return pendo;
+      const combined = deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
         .find(el => {
           const t = (el.textContent || '').trim();
           // Legacy T&A reports (e.g. Timecard w/ Supervisor Approval) label the
           // menu item "Download" or "View as Excel" instead of "View as XLS".
           return t.length < 30 && /view as xls|view as excel|^download$/i.test(t);
-        })
-      || null;
+        });
+      if (combined) return combined;
+      // PDF-only reports (e.g. Employee Lien Detail) render a "View as" HEADER
+      // with separate short items underneath it — "PDF" / "Query" — instead of
+      // one combined "View as PDF" row. Find the header, then the nearest
+      // short-text item under it whose own text is just the format name.
+      const header = deepQueryAll('*').filter(visible)
+        .find(el => el.children.length === 0 && (el.textContent || '').trim().toLowerCase() === 'view as');
+      if (header) {
+        let container = header.parentElement;
+        for (let d = 0; d < 4 && container; d++) {
+          const item = Array.from(container.querySelectorAll('a, [role="menuitem"], li, div, button'))
+            .filter(visible)
+            .find(el => /^(pdf|xls|excel|csv)$/i.test((el.textContent || '').trim()));
+          if (item) return item;
+          container = container.parentElement;
+        }
+      }
+      return null;
+    };
     let anchor = null;
     for (let i = 0; i < 24 && !anchor; i++) {
       anchor = findXlsAnchor();
@@ -1580,7 +1599,7 @@
         await sleep(500);
       }
     }
-    if (!anchor) throw new Error('"View as XLS" menu item not found (trigger still in DOM: ' + trigger.isConnected + ')');
+    if (!anchor) throw new Error('"View as" menu item (XLS/Excel/PDF) not found (trigger still in DOM: ' + trigger.isConnected + ')');
 
     const win = (anchor.ownerDocument && anchor.ownerDocument.defaultView) || window;
     const sn1 = armSniffer(win);
@@ -2799,6 +2818,156 @@
     }
   }
 
+  // ───────────────────────── Employee Lien Detail ─────────────────────────
+
+  // A "Standard" report reached through the Dojo search box, landing on yet
+  // another form shape — an Angular "adpr" page: Select a Language / As of
+  // date / Company Codes (dual-select) / Sort by / Group By / Archived
+  // Employees / Employees with Payroll History, then a single "Run As PDF"
+  // button (no Excel option on this report). There's no date-RANGE field,
+  // only a single "As of date" — so it's pulled TWICE per client: as of
+  // Dec 31 of last year, and as of today, to approximate "this year + last
+  // year" the same way the Paycom bot's Garnishment Report does.
+  const LIEN_REPORT = 'Employee Lien Detail';
+  const LIEN_TYPE = 'Standard';
+
+  function lienAsOfDates() {
+    const now = new Date();
+    const lastYear = now.getFullYear() - 1;
+    return [
+      { label: String(lastYear), value: '12/31/' + lastYear },
+      { label: 'Current', value: pad2(now.getMonth() + 1) + '/' + pad2(now.getDate()) + '/' + now.getFullYear() },
+    ];
+  }
+
+  function findLienAsOfDateInput() {
+    return deepQueryAll('input[name="EmployeeLienDetail-AsOfDate"]').filter(visible)[0] || null;
+  }
+
+  async function stepWaitForLienRunPage() {
+    for (let i = 0; i < 120; i++) { // up to 60s
+      checkAbort();
+      if (findLienAsOfDateInput()) { logSuccess('Employee Lien Detail Run page is up'); await sleep(DOJO_PAD); return true; }
+      await sleep(500);
+    }
+    logError('Employee Lien Detail Run page (As of date field) did not load');
+    return false;
+  }
+
+  // The As of date input is a flatpickr text field bound via Angular ngModel
+  // (updates on blur) — the same prototype-setter + input/change/blur
+  // dispatch used for every other framework's date fields in this file.
+  async function stepSetLienAsOfDate(value) {
+    const input = findLienAsOfDateInput();
+    if (!input) { logError('As of date field not found'); return false; }
+    setReactInputValue(input, value);
+    await sleep(500);
+    logSuccess('As of date set to ' + value);
+    return true;
+  }
+
+  // Company Codes is a required dual-select (Available -> Selected) with its
+  // own "Move all right" button; Sort by / Group By on the SAME page carry
+  // the identical .move-all-right class, so the button is found scoped to
+  // whichever field group's label reads "Company Codes" (tolerating the
+  // required-field "*" Paycom/ADP appends to the label text).
+  async function stepSelectAllCompanyCodes() {
+    const label = deepQueryAll('*').filter(visible)
+      .find(el => el.children.length === 0 && /^Company Codes\s*\*?\s*$/.test((el.textContent || '').trim()));
+    if (!label) { logError('"Company Codes" label not found'); return false; }
+    let group = label.parentElement, btn = null;
+    for (let d = 0; d < 8 && group && !btn; d++) {
+      btn = group.querySelector && group.querySelector('button.move-all-right[aria-label="Move all right"]');
+      group = group.parentElement;
+    }
+    if (!btn) { logError('Company Codes "Move all right" button not found'); return false; }
+    clickEl(btn);
+    await sleep(500);
+    logSuccess('Company Codes: moved all available codes to Selected');
+    return true;
+  }
+
+  async function stepClickLienRunAsPdf() {
+    const btn = deepQueryAll('button').filter(visible).find(el => normalize(el.textContent) === 'run as pdf');
+    if (!btn) { logError('"Run As PDF" button not found'); return false; }
+    clickEl(btn);
+    logSuccess('Clicked Run As PDF');
+    return true;
+  }
+
+  function lienSteps(asOf) {
+    return [
+      { name: 'Open Reports & Analytics menu', fn: () => stepOpenReportsMenu() },
+      { name: 'Open All Standard Reports', fn: () => stepClickAllStandardReports() },
+      { name: 'Search "' + LIEN_REPORT + '"', fn: async () => { await sleep(DOJO_PAD); return stepSearchDojoReport(LIEN_REPORT); } },
+      {
+        name: 'Select ' + LIEN_REPORT, fn: async () => {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            await sleep(1000);
+            if (await stepSelectStandardReportByTitle(LIEN_REPORT, LIEN_TYPE)) return true;
+            if (attempt < 3) {
+              logWarn('Attempt ' + attempt + '/3 found nothing — re-running the search');
+              await stepSearchDojoReport(LIEN_REPORT);
+            }
+          }
+          return false;
+        }
+      },
+      { name: 'Wait for Run Report page', fn: () => stepWaitForLienRunPage() },
+      { name: 'Detect client name', fn: async () => { tryDetectClient('Employee Lien Detail run page'); return true; } },
+      { name: 'Set As of date (' + asOf.label + ')', fn: () => stepSetLienAsOfDate(asOf.value) },
+      { name: 'Select all Company Codes', fn: () => stepSelectAllCompanyCodes() },
+      { name: 'Run As PDF', fn: async () => { await sleep(800); return stepClickLienRunAsPdf(); } },
+      { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
+      {
+        name: 'Download', fn: async () => {
+          const fileName = (auditClientName ? safeFileName(auditClientName) + '_' : '') +
+            'Employee_Lien_Detail_' + asOf.label + '.pdf';
+          try {
+            const res = await downloadRenamed(fileName, LIEN_REPORT + ' (' + asOf.label + ')');
+            if (res && res.sig) downloadedSigs.add(res.sig);
+            return true;
+          } catch (err) {
+            if (err && (err.aborted || err.paused)) throw err;
+            logWarn('Download failed for ' + LIEN_REPORT + ' (' + asOf.label + ') — fetch it from Reports Output manually (' +
+              ((err && err.message) || err) + ')');
+            return true; // the report ran; a naming failure must not fail it
+          }
+        }
+      },
+    ];
+  }
+
+  async function downloadEmployeeLienDetail() {
+    if (isRunning()) { logWarn('Already running — click Stop first.'); return; }
+    logInfo('=== Employee Lien Detail ===');
+    resetAbort();
+    setRunning(true);
+    downloadedSigs = new Set();
+    auditClientName = '';
+    const dates = lienAsOfDates();
+    try {
+      for (let i = 0; i < dates.length; i++) {
+        const asOf = dates[i];
+        setStatus(LIEN_REPORT + ' (' + asOf.label + ') — ' + (i + 1) + '/' + dates.length + '…');
+        await runSteps(lienSteps(asOf), { report: LIEN_REPORT, asOf: asOf.label });
+        logSuccess(LIEN_REPORT + ' (' + asOf.label + ') downloaded');
+      }
+      setStatus(LIEN_REPORT + ' downloaded ✓ (' + dates.map(d => d.label).join(', ') + ')');
+      logSuccess('=== ' + LIEN_REPORT + ' complete ===');
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus('Aborted by user');
+        logWarn('Flow aborted by user (Stop / reset)');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + ((err && err.message) || err));
+    } finally {
+      setRunning(false);
+    }
+  }
+
   // Phase B adds a data set by appending one entry here plus one flow function.
   // The panel's button rail is generated from this list.
   const HISTORICAL_REPORTS = [
@@ -2807,6 +2976,7 @@
     { key: 'timecard', icon: '🕒', label: 'T&A Timecards & Hours', fn: downloadTaLegacyReports },
     { key: 'audittrail', icon: '🧾', label: 'Audit Trail (quarterly)', fn: downloadAuditTrail },
     { key: 'formi9', icon: '🪪', label: 'Form I-9 / E-Verify', fn: downloadFormI9 },
+    { key: 'lien', icon: '⚖️', label: 'Employee Lien Detail', fn: downloadEmployeeLienDetail },
   ];
 
   // ───────────────────────────── year dialog ────────────────────────────
