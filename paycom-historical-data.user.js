@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.29.0
+// @version      0.30.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -213,7 +213,7 @@
       reportType: 'Payroll',
       step1Fields: ['Employee Code', 'Employee Name', 'Pay Class Code'],
       step2SelectAll: ['Earnings', 'Deductions', 'Taxes', 'Employer Liability', 'Accruals', 'Net', 'Taxable Wages'],
-      ranges: PRIOR_PAYROLL_RANGES, pickRanges: true,
+      ranges: PRIOR_PAYROLL_RANGES, pickMode: true,
       fileBase: `PriorPayroll`,
     },
     // ── E-Verify ── (Human Resources → E-Verify → E-Verify Cases — a live
@@ -1139,6 +1139,79 @@
     });
   }
 
+  // For wizard reports offering an either/or choice (one combined pull vs one
+  // pull per year) rather than a free-pick checklist. By convention ranges[0]
+  // is the combined option and the rest are the per-year split. Resolves to
+  // the chosen range array, or null (Skip report).
+  function showRangeModeDialog(report, ranges) {
+    const combined = ranges[0];
+    const yearly = ranges.slice(1);
+    return new Promise((resolve) => {
+      document.getElementById('histbot-rangemode')?.remove();
+      const overlay = document.createElement('div');
+      overlay.id = 'histbot-rangemode';
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2147483647;display:flex;align-items:center;justify-content:center;font:14px sans-serif;';
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#fff;border-radius:10px;padding:20px;max-width:440px;width:92%;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.35);';
+      const title = document.createElement('h3');
+      title.textContent = `${report.name} — how do you want to download it?`;
+      title.style.cssText = 'margin:0 0 14px;color:#0b7dda;font-size:16px;';
+
+      const groupName = 'histbot-rangemode-choice';
+      function makeOption(value, checked, headline, detail) {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:flex-start;gap:10px;padding:10px 10px;border:1px solid #e0e0e0;border-radius:8px;margin-bottom:10px;cursor:pointer;';
+        const radio = document.createElement('input');
+        radio.type = 'radio'; radio.name = groupName; radio.value = value; radio.checked = checked;
+        radio.style.cssText = 'margin-top:3px;transform:scale(1.15);flex:0 0 auto;';
+        const textWrap = document.createElement('div');
+        const h = document.createElement('div');
+        h.textContent = headline;
+        h.style.cssText = 'font-weight:600;color:#222;margin-bottom:4px;';
+        const d = document.createElement('div');
+        d.textContent = detail;
+        d.style.cssText = 'color:#666;font-size:12px;line-height:1.45;';
+        textWrap.appendChild(h); textWrap.appendChild(d);
+        row.appendChild(radio); row.appendChild(textWrap);
+        row.onclick = () => { radio.checked = true; };
+        return { row, radio };
+      }
+
+      const combinedDates = `${resolveDate(combined.from)} → ${resolveDate(combined.to)}`;
+      const yearlyExamples = yearly.map(r => `${report.fileBase}_${r.label}.xlsx`).join(', ');
+
+      const opt1 = makeOption('combined', true,
+        '⚡ Combined — one file (fastest)',
+        `One pull covering the full range, ${combinedDates}. Fastest option and behaves exactly like before — use this for a normal/small client. Example: ${report.fileBase}_Combined.xlsx`);
+      const opt2 = makeOption('peryear', false,
+        `📅 Split by year — ${yearly.length} files`,
+        `One file per year (${yearly.map(r => r.label).join(', ')}). Slower overall — the wizard re-runs once per year — but each individual pull is much lighter, so it's less likely to be slow or time out. Use this for a large client. Example: ${yearlyExamples}`);
+
+      const list = document.createElement('div');
+      list.appendChild(opt1.row); list.appendChild(opt2.row);
+
+      const btns = document.createElement('div');
+      btns.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;margin-top:4px;';
+      const cancel = document.createElement('button');
+      cancel.textContent = 'Skip report';
+      cancel.style.cssText = 'padding:9px 18px;border:1px solid #bbb;background:#fff;border-radius:5px;cursor:pointer;font-size:13px;';
+      cancel.onclick = () => { overlay.remove(); resolve(null); };
+      const ok = document.createElement('button');
+      ok.textContent = 'Run';
+      ok.style.cssText = 'padding:9px 18px;border:0;background:#0b7dda;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;font-size:13px;';
+      ok.onclick = () => {
+        const picked = opt1.radio.checked ? 'combined' : 'peryear';
+        overlay.remove();
+        resolve(picked === 'combined' ? [combined] : yearly);
+      };
+      btns.appendChild(cancel); btns.appendChild(ok);
+
+      box.appendChild(title); box.appendChild(list); box.appendChild(btns);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+    });
+  }
+
   // Runs both years (last + current) on the same report page, no reload between them.
   async function handleReport(report) {
     showBanner(`${report.name}: loading form…`);
@@ -1450,15 +1523,17 @@
   async function dispatchWizard(report, idx, queue) {
     // First entry into this wizard report: if it offers multiple ranges, ask
     // the user which to run — same picker dialog the quarterly-pipeline
-    // reports use (e.g. tick only "Combined" for a small client, or tick each
-    // year for a large one where one combined pull is too slow/heavy). The
-    // choice is persisted so it survives every reload for the rest of this run.
+    // reports use, but as a clear either/or choice (not a free-pick checklist,
+    // since these two modes aren't meant to be combined): Combined for a
+    // normal/small client, or Split by year for a large one where the
+    // combined pull is too slow/heavy. The choice is persisted so it survives
+    // every reload for the rest of this run.
     if (getWzRanges() === null) {
-      if (report.ranges && report.ranges.length > 1 && report.pickRanges) {
+      if (report.ranges && report.ranges.length > 1 && report.pickMode) {
         hideBanner();
-        const chosen = await showRangePickDialog(report, report.ranges);
+        const chosen = await showRangeModeDialog(report, report.ranges);
         if (!chosen) { uiLog(`↷ ${report.name}: skipped by user`); clearWz(); advanceTo(idx + 1, queue); return; }
-        uiLog(`${report.name}: running ${chosen.length}/${report.ranges.length} range(s): ${chosen.map(r => r.label).join(', ')}`);
+        uiLog(`${report.name}: running ${chosen.length === 1 ? 'Combined' : `${chosen.length} yearly ranges`}: ${chosen.map(r => r.label).join(', ')}`);
         setWzRanges(chosen);
       } else {
         setWzRanges(report.ranges || [report.range]);
