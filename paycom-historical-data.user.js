@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.30.1
+// @version      0.30.2
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -50,12 +50,17 @@
   // large clients, so this offers a Combined option AND one range per year —
   // the user picks via the same range-picker dialog the quarterly reports use.
   // A small client can just tick Combined and run it exactly as before.
+  // `label` is the file-name suffix (PriorPayroll_2023.xlsx); `display` is what
+  // the banner/log shows while that range runs — it has to stand on its own,
+  // because the report's own name carries the FULL scope and reading
+  // "Prior Payroll (2023 → today) (2023)" makes it look like the whole range
+  // is being pulled when only 2023 is.
   const PRIOR_PAYROLL_RANGES = [
-    { label: 'Combined', from: `01/01/${STARTYEAR}`, to: 'TODAY' },
-    { label: `${STARTYEAR}`, from: `01/01/${STARTYEAR}`, to: `12/31/${STARTYEAR}` },
-    { label: `${STARTYEAR + 1}`, from: `01/01/${STARTYEAR + 1}`, to: `12/31/${STARTYEAR + 1}` },
-    { label: `${STARTYEAR + 2}`, from: `01/01/${STARTYEAR + 2}`, to: `12/31/${STARTYEAR + 2}` },
-    { label: `${THISYEAR}-to-date`, from: `01/01/${THISYEAR}`, to: 'TODAY' },
+    { label: 'Combined', display: `all years in one file (${STARTYEAR} → today)`, from: `01/01/${STARTYEAR}`, to: 'TODAY' },
+    { label: `${STARTYEAR}`, display: `year ${STARTYEAR} only`, from: `01/01/${STARTYEAR}`, to: `12/31/${STARTYEAR}` },
+    { label: `${STARTYEAR + 1}`, display: `year ${STARTYEAR + 1} only`, from: `01/01/${STARTYEAR + 1}`, to: `12/31/${STARTYEAR + 1}` },
+    { label: `${STARTYEAR + 2}`, display: `year ${STARTYEAR + 2} only`, from: `01/01/${STARTYEAR + 2}`, to: `12/31/${STARTYEAR + 2}` },
+    { label: `${THISYEAR}-to-date`, display: `${THISYEAR} to date only`, from: `01/01/${THISYEAR}`, to: 'TODAY' },
   ];
   // Quarterly ranges for reports whose full-year data is too large (e.g.
   // Employee Punch Change): last + current year split per quarter, skipping
@@ -210,6 +215,9 @@
     // nothing is ever hardcoded. (STARTYEAR is computed once below.)
     {
       section: 'Payroll', key: 'prior-payroll-3yr', name: `Prior Payroll (${STARTYEAR} → today)`, wizard: true,
+      // `name` shows the full scope in the report picker; `shortName` is used in
+      // the per-range banner/log so a single-year run doesn't read as the whole range.
+      shortName: 'Prior Payroll',
       reportType: 'Payroll',
       step1Fields: ['Employee Code', 'Employee Name', 'Pay Class Code'],
       step2SelectAll: ['Earnings', 'Deductions', 'Taxes', 'Employer Liability', 'Accruals', 'Net', 'Taxable Wages'],
@@ -1493,17 +1501,28 @@
     await configureReviewAndGenerate(report, range);
   }
 
+  // What to call this report in banners/logs WHILE one specific range runs.
+  // report.name carries the report's full scope (e.g. "Prior Payroll
+  // (2023 → today)"), so pairing it with a single year reads as though the
+  // whole range is being pulled — use the short name + the range's own
+  // self-describing text instead.
+  function runLabel(report, range) {
+    const base = report.shortName || report.name;
+    if (!range) return base;
+    return `${base} — ${range.display || range.label}`;
+  }
+
   // Download the generated ARW report from the recent-reports tab.
   async function wizardDownload(report, range) {
-    showBanner(`${report.name} (${range.label}): waiting for the report to finish…`);
+    showBanner(`${runLabel(report, range)}: waiting for the report to finish…`);
     await sleep(1500);
     const initial = getDownloadButtons().length;
     await waitFor(() => getDownloadButtons().length > initial, {
       timeout: 30 * 60 * 1000, interval: 900, label: 'wizard report Download',
     });
     await downloadNewest(`${report.fileBase}_${range.label}`);
-    showBanner(`✓ ${report.name} (${range.label}) downloaded`, true);
-    uiLog(`✓ ${report.name} (${range.label}) downloaded`);
+    showBanner(`✓ Downloaded: ${runLabel(report, range)}`, true);
+    uiLog(`✓ Downloaded: ${runLabel(report, range)}`);
   }
 
   // Page-based state machine for a wizard report. Guarded against runaway loops.
@@ -1541,7 +1560,10 @@
         hideBanner();
         const chosen = await showRangeModeDialog(report, report.ranges);
         if (!chosen) { uiLog(`↷ ${report.name}: skipped by user`); clearWz(); advanceTo(idx + 1, queue); return; }
-        uiLog(`${report.name}: running ${chosen.length === 1 ? 'Combined' : `${chosen.length} yearly ranges`}: ${chosen.map(r => r.label).join(', ')}`);
+        const base = report.shortName || report.name;
+        uiLog(chosen.length === 1
+          ? `${base}: downloading ${chosen[0].display || chosen[0].label}`
+          : `${base}: downloading ${chosen.length} separate files — ${chosen.map(r => r.label).join(', ')}`);
         setWzRanges(chosen);
       } else {
         setWzRanges(report.ranges || [report.range]);
@@ -1554,7 +1576,7 @@
     const loads = (parseInt(localStorage.getItem(WZ_KEY) || '0', 10) || 0) + 1;
     try { localStorage.setItem(WZ_KEY, String(loads)); } catch (_) {}
     if (loads > 25) {
-      uiLog(`✕ Skipped ${report.name} (${range.label}): wizard didn't finish after many page loads`);
+      uiLog(`✕ Skipped ${runLabel(report, range)}: didn't finish after many page loads`);
       clearWz(); advanceTo(idx + 1, queue); return;
     }
 
@@ -1570,7 +1592,7 @@
         if (nextIdx < ranges.length) {
           setWzRangeIdx(nextIdx);
           try { localStorage.setItem(WZ_KEY, '0'); } catch (_) {} // fresh loop-guard budget for the next pass
-          uiLog(`→ ${report.name}: next range "${ranges[nextIdx].label}"…`);
+          uiLog(`→ next up: ${runLabel(report, ranges[nextIdx])} (${nextIdx + 1} of ${ranges.length})…`);
           location.href = ARW_SAVED_URL;
           return;
         }
@@ -1579,7 +1601,7 @@
       }
       if (url.includes('/srw-reportwriter-savedReport.php')) {
         const createBtn = await waitFor(() => findByText(['button', 'a'], 'Create New Report'), { timeout: 20000, label: '"Create New Report"' });
-        uiLog(`▶ ${report.name} (${range.label}) — Create New Report…`);
+        uiLog(`▶ ${runLabel(report, range)}: Create New Report…`);
         clickEl(createBtn); // open the menu (its items are <a class="ddbMenuItemLink" href="…">)
         const link = await waitFor(() =>
           Array.from(document.querySelectorAll('a.ddbMenuItemLink'))
@@ -1598,13 +1620,13 @@
         return;
       }
       // Anywhere else → open the ARW.
-      uiLog(`→ Opening Advanced Report Writer for ${report.name} (${range.label})…`);
+      uiLog(`→ Opening Advanced Report Writer for ${runLabel(report, range)}…`);
       showBanner(`Opening Advanced Report Writer…`);
       location.href = ARW_SAVED_URL;
     } catch (err) {
       if (err && err.aborted) { log('Wizard aborted'); hideBanner(); return; }
       hideBanner();
-      uiLog(`✕ Skipped ${report.name} (${range.label}): ${err && err.message ? err.message : err}`);
+      uiLog(`✕ Skipped ${runLabel(report, range)}: ${err && err.message ? err.message : err}`);
       clearWz(); advanceTo(idx + 1, queue);
     }
   }
