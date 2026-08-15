@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.32.2
+// @version      0.33.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -935,6 +935,23 @@
     clickEl(gen);
   }
 
+  // How long we let ONE report sit in Paycom's queue before giving up.
+  // Measured end-to-end (generate → file on disk) on STAVE DELIVERY:
+  //   Prior Payroll 2023 —  9,674 rows / 21 MB — ~2 min
+  //   Prior Payroll 2024 — 14,760 rows / 33 MB — ~10 min
+  // Row count rose 1.5x but the wait rose 5x, so the cost is strongly
+  // super-linear: a bigger client or a bigger year can plausibly exceed 30 min
+  // even though the report itself would have finished fine. Timing out on a
+  // report Paycom IS still building is the worst outcome — it throws away the
+  // work and the queue slot — so allow 45.
+  const QUEUE_TIMEOUT_MS = 45 * 60 * 1000;
+
+  // Human-readable elapsed time for the timing log ("9m 37s").
+  function fmtElapsed(ms) {
+    const s = Math.round(ms / 1000);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  }
+
   async function generateAndDownload(tag, baseName) {
     await lockExcelOutput(tag);
 
@@ -943,13 +960,15 @@
     if (!gen) throw new Error(`${tag}: Generate Report button not found`);
     showBanner(`${tag}: generating…`);
     uiLog(`${tag}: generating…`);
+    const t0 = Date.now();
     clickGenerateAsserted(tag, gen);
-    // 30 min: the biggest quarters (Punch Change 2025-Q4, ~71k rows) can take
-    // over 10 minutes to generate on Paycom's side — 10 min timed out for real.
     await waitFor(() => getDownloadButtons().length > initial, {
-      timeout: 30 * 60 * 1000, interval: 800, label: `${tag} Download button`,
+      timeout: QUEUE_TIMEOUT_MS, interval: 800, label: `${tag} Download button`,
     });
+    const genMs = Date.now() - t0;
+    uiLog(`  ⏱ ${tag}: Paycom took ${fmtElapsed(genMs)} to build the report`);
     await downloadNewest(baseName);
+    uiLog(`  ⏱ ${tag}: total ${fmtElapsed(Date.now() - t0)} (build + download)`);
     resetAttempt(getIndex()); // real progress → this report isn't redirect-looping
     await sleep(2500); // let the download commit before the next generate/navigation
   }
@@ -1114,12 +1133,13 @@
   async function harvestPipeline(report, stampToLabel, qIdx) {
     const done = new Set();
     const t0 = Date.now();
+    let lastWaitLog = 0;
     while (done.size < stampToLabel.size) {
       if (!isRunning()) return;
-      if (Date.now() - t0 > 30 * 60 * 1000) {
+      if (Date.now() - t0 > QUEUE_TIMEOUT_MS) {
         const missing = Array.from(stampToLabel.entries()).filter(([s]) => !done.has(s)).map(([, l]) => l);
         clearPipe();
-        throw new Error(`${report.name}: timed out waiting for ${missing.join(', ')}`);
+        throw new Error(`${report.name}: timed out after ${fmtElapsed(Date.now() - t0)} waiting for ${missing.join(', ')}`);
       }
       const rows = scanQueueStamps();
       for (const [stamp, label] of stampToLabel) {
@@ -1127,17 +1147,28 @@
         const btn = downloadButtonForStamp(rows.get(stamp));
         if (!btn) continue;
         showBanner(`${report.name} ${label}: downloading…`);
+        uiLog(`  ⏱ ${report.name} ${label}: ready after ${fmtElapsed(Date.now() - t0)} in the queue`);
         await downloadViaButton(btn, `${report.fileBase}_${label}`);
         done.add(stamp);
         setPipe({ idx: qIdx, map: Array.from(stampToLabel).filter(([s]) => !done.has(s)) });
         await sleep(2000); // let the download commit
       }
       const left = stampToLabel.size - done.size;
-      if (left) { showBanner(`${report.name}: ${left} report(s) still generating…`); await sleep(4000); }
+      if (left) {
+        showBanner(`${report.name}: ${left} report(s) still generating…`);
+        // Same reasoning as the wizard watcher: never wait silently. One line a
+        // minute is enough to tell "Paycom is slow" from "the bot is stuck".
+        if (Date.now() - lastWaitLog > 60000) {
+          lastWaitLog = Date.now();
+          const pending = Array.from(stampToLabel.entries()).filter(([s]) => !done.has(s)).map(([, l]) => l);
+          uiLog(`  … waiting ${fmtElapsed(Date.now() - t0)} — ${left} still generating: ${pending.join(', ')}`);
+        }
+        await sleep(4000);
+      }
     }
     clearPipe();
     showBanner(`✓ ${report.name} — all ${stampToLabel.size} ranges downloaded`, true);
-    uiLog(`✓ ${report.name}: all ${stampToLabel.size} ranges downloaded`);
+    uiLog(`✓ ${report.name}: all ${stampToLabel.size} ranges downloaded in ${fmtElapsed(Date.now() - t0)}`);
   }
 
   // For reports with pickRanges: ask WHICH ranges to run (all ticked by
@@ -1602,7 +1633,11 @@
 
     // Waiting here is normal (the report is generating) — but it must never be
     // SILENT: log what the watcher sees every 30s so a detection failure is
-    // visible in the activity log instead of looking like a slow report.
+    // visible in the activity log instead of looking like a slow report. The
+    // elapsed time is part of that line, and is reported again on success, so
+    // we build up real per-range numbers instead of guessing which ranges are
+    // "too big" — that data decides whether half-year splitting is worth it.
+    const t0 = Date.now();
     let lastDiag = 0;
     const found = await waitFor(() => {
       const rows = [...scanQueueStamps().entries()]
@@ -1612,7 +1647,7 @@
       const diag = (msg) => {
         if (Date.now() - lastDiag < 30000) return;
         lastDiag = Date.now();
-        uiLog(`  … queue watch: ${rows.length} row(s); ${msg}`);
+        uiLog(`  … waiting ${fmtElapsed(Date.now() - t0)} — ${rows.length} row(s); ${msg}`);
       };
       if (!newest) { diag('no timestamped rows found on this page'); return null; }
       // Newest row is the one we just downloaded → our new report isn't in the
@@ -1624,12 +1659,14 @@
       const btn = downloadButtonForStamp(newest.cands);
       if (!btn) { diag(`newest ${newest.stamp}: no visible Download button yet (still generating?)`); return null; }
       return { btn, stamp: newest.stamp };
-    }, { timeout: 30 * 60 * 1000, interval: 900, label: `${runLabel(report, range)} queue row` });
+    }, { timeout: QUEUE_TIMEOUT_MS, interval: 900, label: `${runLabel(report, range)} queue row` });
 
+    const buildMs = Date.now() - t0;
+    uiLog(`  ⏱ ${runLabel(report, range)}: Paycom took ${fmtElapsed(buildMs)} to build the report`);
     await downloadViaButton(found.btn, `${report.fileBase}_${range.label}`);
     try { localStorage.setItem(WZ_LAST_STAMP_KEY, found.stamp); } catch (_) {}
     showBanner(`✓ Downloaded: ${runLabel(report, range)}`, true);
-    uiLog(`✓ Downloaded: ${runLabel(report, range)}`);
+    uiLog(`✓ Downloaded: ${runLabel(report, range)} — total ${fmtElapsed(Date.now() - t0)} (build ${fmtElapsed(buildMs)})`);
   }
 
   // Page-based state machine for a wizard report. Guarded against runaway loops.
