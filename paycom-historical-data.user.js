@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.31.0
+// @version      0.32.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -384,17 +384,33 @@
     sessionStorage.setItem(TABID_KEY, TAB_ID);
   } catch (_) { TAB_ID = String(Math.random()).slice(2, 12); }
   const LOCK_KEY = 'histbot.lock';
+  // Chrome throttles timers in BACKGROUND tabs to roughly once a minute, so the
+  // driver's heartbeat stops being punctual the moment the user looks at another
+  // tab — it is not dead, just throttled. The old 8s staleness window treated
+  // that as a crash: a second Paycom tab took over, and two tabs then drove the
+  // same queue at once. That interleaved two reports on one form (Employee Punch
+  // Change and Employee Rates by Allocation generated alternately), and the
+  // files those runs claimed to save never reached disk. The window must
+  // therefore sit comfortably above Chrome's ~60s throttled interval.
+  const LOCK_STALE_MS = 120000;
   const readLock = () => { try { return JSON.parse(localStorage.getItem(LOCK_KEY) || 'null'); } catch (_) { return null; } };
   const heartbeat = () => { try { localStorage.setItem(LOCK_KEY, JSON.stringify({ id: TAB_ID, ts: Date.now() })); } catch (_) {} };
   function iAmDriver() {
     const l = readLock();
     if (!l || l.id === TAB_ID) return true;
-    return (Date.now() - (l.ts || 0)) > 8000; // stale lock → safe to take over
+    return (Date.now() - (l.ts || 0)) > LOCK_STALE_MS; // genuinely dead → take over
   }
   let hbTimer = null;
   function becomeDriver() {
     heartbeat();
     if (!hbTimer) hbTimer = setInterval(heartbeat, 2000);
+    // Stamp the lock on every visibility flip too: the beat just before the tab
+    // is backgrounded is the last punctual one it will get, and the beat when it
+    // comes back should land immediately rather than waiting for the interval.
+    if (!becomeDriver._vis) {
+      becomeDriver._vis = () => { const l = readLock(); if (l && l.id === TAB_ID) heartbeat(); };
+      document.addEventListener('visibilitychange', becomeDriver._vis);
+    }
   }
   function releaseDriver() {
     if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
@@ -925,6 +941,7 @@
       timeout: 30 * 60 * 1000, interval: 800, label: `${tag} Download button`,
     });
     await downloadNewest(baseName);
+    resetAttempt(getIndex()); // real progress → this report isn't redirect-looping
     await sleep(2500); // let the download commit before the next generate/navigation
   }
 
@@ -1293,6 +1310,18 @@
     return a[idx];
   }
   const clearAttempts = () => { try { localStorage.removeItem(ATT_KEY); } catch (_) {} };
+  // Called after every successful download: the loop guard exists to catch a
+  // report whose page REDIRECTS on completion (it would otherwise re-generate
+  // forever), but a big multi-range report legitimately re-lands on its own page
+  // a few times over a 20-minute run. Counting those as failed attempts skipped
+  // Employee Punch Change mid-way (Q1-Q3 saved, then "redirects instead of an
+  // inline Download" and it jumped to the next report). Any produced file proves
+  // the page is NOT redirect-looping, so the budget starts fresh.
+  function resetAttempt(idx) {
+    let a = {};
+    try { a = JSON.parse(localStorage.getItem(ATT_KEY) || '{}') || {}; } catch (_) { a = {}; }
+    if (a[idx]) { delete a[idx]; try { localStorage.setItem(ATT_KEY, JSON.stringify(a)); } catch (_) {} }
+  }
 
   // ═════════════════ Advanced Report Writer (multi-step wizard) ═════════════════
   // For custom reports built via the ARW (e.g. the 3-year Prior Payroll). Flow,
@@ -2494,10 +2523,19 @@
     } else {
       // Another tab is actively driving this run — stand by. Take over only if
       // its heartbeat goes stale (that tab was closed mid-run).
-      log('standby: the bot is running in another Paycom tab');
+      uiLog('⏸ Standing by — the bot is already running in another Paycom tab. Keep only ONE Paycom tab open during a run.');
       const watch = setInterval(() => {
         if (!isRunning()) { clearInterval(watch); return; }
-        if (iAmDriver()) { clearInterval(watch); becomeDriver(); dispatch(); }
+        if (iAmDriver()) {
+          clearInterval(watch);
+          // Loud on purpose: if this ever fires while the other tab is actually
+          // alive, two tabs are about to drive the same queue and reports will
+          // interleave on one form. Seeing it in the log is the only way to tell
+          // that apart from a normal "other tab was closed" handover.
+          uiLog(`⚠ Taking over the run — the other tab has not checked in for over ${Math.round(LOCK_STALE_MS / 1000)}s.`);
+          becomeDriver();
+          dispatch();
+        }
       }, 3000);
     }
   }
