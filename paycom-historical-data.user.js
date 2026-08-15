@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.32.1
+// @version      0.32.2
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -854,6 +854,14 @@
     const transid = transidForButton(btn);
     const nonce = getSessionNonce();
 
+    // Say so BEFORE the fetch. A big report can take minutes to transfer, and
+    // without this line the log goes silent for up to 3 minutes while a
+    // Download button sits on screen — which reads as "the bot is stuck and
+    // refusing to click" (reported live on Prior Payroll 2023/2024).
+    uiLog(`  ↓ fetching ${fileName} (transid ${transid || '?'}) — big files take a few minutes…`);
+    const fetchT0 = Date.now();
+    const secs = () => Math.round((Date.now() - fetchT0) / 1000);
+
     if (transid && nonce) {
       const url = 'https://www.paycomonline.net/v4/cl/rpt-generateproc.php'
         + `?session_nonce=${encodeURIComponent(nonce)}&download=1&transid=${encodeURIComponent(transid)}`;
@@ -867,20 +875,21 @@
           const isHtml = /text\/html/i.test(blob.type || '');
           if (blob.size > 512 && !isHtml) {
             saveBlob(blob, fileName);
-            uiLog(`✓ Saved ${fileName} (${Math.round(blob.size / 1024)} KB)`);
+            uiLog(`✓ Saved ${fileName} (${Math.round(blob.size / 1024)} KB in ${secs()}s)`);
             return;
           }
-          uiLog(`⚠ generateproc gave unexpected content (${blob.type || 'no-type'}, ${blob.size}B) — using Paycom download`);
+          uiLog(`⚠ generateproc gave unexpected content (${blob.type || 'no-type'}, ${blob.size}B) after ${secs()}s — using Paycom download`);
         } else {
-          uiLog(`⚠ generateproc HTTP ${resp.status} — using Paycom download`);
+          uiLog(`⚠ generateproc HTTP ${resp.status} after ${secs()}s — using Paycom download`);
         }
       } catch (e) {
         clearTimeout(killer);
-        uiLog('⚠ generateproc fetch failed — using Paycom download: ' + (e && e.message));
+        uiLog(`⚠ generateproc fetch failed after ${secs()}s — using Paycom download: ` + (e && e.message));
       }
     } else {
       uiLog(`⚠ Missing ${!transid ? 'transid' : 'session_nonce'} — using Paycom download (default name)`);
     }
+    uiLog('  ↓ falling back to Paycom\'s own Download button (file keeps Paycom\'s default name)');
     clickEl(btn); // fallback: Paycom's own download (default filename)
   }
 
