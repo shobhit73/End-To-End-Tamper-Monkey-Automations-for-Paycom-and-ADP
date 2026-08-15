@@ -1,0 +1,28 @@
+# distribution-docs
+
+Word (`.docx`) copies of the userscripts, for sharing with the implementor team.
+
+The implementors are non-technical, so they receive the scripts as documents in the
+shared Google Drive folder rather than as raw `.js` files:
+<https://drive.google.com/drive/folders/1EOj3BDQ_x7Hrs6QtVk9IUm93_y5Pb47C>
+
+| Document | Generated from |
+|---|---|
+| `Paycom Daily Reports Automation.docx` | `paycom-reports.user.js` |
+| `ADP Daily Reports Automation.docx` | `adp-reports.user.js` |
+| `Paycom Historical Data Bot.docx` | `paycom-historical-data.user.js` |
+| `ADP Historical Data Bot.docx` | `adp-historical-data.user.js` |
+
+## These are generated — keep them in sync
+
+Each file is a verbatim, line-for-line copy of its script (Consolas, one paragraph
+per line). **They go stale the moment a script is edited**, and a stale doc is not
+obvious to the person copying it — we shipped v0.20.1 to the team while the repo was
+already on v0.23.0 exactly this way.
+
+So: after changing a userscript, regenerate its document before sharing, and check
+the `@version` in the doc matches the script.
+
+Never hand-edit a `.docx` here — Word's autocorrect turns straight quotes into curly
+quotes, which silently breaks the script when it is pasted into Tampermonkey. Always
+regenerate from the source file instead.
