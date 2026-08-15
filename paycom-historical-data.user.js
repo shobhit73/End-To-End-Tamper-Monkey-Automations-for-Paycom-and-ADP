@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.30.2
+// @version      0.31.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -1512,15 +1512,51 @@
     return `${base} — ${range.display || range.label}`;
   }
 
+  // Stamp of the queue row downloaded for the PREVIOUS range of this wizard run,
+  // so the next range can refuse to hand back the same row (see wizardDownload).
+  const WZ_LAST_STAMP_KEY = 'histbot.wz.lastStamp';
+
   // Download the generated ARW report from the recent-reports tab.
+  //
+  // Do NOT use the "count the Download buttons, wait for the count to rise, take
+  // the topmost" shortcut here. generateAndDownload can use it safely because it
+  // snapshots the count on the SAME page immediately before clicking Generate.
+  // The wizard can't: it clicks Generate on the wizard page and only then
+  // navigates to the queue, so the snapshot is taken on a freshly-loading list
+  // whose rows are still rendering. The count then rises because an OLD row
+  // rendered late — not because our report finished — and the topmost row is
+  // still the PREVIOUS range's. That silently saved 2023's file a second time as
+  // PriorPayroll_2024.csv (byte-identical, confirmed by md5) while the log
+  // happily reported both as downloaded.
+  //
+  // Our report is by definition the NEWEST row in the queue, so instead: wait
+  // until the newest row actually has a Download button, and refuse the stamp we
+  // downloaded for the previous range (that row being newest means ours has not
+  // appeared yet). Stamps are only ever compared to EACH OTHER, never to the
+  // clock — Paycom prints them in the client's timezone (CST here), which is not
+  // the browser's.
   async function wizardDownload(report, range) {
     showBanner(`${runLabel(report, range)}: waiting for the report to finish…`);
     await sleep(1500);
-    const initial = getDownloadButtons().length;
-    await waitFor(() => getDownloadButtons().length > initial, {
-      timeout: 30 * 60 * 1000, interval: 900, label: 'wizard report Download',
-    });
-    await downloadNewest(`${report.fileBase}_${range.label}`);
+
+    let lastStamp = '';
+    try { lastStamp = localStorage.getItem(WZ_LAST_STAMP_KEY) || ''; } catch (_) {}
+
+    const found = await waitFor(() => {
+      const rows = [...scanQueueStamps().entries()]
+        .map(([stamp, el]) => ({ stamp, el, t: parseStamp(stamp) }))
+        .sort((a, b) => b.t - a.t); // newest first
+      const newest = rows[0];
+      if (!newest) return null;
+      // Newest row is the one we just downloaded → our new report isn't in the
+      // list yet. Keep waiting rather than handing back the same file again.
+      if (lastStamp && newest.stamp === lastStamp) return null;
+      const btn = downloadButtonInRow(newest.el);
+      return btn ? { btn, stamp: newest.stamp } : null; // still generating → wait
+    }, { timeout: 30 * 60 * 1000, interval: 900, label: `${runLabel(report, range)} queue row` });
+
+    await downloadViaButton(found.btn, `${report.fileBase}_${range.label}`);
+    try { localStorage.setItem(WZ_LAST_STAMP_KEY, found.stamp); } catch (_) {}
     showBanner(`✓ Downloaded: ${runLabel(report, range)}`, true);
     uiLog(`✓ Downloaded: ${runLabel(report, range)}`);
   }
@@ -1537,6 +1573,9 @@
       localStorage.removeItem(WZ_KEY);
       localStorage.removeItem(WZ_RANGES_KEY);
       localStorage.removeItem(WZ_RANGE_IDX_KEY);
+      // Must be cleared too — a stamp left over from a previous run would make
+      // the next run's FIRST range sit and wait for a row newer than it.
+      localStorage.removeItem(WZ_LAST_STAMP_KEY);
     } catch (_) {}
   };
   function getWzRanges() {
