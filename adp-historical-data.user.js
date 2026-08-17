@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.14.0
+// @version      1.15.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -47,7 +47,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '1.14.0';
+    return '1.15.0';
   })();
 
   const YEARS_KEY = 'historicalBot.adp.years';
@@ -1767,12 +1767,17 @@
     sn1.renameTo = fileName;
     if (sn2) sn2.renameTo = fileName;
     const baseHref = anchor.ownerDocument.baseURI;
-    // The real spreadsheet lives at …/downloadTemplate/?instanceRefId=BIRT…;
-    // the first thing ADP opens is usually a launcher page (auditOutput.do).
-    // Two file-URL shapes exist: BIRT reports (Payroll History etc.) use
-    // …/downloadTemplate/?instanceRefId=BIRT…; legacy T&A reports (Timecard w/
-    // Supervisor Approval) use /mascsr/wfntlm/reports/v2/downloadreport?referenceId=…
-    const isFileUrl = (u) => /downloadTemplate|instanceRefId|downloadreport|referenceId=|\.(xlsx?|csv)(\?|$)/i.test(u);
+    // The first thing ADP opens is usually a launcher page (auditOutput.do);
+    // the real file is a SECOND captured URL. Three shapes seen live:
+    //   …/downloadTemplate/?instanceRefId=BIRT…              (some BIRT reports)
+    //   /mascsr/wfntlm/reports/v2/downloadreport?referenceId=…   (legacy T&A)
+    //   /mascsr/wfn/ireporting/metaservices/reportviewer/download/BIRT<id>_PROD_DC2
+    //                                                        (Payroll History)
+    // The third was captured correctly but not RECOGNISED, so the launcher page
+    // won by default and the run ended with "could not reach the real file"
+    // while the answer sat in the diagnostics line. Keep this list in step with
+    // whatever the diagnostics show.
+    const isFileUrl = (u) => /downloadTemplate|instanceRefId|downloadreport|reportviewer\/download|\/BIRT\d|referenceId=|\.(xlsx?|csv)(\?|$)/i.test(u);
     const capturedUrls = () => sn1.urls.concat(sn2 ? sn2.urls : []);
     const capturedForms = () => sn1.forms.concat(sn2 ? sn2.forms : []);
     // The menu item is a Dojo widget, same as the ⋯ button: its handler runs on
