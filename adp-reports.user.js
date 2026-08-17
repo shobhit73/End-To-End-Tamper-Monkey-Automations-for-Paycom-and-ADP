@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.7.0
+// @version      1.7.1
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -15,6 +15,17 @@
 // =====================================================================
 (function () {
   'use strict';
+
+  // Version shown in the panel badge — read from Tampermonkey so it can never
+  // drift from @version the way a hardcoded copy does.
+  const SCRIPT_VERSION = (() => {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) {
+        return GM_info.script.version;
+      }
+    } catch (_) { }
+    return '1.7.1';
+  })();
 
   // ───────────────── column lists (verbatim from v9.2 ADP Multi-Mode Assistant) ─────────────────
 
@@ -3892,7 +3903,9 @@
 
     const versionTag = document.createElement('span');
     versionTag.className = 'adpbot-ver';
-    versionTag.textContent = 'v1.0';
+    // Never hardcode this: the badge read 'v1.0' while @version was 1.7.0, so
+    // the panel could not be used to tell which build was actually loaded.
+    versionTag.textContent = 'v' + SCRIPT_VERSION;
     titleRow.appendChild(versionTag);
 
     const toggleBtn = document.createElement('button');

@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.23.0
+  // @version      0.23.1
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -10,6 +10,18 @@
 
   (function () {
     'use strict';
+
+    // Shown in the panel header. Read from Tampermonkey, never hardcoded — a
+    // second copy of the version silently goes stale, and then the panel cannot
+    // be used to tell which build is actually loaded during a live run.
+    const SCRIPT_VERSION = (() => {
+      try {
+        if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) {
+          return GM_info.script.version;
+        }
+      } catch (_) { }
+      return '0.23.1';
+    })();
 
     const STATE_KEY = 'paycomBot.state';
     const STATES = { IDLE: 'IDLE', RUNNING: 'RUNNING' };
@@ -3261,6 +3273,8 @@
           #paycom-bot-panel.minimized .hdr{padding:8px 12px;border-bottom:0}
           #paycom-bot-panel h4{margin:0;color:#cad2c5;font-size:14px;font-weight:700;letter-spacing:.4px;white-space:nowrap;
             display:flex;align-items:center;gap:8px}
+          #paycom-bot-panel .pcb-ver{flex:none;font-size:10px;font-weight:700;letter-spacing:.3px;color:#cad2c5;
+            background:rgba(47,62,70,.45);border:1px solid rgba(202,210,197,.35);border-radius:999px;padding:1px 7px}
           #paycom-bot-panel h4::before{content:'';flex:none;width:9px;height:9px;border-radius:50%;
             background:#84a98c;box-shadow:0 0 8px rgba(132,169,140,.9)}
           #paycom-bot-panel.running h4::before{background:#cad2c5;box-shadow:0 0 10px #cad2c5;
@@ -3315,7 +3329,7 @@
             font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
         </style>
         <div class="hdr">
-          <h4>Paycom Bot</h4>
+          <h4>Paycom Bot<span class="pcb-ver">v${SCRIPT_VERSION}</span></h4>
           <button class="min-btn" title="Minimize panel">–</button>
         </div>
         <div class="body">

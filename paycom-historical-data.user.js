@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.34.0
+// @version      0.34.1
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -10,6 +10,18 @@
 
 (function () {
   'use strict';
+
+  // Shown in the panel header. Read from Tampermonkey so it can never drift
+  // from @version — a stale badge makes the panel useless for telling which
+  // build is actually loaded mid-run.
+  const SCRIPT_VERSION = (() => {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) {
+        return GM_info.script.version;
+      }
+    } catch (_) { }
+    return '0.34.1';
+  })();
 
   // ── Duplicate-instance guards ──
   // 1) IFRAMES: Paycom pages embed same-origin iframes whose URLs also match
@@ -2546,10 +2558,12 @@
         #histbot-panel .inspect:hover{background:rgba(132,169,140,.1)}
         #histbot-panel .stop{background:transparent;color:#cad2c5;border:1px solid rgba(202,210,197,.5)}
         #histbot-panel .stop:hover{background:rgba(202,210,197,.12)}
+        #histbot-panel .hb-ver{flex:none;font-size:10px;font-weight:700;letter-spacing:.3px;color:#cad2c5;
+          background:rgba(47,62,70,.45);border:1px solid rgba(202,210,197,.35);border-radius:999px;padding:1px 7px}
         #histbot-panel.minimized .body{display:none}
       </style>
       <div class="hdr">
-        <h4>Historical Data Bot</h4>
+        <h4>Historical Data Bot<span class="hb-ver">v${SCRIPT_VERSION}</span></h4>
         <button class="min-btn" title="Minimize panel">–</button>
       </div>
       <div class="body">
