@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.13.1
+// @version      1.14.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -47,7 +47,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '1.13.1';
+    return '1.14.0';
   })();
 
   const YEARS_KEY = 'historicalBot.adp.years';
@@ -947,8 +947,25 @@
 
   // Plain calendar year. The day-to-day script uses a +1-day convention
   // (01/02 → 01/01 of the next year); that is deliberately NOT used here.
+  // A past year is the whole calendar year. The CURRENT year must stop at
+  // today — asking ADP for a range that runs into the future is not a range
+  // the report is meant to take, and there is no data there to fetch anyway.
   function yearDateRange(year) {
+    const now = new Date();
+    if (year === now.getFullYear()) {
+      return {
+        from: '01/01/' + year,
+        to: pad2(now.getMonth() + 1) + '/' + pad2(now.getDate()) + '/' + year,
+      };
+    }
     return { from: '01/01/' + year, to: '12/31/' + year };
+  }
+
+  // Filename suffix. The current year is partial, so label it as such instead
+  // of letting HistoricalPayroll_2026.xlsx imply a full year of data — the same
+  // convention the Paycom historical bot uses.
+  function yearLabel(year) {
+    return year === new Date().getFullYear() ? year + '-to-date' : String(year);
   }
 
   function pad2(n) { return String(n).padStart(2, '0'); }
@@ -1975,7 +1992,7 @@
   ];
 
   function downloadSteps(year) {
-    const fileName = 'HistoricalPayroll_' + year + '.xlsx';
+    const fileName = 'HistoricalPayroll_' + yearLabel(year) + '.xlsx';
     return [
       {
         name: 'Download ' + fileName, fn: async () => {
@@ -3182,12 +3199,16 @@
 
   // ───────────────────────────── year dialog ────────────────────────────
 
-  // Prior three calendar years, ascending. The CURRENT year is deliberately
-  // EXCLUDED — it is covered by the day-to-day adp-reports bot. Derived from
-  // the system clock, so this rolls over on its own each January.
+  // Prior three calendar years PLUS the current one, ascending. The current
+  // year used to be excluded on the grounds that the day-to-day adp-reports bot
+  // covers it, but a migration needs one continuous Payroll History set — and
+  // that bot pulls per-pay-period files, not a consolidated year. It runs
+  // 1 Jan → today (see yearDateRange) and is saved as <year>-to-date. Untick it
+  // in the picker when it isn't wanted. Derived from the system clock, so this
+  // rolls over on its own each January.
   function historicalYears() {
     const y = new Date().getFullYear();
-    return [y - 3, y - 2, y - 1];
+    return [y - 3, y - 2, y - 1, y];
   }
 
   // Default on first run: every year ticked.
@@ -3346,7 +3367,8 @@
 
       const hint = document.createElement('div');
       hint.style.cssText = 'font-size:11.5px;color:#c2a8ff;margin-bottom:8px;';
-      hint.textContent = 'Select the year(s) to download. One consolidated file per year.';
+      hint.textContent = 'Select the year(s) to download. One consolidated file per year — '
+        + 'the current year runs 1 Jan → today and is saved as <year>-to-date.';
       body.appendChild(hint);
 
       const row = document.createElement('div');
