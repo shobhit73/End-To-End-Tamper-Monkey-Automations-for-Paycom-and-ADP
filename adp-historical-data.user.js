@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.13.0
+// @version      1.13.1
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -36,7 +36,19 @@
   const PANEL_ID = 'hd-bot-panel';
   // 1.8.0 = merge of two parallel lines: Rohit's 1.2.0 (Who Appears filter for
   // two Time Off reports) + the 1.2.x–1.7.x line (T&A timecards, Audit Trail).
-  const SCRIPT_VERSION = '1.10.1';
+  // Read the version from Tampermonkey rather than repeating it here. A second
+  // hardcoded copy silently drifts: this said 1.10.1 while @version had moved
+  // on four releases, so the panel and every log line reported a version that
+  // was not running — the one thing you must be able to trust when debugging a
+  // live run. The literal below is only a fallback for when GM_info is absent.
+  const SCRIPT_VERSION = (() => {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) {
+        return GM_info.script.version;
+      }
+    } catch (_) { }
+    return '1.13.1';
+  })();
 
   const YEARS_KEY = 'historicalBot.adp.years';
 
