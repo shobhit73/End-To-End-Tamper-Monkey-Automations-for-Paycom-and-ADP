@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.11.2
+// @version      1.12.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1593,26 +1593,49 @@
       return { expanded, pop };
     };
 
+    // ADP tags each menu item with its own stable data-pendo-id. Captured live:
+    //   <ul class="reportActionsList">
+    //     <li><span style="font-weight:bold">View as </span></li>
+    //     <li><a href="#!" data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_DATA_PDF">
+    //           <i class="fa fa-file-pdf-o"></i>PDF</a></li>
+    //     <li><a href="#!" data-pendo-id="PENDO_ADPR_DATAGRID_SHOW_QUERY">…
+    // These ids are the safest handle there is — they cannot match Run / Query /
+    // AddNotes by accident the way a text search can. Excel first: a report that
+    // offers both should not be taken as PDF.
+    const PENDO_IDS = [
+      'PENDO_ADPR_DATAGRID_VIEW_EXTERNAL',   // XLS / Excel
+      'PENDO_ADPR_DATAGRID_VIEW_DATA_PDF',   // PDF-only reports (Employee Lien Detail)
+    ];
+
     // Format items inside the popup. Scoping to OUR popup means a loose text
     // match is safe — there is no other row's control in here to grab.
     const FORMAT_RE = /^(view as\s+)?(xlsx?|excel|csv|pdf|download)$/i;
+    const CLICKABLE = 'a, [role="menuitem"], button';
     const findInPopup = (pop) => {
       const cands = Array.from(pop.querySelectorAll('a, [role="menuitem"], li, div, span, button, td'))
         .filter(visible)
         .filter(el => FORMAT_RE.test((el.textContent || '').replace(/\s+/g, ' ').trim()));
       if (!cands.length) return null;
       // Prefer Excel/CSV over PDF (PDF-only reports simply have no other item),
-      // and the DEEPEST node so we click the item, not a wrapper holding several.
+      // then a real control over its <li> wrapper — the handler lives on the
+      // <a>, and a click on the surrounding <li> never reaches it (that is
+      // exactly why "Clicking PDF — <li>" did nothing) — then the deepest node.
       const rank = (el) => /pdf/i.test(el.textContent || '') ? 1 : 0;
+      const notClickable = (el) => (el.matches && el.matches(CLICKABLE)) ? 0 : 1;
       const depth = (el) => { let d = 0, n = el; while (n && n !== pop) { d++; n = n.parentElement; } return d; };
-      cands.sort((a, b) => rank(a) - rank(b) || depth(b) - depth(a));
+      cands.sort((a, b) => rank(a) - rank(b) || notClickable(a) - notClickable(b) || depth(b) - depth(a));
       return cands[0];
     };
 
     const findXlsAnchor = () => {
-      const pendo = deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0];
-      if (pendo) return pendo;
       const { pop } = menuHost();
+      for (const id of PENDO_IDS) {
+        const sel = '[data-pendo-id="' + id + '"]';
+        const scoped = pop ? Array.from(pop.querySelectorAll(sel)).filter(visible)[0] : null;
+        if (scoped) return scoped;
+        const anywhere = deepQueryAll(sel).filter(visible)[0];
+        if (anywhere) return anywhere;
+      }
       if (pop) { const hit = findInPopup(pop); if (hit) return hit; }
       // Fallbacks for layouts whose button carries no aria-owns.
       const combined = deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
@@ -1626,9 +1649,12 @@
       if (header) {
         let container = header.parentElement;
         for (let d = 0; d < 4 && container; d++) {
-          const item = Array.from(container.querySelectorAll('a, [role="menuitem"], li, div, button'))
+          const hits = Array.from(container.querySelectorAll('a, [role="menuitem"], li, div, button'))
             .filter(visible)
-            .find(el => /^(pdf|xls|excel|csv)$/i.test((el.textContent || '').trim()));
+            .filter(el => /^(pdf|xls|excel|csv)$/i.test((el.textContent || '').trim()));
+          // The <li> precedes its own <a> in document order, so taking the
+          // first hit picks the wrapper and the click goes nowhere.
+          const item = hits.find(el => el.matches && el.matches(CLICKABLE)) || hits[0];
           if (item) return item;
           container = container.parentElement;
         }
