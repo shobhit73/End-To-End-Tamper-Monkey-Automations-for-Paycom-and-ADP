@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.12.1
+// @version      1.13.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1452,7 +1452,52 @@
       } catch (_) { }
       return oSub.apply(this, arguments);
     };
-    st.restore = () => { try { win.open = oOpen; if (oFetch) win.fetch = oFetch; if (oXo) XP.open = oXo; if (oSub) FP.submit = oSub; } catch (_) { } };
+    // Some ADP handlers use NO JavaScript API at all: they build an
+    // <a href download> (or a hidden iframe) and click it, which the browser
+    // handles natively. Confirmed live on Employee Lien Detail — the PDF
+    // downloaded twice while open/fetch/XHR/submit stayed completely silent.
+    //
+    // For the anchor case this is better than capturing a URL: set the
+    // element's own `download` attribute and the browser saves it under OUR
+    // name, with no second copy and no re-fetch.
+    const AP = win.HTMLAnchorElement && win.HTMLAnchorElement.prototype;
+    const oAClick = AP && AP.click;
+    if (oAClick) {
+      AP.click = function () {
+        try {
+          const href = this.getAttribute && this.getAttribute('href');
+          if (href) push(href);
+          if (st.renameTo && this.hasAttribute && this.hasAttribute('download')) {
+            this.setAttribute('download', st.renameTo);
+            st.renamedInPlace = true;
+          }
+        } catch (_) { }
+        return oAClick.apply(this, arguments);
+      };
+    }
+    // Hidden-iframe downloads: record the src so the caller can fetch it.
+    let obs = null;
+    try {
+      obs = new win.MutationObserver((recs) => {
+        for (const r of recs) {
+          for (const n of r.addedNodes || []) {
+            try {
+              const tag = (n.tagName || '').toLowerCase();
+              if (tag === 'iframe' || tag === 'embed') push(n.getAttribute('src') || '');
+              else if (tag === 'object') push(n.getAttribute('data') || '');
+              else if (tag === 'a') push(n.getAttribute('href') || '');
+            } catch (_) { }
+          }
+        }
+      });
+      obs.observe(win.document.documentElement, { childList: true, subtree: true });
+    } catch (_) { obs = null; }
+
+    st.restore = () => {
+      try { win.open = oOpen; if (oFetch) win.fetch = oFetch; if (oXo) XP.open = oXo; if (oSub) FP.submit = oSub; } catch (_) { }
+      try { if (oAClick) AP.click = oAClick; } catch (_) { }
+      try { if (obs) obs.disconnect(); } catch (_) { }
+    };
     return st;
   }
 
@@ -1689,6 +1734,9 @@
     const win = (anchor.ownerDocument && anchor.ownerDocument.defaultView) || window;
     const sn1 = armSniffer(win);
     const sn2 = (win === window) ? null : armSniffer(window);
+    // If ADP downloads by clicking its own <a download>, rename it in place.
+    sn1.renameTo = fileName;
+    if (sn2) sn2.renameTo = fileName;
     const baseHref = anchor.ownerDocument.baseURI;
     // The real spreadsheet lives at …/downloadTemplate/?instanceRefId=BIRT…;
     // the first thing ADP opens is usually a launcher page (auditOutput.do).
@@ -1719,26 +1767,29 @@
       // which for a menu item can land outside the item.
       try { clickTarget.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (_) { }
       mouseSeq(clickTarget);            // pointer/mouse sequence (Dojo needs mousedown)
-      let escalated = false;
+      // Exactly ONE click, and no retry. The click DOES reach ADP's handler —
+      // it downloads the file every time — the sniffer simply cannot see how,
+      // so "no request captured" must not be read as "the click missed". The
+      // retry that assumption justified produced a second copy of every PDF.
       for (let i = 0; i < 40; i++) { // up to 12s for the handler to fire
+        if (sn1.renamedInPlace || (sn2 && sn2.renamedInPlace)) break;
         const arr = capturedUrls();
         const good = arr.find(isFileUrl);
         if (good) { url = good; break; }
         if (!url) url = arr[0] || '';
         if (url && i >= 20) break; // give the real URL ~6s, then work with the viewer
-        // ~2.4s of complete silence means the click never reached a handler.
-        if (!escalated && !arr.length && i === 8) {
-          escalated = true;
-          logInfo('No request after the click — retrying with a plain click + dijitclick');
-          clickEl(clickTarget);
-          try { clickTarget.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
-        }
         checkAbort();
         await sleep(300);
       }
     } finally {
       sn1.restore();
       if (sn2) sn2.restore();
+    }
+    // ADP's own <a download> was retagged with our filename — the browser has
+    // already saved it correctly, so there is nothing left to fetch.
+    if (sn1.renamedInPlace || (sn2 && sn2.renamedInPlace)) {
+      logSuccess('Saved ' + fileName + ' (renamed ADP\'s own download)');
+      return { ok: true, sig: topSig };
     }
     // A plain <a href> navigation calls none of the APIs the sniffer hooks
     // (open/fetch/XHR/submit), so "nothing captured" does NOT mean "no URL" —
@@ -1751,7 +1802,8 @@
       logWarn(label + ': could not capture the file URL — the file keeps ADP\'s default name');
       logInfo('  clicked <' + clickTarget.tagName.toLowerCase() + '> "' +
         (clickTarget.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40) +
-        '"; nothing was requested afterwards (no open/fetch/XHR/form, no href)');
+        '"; ADP downloaded it by a route we cannot see (no open/fetch/XHR/form/submit, ' +
+        'no <a download>, no injected iframe). The file IS in Downloads under ADP\'s own name.');
       return { ok: false, sig: topSig };
     }
     const abs = new URL(url, baseHref).href;
