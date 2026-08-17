@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.10.1
+// @version      1.11.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -39,6 +39,14 @@
   const SCRIPT_VERSION = '1.10.1';
 
   const YEARS_KEY = 'historicalBot.adp.years';
+
+  // Did the LAST download step actually write a renamed file? A download step
+  // deliberately returns true even when renaming fails (the report itself ran,
+  // and failing the whole year over a filename would be worse) — but the caller
+  // then logged "… downloaded" right underneath its own "Download failed"
+  // warning. A log that claims success on failure is how a broken run looks
+  // healthy, so callers must report what actually happened.
+  let lastSaveOk = false;
 
   const REPORT_SEARCH_TERM = 'Payroll History';
   // The row's title attribute is the BARE report name. "Standard" is the Type
@@ -1559,21 +1567,48 @@
     clickTrigger();
     await sleep(800);
 
+    // Is OUR ⋯ dropdown actually open? The Dojo button says so itself, and it
+    // names its popup: aria-expanded="true" popupactive="true"
+    // aria-owns="revit_TooltipDialog_NNN". Verified live on Reports Output.
+    // Without this we cannot tell "menu never opened" from "menu open but the
+    // item wasn't recognised" — and those need opposite fixes.
+    const menuHost = () => {
+      const btn = (trigger.querySelector && trigger.querySelector('[aria-owns]')) ||
+        (trigger.closest && trigger.closest('[aria-owns]')) || trigger;
+      const owns = btn.getAttribute && btn.getAttribute('aria-owns');
+      const expanded = (btn.getAttribute && btn.getAttribute('aria-expanded')) === 'true';
+      const pop = owns ? document.getElementById(owns) : null;
+      return { expanded, pop: (pop && visible(pop)) ? pop : null };
+    };
+
+    // Format items inside the popup. Scoping to OUR popup means a loose text
+    // match is safe — there is no other row's control in here to grab.
+    const FORMAT_RE = /^(view as\s+)?(xlsx?|excel|csv|pdf|download)$/i;
+    const findInPopup = (pop) => {
+      const cands = Array.from(pop.querySelectorAll('a, [role="menuitem"], li, div, span, button, td'))
+        .filter(visible)
+        .filter(el => FORMAT_RE.test((el.textContent || '').replace(/\s+/g, ' ').trim()));
+      if (!cands.length) return null;
+      // Prefer Excel/CSV over PDF (PDF-only reports simply have no other item),
+      // and the DEEPEST node so we click the item, not a wrapper holding several.
+      const rank = (el) => /pdf/i.test(el.textContent || '') ? 1 : 0;
+      const depth = (el) => { let d = 0, n = el; while (n && n !== pop) { d++; n = n.parentElement; } return d; };
+      cands.sort((a, b) => rank(a) - rank(b) || depth(b) - depth(a));
+      return cands[0];
+    };
+
     const findXlsAnchor = () => {
       const pendo = deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0];
       if (pendo) return pendo;
+      const { pop } = menuHost();
+      if (pop) { const hit = findInPopup(pop); if (hit) return hit; }
+      // Fallbacks for layouts whose button carries no aria-owns.
       const combined = deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
         .find(el => {
           const t = (el.textContent || '').trim();
-          // Legacy T&A reports (e.g. Timecard w/ Supervisor Approval) label the
-          // menu item "Download" or "View as Excel" instead of "View as XLS".
           return t.length < 30 && /view as xls|view as excel|^download$/i.test(t);
         });
       if (combined) return combined;
-      // PDF-only reports (e.g. Employee Lien Detail) render a "View as" HEADER
-      // with separate short items underneath it — "PDF" / "Query" — instead of
-      // one combined "View as PDF" row. Find the header, then the nearest
-      // short-text item under it whose own text is just the format name.
       const header = deepQueryAll('*').filter(visible)
         .find(el => el.children.length === 0 && (el.textContent || '').trim().toLowerCase() === 'view as');
       if (header) {
@@ -1593,13 +1628,25 @@
       anchor = findXlsAnchor();
       if (!anchor) {
         if (i > 0 && i % 8 === 0) {
-          logInfo('Options menu not open yet — re-clicking the ⋯ button');
+          const { expanded, pop } = menuHost();
+          logInfo(expanded
+            ? 'Menu reports itself OPEN but no format item matched yet — re-clicking anyway'
+            : 'Options menu is not open — re-clicking the ⋯ button');
+          if (pop) logInfo('  menu contents: ' + JSON.stringify((pop.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200)));
           clickTrigger();
         }
         await sleep(500);
       }
     }
-    if (!anchor) throw new Error('"View as" menu item (XLS/Excel/PDF) not found (trigger still in DOM: ' + trigger.isConnected + ')');
+    if (!anchor) {
+      // Say WHICH failure this was, and what the menu actually held — otherwise
+      // the next debugging round starts from zero again.
+      const { expanded, pop } = menuHost();
+      throw new Error('"View as" item not found — menu ' + (expanded ? 'WAS open' : 'never opened') +
+        (pop ? ', contents: ' + JSON.stringify((pop.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200))
+             : ', popup element not locatable') +
+        ' (trigger still in DOM: ' + trigger.isConnected + ')');
+    }
 
     const win = (anchor.ownerDocument && anchor.ownerDocument.defaultView) || window;
     const sn1 = armSniffer(win);
@@ -1795,11 +1842,13 @@
     return [
       {
         name: 'Download ' + fileName, fn: async () => {
+          lastSaveOk = false;
           try {
             const res = await downloadRenamed(fileName, String(year));
             // Claim the row only once the attempt has finished, so a paused and
             // resumed retry can re-claim the same row instead of hanging.
             if (res && res.sig) downloadedSigs.add(res.sig);
+            lastSaveOk = !!(res && res.ok);
             return true;
           } catch (err) {
             if (err && (err.aborted || err.paused)) throw err;
@@ -1858,9 +1907,11 @@
       { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
       {
         name: 'Download ' + fileName, fn: async () => {
+          lastSaveOk = false;
           try {
             const res = await downloadRenamed(fileName, reportName);
             if (res && res.sig) downloadedSigs.add(res.sig);
+            lastSaveOk = !!(res && res.ok);
             return true;
           } catch (err) {
             if (err && (err.aborted || err.paused)) throw err;
@@ -1909,7 +1960,8 @@
         try {
           await runSteps(steps, { year: year });
           succeeded.push(year);
-          logSuccess(year + ' complete');
+          if (lastSaveOk) logSuccess(year + ' complete');
+          else logWarn(year + ' RAN but the file was not saved under our name — download it from Reports Output');
         } catch (err) {
           if (err && err.aborted) throw err; // Stop kills the whole run
           failed.push(year);
@@ -1973,7 +2025,8 @@
         try {
           await runSteps(timeOffSteps(reportName, range.from, range.to), { report: reportName });
           succeeded.push(reportName);
-          logSuccess(reportName + ' complete');
+          if (lastSaveOk) logSuccess(reportName + ' complete');
+          else logWarn(reportName + ' RAN but the file was not saved under our name — download it from Reports Output');
         } catch (err) {
           if (err && err.aborted) throw err; // Stop kills the whole run
           failed.push(reportName);
@@ -2157,9 +2210,11 @@
       { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
       {
         name: 'Download ' + fileName, fn: async () => {
+          lastSaveOk = false;
           try {
             const res = await downloadRenamed(fileName, reportName);
             if (res && res.sig) downloadedSigs.add(res.sig);
+            lastSaveOk = !!(res && res.ok);
             return true;
           } catch (err) {
             if (err && (err.aborted || err.paused)) throw err;
@@ -2205,7 +2260,8 @@
         try {
           await runSteps(taLegacySteps(reportName, rng), { report: reportName });
           succeeded.push(reportName);
-          logSuccess(reportName + ' complete');
+          if (lastSaveOk) logSuccess(reportName + ' complete');
+          else logWarn(reportName + ' RAN but the file was not saved under our name — download it from Reports Output');
         } catch (err) {
           if (err && err.aborted) throw err; // Stop kills the whole run
           failed.push(reportName);
@@ -2260,6 +2316,7 @@
   // Detected once per run while the run page is open (the Reports Output page
   // no longer shows it). Falls back to '' → file name simply omits the client.
   let auditClientName = '';
+
   function detectClientName() {
     const texts = deepQueryAll('div, span, li, h1, h2, b').filter(visible)
       .map(el => (el.textContent || '').trim())
@@ -2923,9 +2980,11 @@
         name: 'Download', fn: async () => {
           const fileName = (auditClientName ? safeFileName(auditClientName) + '_' : '') +
             'Employee_Lien_Detail_' + asOf.label + '.pdf';
+          lastSaveOk = false;
           try {
             const res = await downloadRenamed(fileName, LIEN_REPORT + ' (' + asOf.label + ')');
             if (res && res.sig) downloadedSigs.add(res.sig);
+            lastSaveOk = !!(res && res.ok);
             return true;
           } catch (err) {
             if (err && (err.aborted || err.paused)) throw err;
@@ -2946,15 +3005,20 @@
     downloadedSigs = new Set();
     auditClientName = '';
     const dates = lienAsOfDates();
+    let saved = 0;
     try {
       for (let i = 0; i < dates.length; i++) {
         const asOf = dates[i];
         setStatus(LIEN_REPORT + ' (' + asOf.label + ') — ' + (i + 1) + '/' + dates.length + '…');
         await runSteps(lienSteps(asOf), { report: LIEN_REPORT, asOf: asOf.label });
-        logSuccess(LIEN_REPORT + ' (' + asOf.label + ') downloaded');
+        if (lastSaveOk) { logSuccess(LIEN_REPORT + ' (' + asOf.label + ') downloaded'); saved++; }
+        else logWarn(LIEN_REPORT + ' (' + asOf.label + ') RAN but was not saved under our name — download it from Reports Output');
       }
-      setStatus(LIEN_REPORT + ' downloaded ✓ (' + dates.map(d => d.label).join(', ') + ')');
-      logSuccess('=== ' + LIEN_REPORT + ' complete ===');
+      setStatus(saved === dates.length
+        ? LIEN_REPORT + ' downloaded ✓ (' + dates.map(d => d.label).join(', ') + ')'
+        : LIEN_REPORT + ': ' + saved + '/' + dates.length + ' saved — see log');
+      if (saved === dates.length) logSuccess('=== ' + LIEN_REPORT + ' complete ===');
+      else logWarn('=== ' + LIEN_REPORT + ' finished with ' + (dates.length - saved) + ' file(s) NOT saved ===');
     } catch (err) {
       if (err && err.aborted) {
         setStatus('Aborted by user');
