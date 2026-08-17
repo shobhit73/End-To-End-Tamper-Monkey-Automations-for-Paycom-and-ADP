@@ -112,8 +112,9 @@ A batch of three simultaneous "fixes" (multi-tab lock + nonce regex + date-range
 1. **One fix per version, test, then next.** Bump `@version` every time; hand the file to the user via file-send after every change.
 2. **Debug live in the user's logged-in Chrome** (claude-in-chrome MCP) instead of guessing from code: `performance.getEntriesByType('resource')` lists every request URL the page made; fetching Paycom's own JS bundles and grepping them reveals the real handlers. Minutes of live inspection beat hours of speculative patching.
 3. The Chrome extension **blocks returning raw HTML or query-string data** from the page (`[BLOCKED: Cookie/query string data]`). Return only attribute NAMES, URL pathnames, `searchParams.keys()`, and heavily masked snippets (`.replace(/[A-Za-z0-9+\/]{16,}/g,'MASKED')`).
-4. `node --check` the script after every edit — it catches template-literal/escaping mistakes before the user pastes a broken file.
-5. Multi-tab hazard — now FIXED in code (v0.21.0+): a sessionStorage tab-id + localStorage heartbeat lock makes one tab the "driver"; other tabs stand by and take over only if the heartbeat goes stale. (An earlier v0.16 tab-lock attempt broke the script; this minimal heartbeat version works.)
+4. `node --check` the script after every edit — it catches template-literal/escaping mistakes before the user pastes a broken file. It does **not** catch a `let` used above its declaration (that only throws at runtime), so put new module-level state near the top with the rest.
+5. **Get the markup before writing the fix.** Two consecutive ADP releases were shipped reasoning from code alone and both missed; the actual `<ul>` markup, once captured, made the fix obvious and correct first time. If the element can't be inspected because it disappears on click, use the Console recipe in "Capturing DOM that vanishes when you click" — a couple of minutes there beats a release that has to be undone.
+6. Multi-tab hazard — now FIXED in code (v0.21.0+): a sessionStorage tab-id + localStorage heartbeat lock makes one tab the "driver"; other tabs stand by and take over only if the heartbeat goes stale. (An earlier v0.16 tab-lock attempt broke the script; this minimal heartbeat version works.)
 
 ### Duplicate-instance war stories (Aug 2026, the Employee Punch Change saga)
 
@@ -127,7 +128,62 @@ Every one of these produced the SAME symptom — doubled log lines / doubled gen
 
 The queue-all-generates-then-harvest pipeline (v0.20.x–0.21.x) was reverted after repeatedly mislabeling files: row→label mapping broke via late-rendering junk queue rows, lazy tab panes, and the duplicate instances above. **Strictly serial** (generate one range → wait for ITS download → save → next) cannot mix labels up and is the shipped design. Reports whose full year is too large get quarterly `ranges` (`QUARTER_RANGES`) plus `pickRanges: true`, which pops a checkbox dialog so an interrupted run can resume with only the missing quarters. Download-button wait is 30 min (a ~71k-row quarter genuinely exceeded 10).
 
-Startup log line shows the running version (`Started 1 report(s) [v0.23.0]: …`) — check it FIRST when behavior doesn't match the code you just shipped; a stale Tampermonkey paste cost a debugging round.
+Startup log line shows the running version (`Started 1 report(s) [v0.23.0]: …`) — check it FIRST when behavior doesn't match the code you just shipped; a stale Tampermonkey paste cost a debugging round. All four bots now read this from `GM_info.script.version`; never hardcode a second copy (see "A log that can lie" below).
+
+## Picking the RIGHT row / the RIGHT element (Aug 2026 — the costliest bug family)
+
+Every silent-wrong-file bug in this repo has been the same mistake wearing a different hat: **identifying the thing to click by position or by text instead of by identity.** Four separate instances in one session:
+
+1. **"Wait for the Download-button count to rise, then take the topmost."** The count also rises when a PREVIOUS range's row finishes, and at that moment the topmost row with a button is still that range. `PriorPayroll_2024.csv` was a byte-identical copy of 2023 (md5 `0fe1ac6e1930`); `EmployeePunchChange_2026-Q3` was a byte-identical copy of Q2 (md5 `c8cf48d92995`) saved 39s after Generate while every real quarter took 4–8 min. Fix: snapshot the newest queue-row **timestamp** before clicking Generate, then wait for a strictly newer row and download ITS button. Stamps are compared only to each other — Paycom prints them in the client's timezone, not the browser's.
+2. **Fixing one code path and *assuming* the sibling is safe.** After fixing `wizardDownload`, a comment was written claiming `generateAndDownload` was safe "because it snapshots on the same page". It was not; the identical bug shipped there and cost another round. **When you fix a selection bug, audit every path that selects the same kind of thing, and delete the old helper so it cannot come back** (`downloadNewest` is gone for exactly this reason).
+3. **The same visible text on a wrapper and its control.** ADP's menu item is `<li><a data-pendo-id="…VIEW_DATA_PDF">PDF</a></li>` — the `<li>` and the `<a>` both have `textContent === "PDF"`, and the `<li>` comes first in document order, so a text search returns the wrapper. Clicking an `<li>` never reaches the `<a>` inside it, so every mouse event fired did nothing. Prefer a real control (`a, [role="menuitem"], button`), then the deepest node — and better still, key on the app's own identifier (`data-pendo-id`), which cannot collide with **Run** / **Query** / **AddNotes** the way text can.
+4. **Hidden duplicate copies of a row.** With `override-report-hub=1` Paycom keeps a hidden Report Hub copy of each queue row later in the DOM; keeping only the last element per timestamp latched onto the invisible one whose Download button never passes `visible()`. Collect **all** candidates per key and take the first that yields a visible control.
+
+**Verify with hashes, not with logs.** `md5sum` across a finished run is the only cheap proof: identical hashes for different labels = wrong-row bug; a file the log says was saved but which isn't on disk = the run lied. Both happened here.
+
+## Capturing DOM that vanishes when you click (the hidden-menu recipe)
+
+Dojo popups (ADP's ⋯ row menu) close on any outside mousedown, so **neither** the bot's own "Inspect Element HTML" button **nor** clicking into DevTools can be used the normal way. Three rounds were burned guessing at this markup before capturing it. The recipe that works, in the page's Console (pick the right frame in the context dropdown first — see below):
+
+```js
+// 1. Arm a watcher, THEN open the menu. It captures and stops on its own.
+window.__cap=null; window.__t=setInterval(()=>{const c=[...document.querySelectorAll('[id^="revit_TooltipDialog_"],div,ul')].filter(e=>{const t=(e.innerText||'').replace(/\s+/g,' ').trim();return e.offsetParent&&t&&/view as/i.test(t)&&/pdf|xls|excel/i.test(t)&&t.length<250;});if(c.length){window.__cap=c[c.length-1].outerHTML;clearInterval(window.__t);console.log('CAPTURED '+window.__cap.length+' chars');}},200);
+// 2. Click ⋯ . 3. Let the menu close — the HTML is already saved. 4. Then:
+copy(__cap)
+```
+
+Two traps that wasted a round each:
+
+- **`copy()` only exists for a directly-evaluated Console expression.** Inside a `setTimeout`/`setInterval` callback it throws `copy is not defined`. Capture into a global, then call `copy()` as its own statement.
+- **ADP's Reports Output grid lives inside a same-origin `<iframe id="adprIframe">`** (`basic/Reporting/indexPortalLight.do`). A top-level `document.getElementById(...)` cannot see a popup Dojo attached inside the frame, and the Console evaluates against whichever frame the context dropdown names. In code, always resolve against `trigger.ownerDocument` first, then `document`. (`deepQueryAll` already walks same-origin iframes and shadow roots — mirror that habit anywhere you use raw `document.*`.)
+
+Useful ADP-specific handles found this way: the row button carries `aria-owns="revit_TooltipDialog_NNN"` naming its own popup (scope every search to it), and **`aria-expanded` lies** — it stays `"false"` on an open menu while `popupactive="true"`. Trust either.
+
+## A log that can lie is worse than no log
+
+Most of the debugging time in this session went to logs that misreported reality. All four are fixed; do not reintroduce them.
+
+- **Claiming success after failure.** ADP printed `✓ … downloaded` directly beneath its own `Download failed` warning, because the download step returns `true` on purpose (a naming failure must not fail the whole report). Thread the real outcome back (`lastSaveOk`) and report what actually happened.
+- **Silence during a long operation.** `downloadViaButton` fetches the file with a 180s timeout and logged nothing until it finished, so a healthy 33 MB download looked identical to a hang — reported twice as "the bot is stuck, it won't click". Any wait longer than ~30s must log periodically, and the line should carry elapsed time.
+- **A version badge that isn't the running version.** `SCRIPT_VERSION` was a second hardcoded copy and read `1.10.1` while `@version` had moved four releases on. Mid-run, that is the one fact you must be able to trust: it is how you tell *"the fix didn't work"* from *"the fix isn't loaded"*. All four bots now derive it from `GM_info.script.version`.
+- **An opaque failure message.** `"View as XLS" menu item not found` cannot distinguish "menu never opened" from "menu open, nothing matched". Make failures name their branch and dump what was actually seen (`menu WAS open, contents: "View as PDF Query Run…"`). This turned round 3 of the ADP bug from a guess into a five-minute fix.
+
+## When "nothing happened" doesn't mean the click missed
+
+The sniffer hooks `window.open`, `fetch`, `XMLHttpRequest.open` and `form.submit`. **A native `<a href download>` click or an injected iframe uses none of them**, so "no request captured" is not evidence the click failed — on ADP's Employee Lien Detail the PDF downloaded every time while the sniffer stayed completely silent.
+
+Consequences worth remembering:
+
+- Reading that silence as "the click missed" justified an automatic retry, and **the retry was itself the second PDF** the user reported. `mouseSeq()` already ends in a `click` event; firing `.click()` and `dijitclick` alongside it runs the handler two or three times. **One click, no retry.**
+- For the anchor case there is a better move than capturing a URL: hook `HTMLAnchorElement.prototype.click` and rewrite the element's own `download` attribute to our filename before letting the click through. The browser saves it correctly first time — no re-fetch, no second copy.
+
+## ADP Historical Data Bot (`adp-historical-data.user.js`)
+
+Same shape as the Paycom historical bot but driven by named ADP Standard Reports rather than an `rptId` catalog, so filenames are built per flow (`HistoricalPayroll_<year>.xlsx`, `safeFileName(reportName)_<range>.xlsx`, `<Client>_Audit_Trail_Report_<Qn-YYYY>.xlsx`). Notes:
+
+- **Payroll History covers `y-3 … y`** (v1.14.0). The current year is capped at **today**, not 31 Dec — asking ADP for a range running into the future is not a range the report takes — and is saved as `<year>-to-date` so a partial year can't be mistaken for a full one.
+- **An empty report is not necessarily a bug.** Payroll History returned `"Your filter criteria didn't return anything to report."` for all three prior years on First Line Logistics; the `Report Runtime Settings` sheet inside each file confirmed the requested range was correct. Read that sheet before blaming the bot — some reports (`Salary Time Off Absence Tracking`) even state the date range they ran with.
+- Client name is detected on the run page and prefixes the audit / I-9 / lien filenames; it is re-detected per run and **can fail on later iterations**, which silently drops the prefix.
 
 ## Memory directory
 
