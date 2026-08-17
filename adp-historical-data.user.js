@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.11.1
+// @version      1.11.2
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1572,13 +1572,25 @@
     // aria-owns="revit_TooltipDialog_NNN". Verified live on Reports Output.
     // Without this we cannot tell "menu never opened" from "menu open but the
     // item wasn't recognised" — and those need opposite fixes.
+    // Look the popup up in the TRIGGER's document, not `document`: the whole
+    // Reports Output grid lives inside the same-origin <iframe id="adprIframe">
+    // (basic/Reporting/indexPortalLight.do), so a top-level getElementById
+    // would miss a popup Dojo attached inside the frame.
+    // ADP also leaves aria-expanded="false" on an open menu while
+    // popupactive="true" — observed live — so trust either.
     const menuHost = () => {
       const btn = (trigger.querySelector && trigger.querySelector('[aria-owns]')) ||
         (trigger.closest && trigger.closest('[aria-owns]')) || trigger;
-      const owns = btn.getAttribute && btn.getAttribute('aria-owns');
-      const expanded = (btn.getAttribute && btn.getAttribute('aria-expanded')) === 'true';
-      const pop = owns ? document.getElementById(owns) : null;
-      return { expanded, pop: (pop && visible(pop)) ? pop : null };
+      const attr = (n) => (btn.getAttribute && btn.getAttribute(n)) || '';
+      const owns = attr('aria-owns');
+      const expanded = attr('aria-expanded') === 'true' || attr('popupactive') === 'true';
+      const docs = [trigger.ownerDocument, document].filter(Boolean);
+      let pop = null;
+      for (const d of docs) {
+        const el = owns && d.getElementById ? d.getElementById(owns) : null;
+        if (el && visible(el)) { pop = el; break; }
+      }
+      return { expanded, pop };
     };
 
     // Format items inside the popup. Scoping to OUR popup means a loose text
