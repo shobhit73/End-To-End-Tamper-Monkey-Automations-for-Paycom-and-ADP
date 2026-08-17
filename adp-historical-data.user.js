@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.11.0
+// @version      1.11.1
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1660,10 +1660,25 @@
     const isFileUrl = (u) => /downloadTemplate|instanceRefId|downloadreport|referenceId=|\.(xlsx?|csv)(\?|$)/i.test(u);
     const capturedUrls = () => sn1.urls.concat(sn2 ? sn2.urls : []);
     const capturedForms = () => sn1.forms.concat(sn2 ? sn2.forms : []);
+    // The menu item is a Dojo widget, same as the ⋯ button: its handler runs on
+    // MOUSEDOWN, so a bare .click() never reaches it. Click the nearest real
+    // control (the matched node can be an inner <span>) with the full pointer
+    // sequence. Observed live on Employee Lien Detail: the item was found but
+    // nothing happened, and the sniffer captured no URL at all.
+    const clickTarget = (anchor.closest && (anchor.closest('a[href]') ||
+      anchor.closest('a, [role="menuitem"], button, li'))) || anchor;
+    const directHref = (clickTarget.getAttribute && clickTarget.getAttribute('href')) || '';
+    logInfo('Clicking "' + (anchor.textContent || '').trim() + '" — <' +
+      clickTarget.tagName.toLowerCase() + '>' + (directHref ? ' href=' + directHref : ' (no href)'));
+
     let url = '';
     try {
-      clickEl(anchor);
-      try { anchor.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+      // NOT clickRevit: that re-targets to the nearest .revitButton ancestor,
+      // which for a menu item can land outside the item.
+      try { clickTarget.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (_) { }
+      mouseSeq(clickTarget);            // pointer/mouse sequence (Dojo needs mousedown)
+      clickEl(clickTarget);             // plain click too, for ordinary anchors
+      try { clickTarget.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
       for (let i = 0; i < 40; i++) { // up to 12s for the handler to fire
         const arr = capturedUrls();
         const good = arr.find(isFileUrl);
@@ -1677,8 +1692,18 @@
       sn1.restore();
       if (sn2) sn2.restore();
     }
+    // A plain <a href> navigation calls none of the APIs the sniffer hooks
+    // (open/fetch/XHR/submit), so "nothing captured" does NOT mean "no URL" —
+    // the item may simply carry the link itself.
+    if (!url && directHref && !/^#|^javascript:/i.test(directHref)) {
+      url = directHref;
+      logInfo('Sniffer saw nothing — using the menu item\'s own href');
+    }
     if (!url) {
       logWarn(label + ': could not capture the file URL — the file keeps ADP\'s default name');
+      logInfo('  clicked <' + clickTarget.tagName.toLowerCase() + '> "' +
+        (clickTarget.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40) +
+        '"; nothing was requested afterwards (no open/fetch/XHR/form, no href)');
       return { ok: false, sig: topSig };
     }
     const abs = new URL(url, baseHref).href;
