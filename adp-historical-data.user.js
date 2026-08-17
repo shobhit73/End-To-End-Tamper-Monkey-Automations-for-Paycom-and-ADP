@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.12.0
+// @version      1.12.1
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1711,18 +1711,28 @@
 
     let url = '';
     try {
-      // NOT clickRevit: that re-targets to the nearest .revitButton ancestor,
+      // ONE click. mouseSeq already ends in a click event, so firing .click()
+      // and dijitclick alongside it means the handler runs two or three times —
+      // once the target was finally correct that produced two or three copies of
+      // the PDF. Escalate to the other methods only if nothing was requested.
+      // NOT clickRevit: it re-targets to the nearest .revitButton ancestor,
       // which for a menu item can land outside the item.
       try { clickTarget.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (_) { }
       mouseSeq(clickTarget);            // pointer/mouse sequence (Dojo needs mousedown)
-      clickEl(clickTarget);             // plain click too, for ordinary anchors
-      try { clickTarget.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+      let escalated = false;
       for (let i = 0; i < 40; i++) { // up to 12s for the handler to fire
         const arr = capturedUrls();
         const good = arr.find(isFileUrl);
         if (good) { url = good; break; }
         if (!url) url = arr[0] || '';
         if (url && i >= 20) break; // give the real URL ~6s, then work with the viewer
+        // ~2.4s of complete silence means the click never reached a handler.
+        if (!escalated && !arr.length && i === 8) {
+          escalated = true;
+          logInfo('No request after the click — retrying with a plain click + dijitclick');
+          clickEl(clickTarget);
+          try { clickTarget.dispatchEvent(new Event('dijitclick', { bubbles: true, cancelable: true })); } catch (_) { }
+        }
         checkAbort();
         await sleep(300);
       }
