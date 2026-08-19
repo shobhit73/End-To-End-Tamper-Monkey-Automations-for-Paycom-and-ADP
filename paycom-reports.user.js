@@ -1,8 +1,8 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.23.1
-  // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable)
+  // @version      0.24.0
+  // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable, persistent per-document run log + CSV export)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
   // @grant        none
@@ -2581,6 +2581,200 @@
         STATE_KEY: 'paycom_dl_state',
       };
 
+      // ═════════════════ persistent run log ═════════════════
+      // clearDlState() wipes `paycom_dl_state` both on completion AND on Stop,
+      // so after a long unattended run nothing is left to answer "what actually
+      // happened?". These two keys are independent of it and survive reloads,
+      // browser restarts and Stop/reset — only the panel's "Clear stored log"
+      // button removes them.
+      //   LOG_KEY  → one row per document attempt (ok / fail / dup)
+      //   RUNS_KEY → one row per run (start, end, counts, how it ended)
+      const LOG = {
+        LOG_KEY: 'paycom_dl_log',
+        RUNS_KEY: 'paycom_dl_runs',
+        FLUSH_EVERY: 25,      // batched: a write per row is O(n^2) over 9k+ rows
+        MAX_ENTRIES: 40000,   // ring-buffer cap so localStorage cannot overflow
+        MAX_RUNS: 50,
+      };
+
+      let logBuf = [];        // entries not yet persisted
+      let logCount = 0;       // entries already persisted
+      let currentRunId = null;
+
+      const two = (n) => String(n).padStart(2, '0');
+      function stamp(d) {
+        d = d || new Date();
+        return `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}` +
+          `_${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+      }
+      function isoLocal(ms) {
+        if (!ms) return '';
+        const d = new Date(ms);
+        return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ` +
+          `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+      }
+
+      function downloadText(text, filename, mime) {
+        const blob = new Blob([text], { type: mime || 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename; a.style.display = 'none';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      }
+
+      function logRead() {
+        try { return JSON.parse(localStorage.getItem(LOG.LOG_KEY) || '[]'); }
+        catch (_) { return []; }
+      }
+      function runsRead() {
+        try { return JSON.parse(localStorage.getItem(LOG.RUNS_KEY) || '[]'); }
+        catch (_) { return []; }
+      }
+      function runsWrite(runs) {
+        try {
+          const t = runs.length > LOG.MAX_RUNS ? runs.slice(runs.length - LOG.MAX_RUNS) : runs;
+          localStorage.setItem(LOG.RUNS_KEY, JSON.stringify(t));
+        } catch (e) { console.warn('[DL] runs write failed', e); }
+      }
+
+      // Merge the in-memory buffer into localStorage. If the quota blows, dump
+      // everything to a CSV in Downloads rather than lose the run silently.
+      function logFlush(force) {
+        if (!logBuf.length && !force) return;
+        try {
+          const all = logRead().concat(logBuf);
+          const t = all.length > LOG.MAX_ENTRIES ? all.slice(all.length - LOG.MAX_ENTRIES) : all;
+          localStorage.setItem(LOG.LOG_KEY, JSON.stringify(t));
+          logCount = t.length;
+          logBuf = [];
+        } catch (e) {
+          console.warn('[DL] log flush failed (quota?) — auto-exporting to file', e);
+          try {
+            downloadText(logToCsv(logRead().concat(logBuf)),
+              'paycom_dl_log_overflow_' + stamp() + '.csv');
+            localStorage.setItem(LOG.LOG_KEY, '[]');
+          } catch (_) {}
+          logCount = 0;
+          logBuf = [];
+        }
+      }
+      function logAppend(entry) {
+        logBuf.push(entry);
+        if (logBuf.length >= LOG.FLUSH_EVERY) logFlush();
+      }
+      function logClearAll() {
+        logBuf = []; logCount = 0;
+        try {
+          localStorage.removeItem(LOG.LOG_KEY);
+          localStorage.removeItem(LOG.RUNS_KEY);
+        } catch (_) {}
+      }
+      const logAll = () => logRead().concat(logBuf);
+
+      // One log row. Short keys keep 9k+ entries inside the localStorage quota.
+      function logRow(info, state, status, extra) {
+        return Object.assign({
+          t: Date.now(),
+          run: currentRunId,
+          p: state.currentPage,
+          ec: info.empCode,
+          en: info.empName,
+          dn: info.docName,
+          ft: info.fileTemplate,
+          id: info.docId,
+          s: status,
+        }, extra || {});
+      }
+
+      // CSV helpers. Deliberately backslash-free (fromCharCode / indexOf rather
+      // than escapes and regex literals) so the block survives future patching.
+      const CRLF = String.fromCharCode(13, 10);
+      function csvCell(v) {
+        const str = String(v === null || v === undefined ? '' : v);
+        const needsQuote = str.indexOf('"') >= 0 || str.indexOf(',') >= 0 ||
+          str.indexOf(String.fromCharCode(10)) >= 0 ||
+          str.indexOf(String.fromCharCode(13)) >= 0;
+        return needsQuote ? '"' + str.split('"').join('""') + '"' : str;
+      }
+      const LOG_COLS = [
+        ['when',          (e) => isoLocal(e.t)],
+        ['run_id',        (e) => e.run || ''],
+        ['status',        (e) => e.s],
+        ['page',          (e) => e.p],
+        ['emp_code',      (e) => e.ec],
+        ['emp_name',      (e) => e.en],
+        ['doc_name',      (e) => e.dn],
+        ['file_template', (e) => e.ft],
+        ['doc_id',        (e) => e.id],
+        ['saved_as',      (e) => e.f || ''],
+        ['size_kb',       (e) => (e.kb === undefined ? '' : e.kb)],
+        ['content_type',  (e) => e.ct || ''],
+        ['attempts',      (e) => (e.a === undefined ? '' : e.a)],
+        ['reason',        (e) => e.r || ''],
+      ];
+      function logToCsv(entries) {
+        const head = LOG_COLS.map((c) => c[0]).join(',');
+        const rows = entries.map((e) => LOG_COLS.map((c) => csvCell(c[1](e))).join(','));
+        return [head].concat(rows).join(CRLF);
+      }
+      function runsToCsv(runs) {
+        const head = 'run_id,started,ended,how_it_ended,pages_seen,attempted,saved,failed,already_done';
+        const rows = runs.map((r) => [
+          r.id, isoLocal(r.start), isoLocal(r.end), r.status,
+          r.pages, r.attempted, r.ok, r.fail, r.dup,
+        ].map(csvCell).join(','));
+        return [head].concat(rows).join(CRLF);
+      }
+
+      function exportFullLog() {
+        logFlush(true);
+        const entries = logAll();
+        if (!entries.length) { alert('No document log entries stored yet.'); return; }
+        downloadText(logToCsv(entries), 'paycom_dl_log_' + stamp() + '.csv');
+        const runs = runsRead();
+        if (runs.length) downloadText(runsToCsv(runs), 'paycom_dl_runs_' + stamp() + '.csv');
+      }
+      function exportFailedLog() {
+        logFlush(true);
+        const bad = logAll().filter((e) => e.s !== 'ok');
+        if (!bad.length) { alert('No failed or skipped documents logged.'); return; }
+        downloadText(logToCsv(bad), 'paycom_dl_FAILED_' + stamp() + '.csv');
+      }
+
+      // ── run-summary bookkeeping ──
+      function runStart(state) {
+        currentRunId = 'run_' + stamp();
+        const runs = runsRead();
+        runs.push({
+          id: currentRunId, start: Date.now(), end: null, status: 'running',
+          pages: 0, attempted: 0, ok: 0, fail: 0, dup: 0,
+          resumedFromPage: state.currentPage,
+        });
+        runsWrite(runs);
+        console.log(`[DL] ── run ${currentRunId} started (from page ${state.currentPage}) ──`);
+        return currentRunId;
+      }
+      function runEnd(state, status, pagesSeen) {
+        logFlush(true);
+        const runs = runsRead();
+        const r = runs.filter((x) => x.id === currentRunId)[0];
+        if (r) {
+          r.end = Date.now();
+          r.status = status;
+          r.pages = pagesSeen;
+          r.attempted = state.totalAttempted;
+          r.ok = state.downloadedDocIds.size;
+          r.fail = state.skippedDocs.length;
+          r.dup = state.dupSkips || 0;
+          runsWrite(runs);
+        }
+        console.log(`[DL] ── run ${currentRunId} ended: ${status} ──`);
+      }
+
+      // Last-ditch flush if the tab is closed or navigates away mid-run.
+      window.addEventListener('beforeunload', () => { try { logFlush(); } catch (_) {} });
+
       const dlSleep = (ms) => new Promise((r) => setTimeout(r, ms));
       let paused = false;
       // Set by docsStop() (the panel's Stop / reset button). Every loop in the
@@ -2612,6 +2806,7 @@
           totalAttempted: 0,
           downloadedDocIds: new Set(),
           skippedDocs: [],
+          dupSkips: 0,
           isComplete: false,
         };
       }
@@ -2691,7 +2886,23 @@
           if (!res.ok) return { ok: false, reason: `HTTP ${res.status} ${res.statusText}` };
           const blob = await res.blob();
           if (blob.size === 0) return { ok: false, reason: 'Server returned empty file (0 bytes)' };
+          const ctype = String(blob.type || res.headers.get('Content-Type') || '').toLowerCase();
           const filename = extractFilename(res, fallbackFilename);
+          // Paycom sometimes answers 200 OK with its HTML document-viewer page
+          // instead of the file (documents that only open in the inline viewer
+          // do this). Without this guard they land in Downloads as ~205 KB .htm
+          // files AND get counted as successes, silently corrupting the run.
+          const lowerName = filename.toLowerCase();
+          if (ctype.indexOf('text/html') >= 0 ||
+              lowerName.endsWith('.htm') || lowerName.endsWith('.html')) {
+            return {
+              ok: false,
+              contentType: ctype,
+              reason: 'Server returned an HTML page, not a file (' +
+                (ctype || 'no content-type') +
+                ') — this document probably only opens in the inline viewer',
+            };
+          }
           const blobUrl = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = blobUrl;
@@ -2726,13 +2937,17 @@
 
           if (state.downloadedDocIds.has(info.docId)) {
             console.log(`[DL] Skip (already done): ${info.empName}`);
+            state.dupSkips = (state.dupSkips || 0) + 1;
+            logAppend(logRow(info, state, 'dup', { r: 'Already downloaded earlier in this run' }));
             continue;
           }
 
           state.totalAttempted++;
 
           if (!info.dlUrl) {
-            state.skippedDocs.push({ ...info, reason: 'No download URL found in row DOM', page: state.currentPage });
+            const noUrl = 'No download URL found in row DOM';
+            state.skippedDocs.push({ ...info, reason: noUrl, page: state.currentPage });
+            logAppend(logRow(info, state, 'fail', { r: noUrl, a: 0 }));
             saveDlState(state);
             continue;
           }
@@ -2742,8 +2957,10 @@
             : `${info.empCode}_${info.docName.replace(/\s+/g, '_')}.pdf`;
 
           let result = null;
+          let attemptsUsed = 0;
           for (let attempt = 0; attempt <= CFG.MAX_RETRIES; attempt++) {
             if (stopRequested) return;
+            attemptsUsed = attempt + 1;
             if (attempt > 0) {
               console.log(`[DL] Retry ${attempt}/${CFG.MAX_RETRIES} for ${info.empName}`);
               statusEl.textContent = `Docs: p${state.currentPage} row ${i + 1}/${rows.length} | RETRY ${attempt}`;
@@ -2755,11 +2972,22 @@
 
           if (result.ok) {
             state.downloadedDocIds.add(info.docId);
+            logAppend(logRow(info, state, 'ok', {
+              f: result.filename,
+              kb: Math.round(result.size / 1024),
+              ct: result.type,
+              a: attemptsUsed,
+            }));
             saveDlState(state);
             console.log(`[DL] ✓ ${info.empName} → ${result.filename} (${(result.size / 1024).toFixed(0)} KB, ${result.type})`);
           } else {
             console.warn(`[DL] ✗ ${info.empName}: ${result.reason}`);
             state.skippedDocs.push({ ...info, reason: result.reason, page: state.currentPage });
+            logAppend(logRow(info, state, 'fail', {
+              r: result.reason,
+              ct: result.contentType || '',
+              a: attemptsUsed,
+            }));
             saveDlState(state);
           }
 
@@ -2790,38 +3018,68 @@
 
       // ── orchestrator ──
       async function run(state, statusEl) {
-        if (state.currentPage > 1) {
-          statusEl.textContent = `Navigating to page ${state.currentPage}…`;
-          await gotoPage(state.currentPage);
-          await dlSleep(800);
-        }
-
-        await processPage(state, statusEl);
-
-        await dlSleep(500);
-        while (!isNextDisabled() && !stopRequested) {
-          const prevInfo = getInfoText();
-          getNextBtn().click();
-          const moved = await waitForPageChange(prevInfo);
-          if (!moved) {
-            if (!stopRequested) console.warn('[DL] Pagination stuck — timed out waiting for page change. Stopping.');
-            break;
+        runStart(state);
+        let pagesSeen = 0;
+        let endStatus = 'complete';
+        try {
+          if (state.currentPage > 1) {
+            statusEl.textContent = `Navigating to page ${state.currentPage}…`;
+            await gotoPage(state.currentPage);
+            await dlSleep(800);
           }
-          state.currentPage = getCurrentPage();
-          saveDlState(state);
+
           await processPage(state, statusEl);
+          pagesSeen++;
+
           await dlSleep(500);
+          while (!isNextDisabled() && !stopRequested) {
+            const prevInfo = getInfoText();
+            getNextBtn().click();
+            const moved = await waitForPageChange(prevInfo);
+            if (!moved) {
+              if (!stopRequested) {
+                console.warn('[DL] Pagination stuck — timed out waiting for page change. Stopping.');
+                endStatus = 'stalled-pagination';
+              }
+              break;
+            }
+            state.currentPage = getCurrentPage();
+            saveDlState(state);
+            await processPage(state, statusEl);
+            pagesSeen++;
+            await dlSleep(500);
+          }
+
+          if (stopRequested) {
+            endStatus = 'stopped-by-user';
+            console.log(`[DL] Stopped by user: ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`);
+            statusEl.textContent = 'Documents: stopped';
+            return;
+          }
+
+          // A pagination stall is NOT a finished run. Keep the saved state so
+          // Resume can pick it up from the stuck page; previously this fell
+          // through and wiped it, marking a half-done run as complete.
+          if (endStatus === 'stalled-pagination') {
+            showSummary(state);
+            statusEl.textContent =
+              `Docs STALLED on page ${state.currentPage} — use Resume ` +
+              `(✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length})`;
+            return;
+          }
+
+          state.isComplete = true;
+          saveDlState(state);
+          showSummary(state);
+          clearDlState();
+          statusEl.textContent = `Docs done: ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`;
+        } catch (e) {
+          endStatus = 'error: ' + (e && e.message ? e.message : String(e));
+          throw e;
+        } finally {
+          runEnd(state, endStatus, pagesSeen);
+          refreshLogInfo();
         }
-        if (stopRequested) {
-          console.log(`[DL] Stopped by user: ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`);
-          statusEl.textContent = 'Documents: stopped';
-          return;
-        }
-        state.isComplete = true;
-        saveDlState(state);
-        showSummary(state);
-        clearDlState();
-        statusEl.textContent = `Docs done: ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`;
       }
 
       // ── summary overlay ──
@@ -2876,6 +3134,24 @@
           });
           ov.appendChild(ul);
         }
+
+        // Export straight from the summary. The persistent log outlives the
+        // run state, so this still works after the state has been cleared.
+        const exportRow = document.createElement('div');
+        exportRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px';
+        const mkExp = (label, bg, fn) => {
+          const b = document.createElement('button');
+          b.textContent = label;
+          Object.assign(b.style, {
+            padding: '8px 14px', background: bg, color: '#fff', border: '0',
+            borderRadius: '7px', cursor: 'pointer', fontWeight: '600', fontSize: '13px',
+          });
+          b.onclick = fn;
+          return b;
+        };
+        exportRow.appendChild(mkExp('📄 Export full log CSV', '#2980b9', exportFullLog));
+        exportRow.appendChild(mkExp('⚠️ Export failed only', '#c0392b', exportFailedLog));
+        ov.appendChild(exportRow);
 
         const close = document.createElement('button');
         close.textContent = 'Close';
@@ -3069,9 +3345,47 @@
       const resumeBtn = mkBtn('', '#e67e22'); resumeBtn.style.display = 'none';
       const pauseBtn = mkBtn('⏸  Pause', '#7f8c8d'); pauseBtn.style.display = 'none';
 
+      // Persistent-log controls. These stay useful after a run ends (or dies)
+      // because the log is stored separately from the run state.
+      const logInfoEl = document.createElement('div');
+      logInfoEl.className = 'status dl-log-info';
+
+      const exportBtn = mkBtn('📄 Export log CSV', '#2980b9');
+      const failedBtn = mkBtn('⚠️ Export failed CSV', '#c0392b');
+      const clearLogBtn = mkBtn('🗑 Clear stored log', '#7f8c8d');
+
       container.appendChild(statusEl);
       container.appendChild(resumeBtn);
       container.appendChild(pauseBtn);
+      container.appendChild(logInfoEl);
+      container.appendChild(exportBtn);
+      container.appendChild(failedBtn);
+      container.appendChild(clearLogBtn);
+
+      exportBtn.addEventListener('click', exportFullLog);
+      failedBtn.addEventListener('click', exportFailedLog);
+      clearLogBtn.addEventListener('click', () => {
+        if (!window.confirm('Delete the stored document log and run history?' +
+          String.fromCharCode(10, 10) + 'Export it first if you still need it.')) return;
+        logClearAll();
+        refreshLogInfo();
+      });
+
+      // Looked up from the DOM each time so this is safe to call from run()'s
+      // finally block regardless of mount order.
+      function refreshLogInfo() {
+        const el = container.querySelector('.dl-log-info');
+        if (!el) return;
+        const n = logCount + logBuf.length;
+        const runs = runsRead();
+        if (!n) { el.textContent = 'Log: empty'; return; }
+        const last = runs.length ? runs[runs.length - 1] : null;
+        el.textContent = `Log: ${n.toLocaleString()} rows · ${runs.length} run(s)` +
+          (last ? ` · last: ${last.status}` : '');
+      }
+
+      logCount = logRead().length;   // pick up whatever a previous run left
+      refreshLogInfo();
 
       pauseBtn.addEventListener('click', () => {
         paused = !paused;
