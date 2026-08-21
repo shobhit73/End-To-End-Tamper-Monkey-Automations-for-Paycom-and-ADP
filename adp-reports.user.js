@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.7.1
+// @version      1.7.3
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1811,22 +1811,6 @@
     };
   }
 
-  // Build the task descriptor for one consolidated FULL past year. Same shape
-  // as a quarter task so the download loop runs it unchanged: quarter 0 is
-  // always < the chosen current quarter, so it gets the closed-quarter
-  // treatment (Associate ID sort, Group By, Totals Only, unmasked, custom
-  // dates). Dates are the true calendar year boundaries, like the quarters.
-  function buildYearInfo(year) {
-    return {
-      quarter: 0,                       // 0 = full-year task → always consolidated
-      fullYear: true,
-      year: year,
-      label: 'FY ' + year,
-      from: '01/01/' + year,
-      to: '12/31/' + year
-    };
-  }
-
   // Quarters Q1 … currentQuarter. currentQuarter defaults to the calendar
   // quarter, but the caller (the picker dialog) can pass a user-chosen one.
   function getQuartersToDownload(currentQuarter) {
@@ -1838,15 +1822,10 @@
     return quarters;
   }
 
-  // Modal: choose years + quarters to download. Resolves to
-  // { quarters: [...tasks], currentQuarter: n } — where tasks is the COMBINED
-  // ordered list [past-year FY tasks (ascending)…, current-year quarter
-  // tasks…] — or null if the user cancels (or Stop/reset is pressed).
-  //  - "Years" chips: the past 3 years + the current year (derived from the
-  //    system year). Only the current year is ticked by default. A ticked past
-  //    year becomes ONE consolidated full-year task (buildYearInfo).
-  //  - The quarter section applies to the CURRENT year only, and is hidden
-  //    entirely while the current-year chip is unticked.
+  // Modal: choose the current year's quarters to download. Resolves to
+  // { quarters: [...quarter tasks], currentQuarter: n } — or null if the user
+  // cancels (or Stop/reset is pressed). Past-year consolidated (FY) downloads
+  // were removed from this bot — the ADP Historical Data Bot handles those.
   //  - The first-payroll-quarter selector (default = the calendar quarter)
   //    drives the split: quarters BEFORE it are consolidated (Totals Only),
   //    and the chosen quarter itself is detailed / per pay period.
@@ -1871,45 +1850,13 @@
       const head = document.createElement('div');
       head.style.cssText = 'padding:14px 16px;font-weight:700;font-size:15px;color:#fff;' +
         'background:linear-gradient(90deg,rgba(0,71,171,.45),rgba(0,100,241,.12));border-bottom:1px solid rgba(90,159,255,.2);';
-      head.textContent = 'Payroll History — choose years & quarters';
+      head.textContent = 'Payroll History — choose quarters';
       box.appendChild(head);
 
       const body = document.createElement('div');
       body.style.cssText = 'padding:12px 16px;';
 
-      // ── Years: past 3 years + current year as tick-able chips ──
-      // Only the current year is ticked by default. A ticked PAST year becomes
-      // one consolidated full-year report; the quarter section below applies
-      // to the current year only and hides while the current year is unticked.
-      const yearLabel = document.createElement('div');
-      yearLabel.style.cssText = 'font-size:11.5px;color:#9fc2ff;margin-bottom:5px;';
-      yearLabel.textContent = 'Select year(s) — a past year downloads as one consolidated full-year report';
-      body.appendChild(yearLabel);
-
-      const yearsArr = [year - 3, year - 2, year - 1, year]; // oldest → newest
-      const yearRow = document.createElement('div');
-      yearRow.style.cssText = 'display:flex;gap:7px;margin-bottom:12px;';
-      const yearChecks = [];
-      yearsArr.forEach((y) => {
-        const chip = document.createElement('label');
-        chip.style.cssText = 'flex:1;display:flex;align-items:center;justify-content:center;gap:6px;' +
-          'padding:8px 4px;cursor:pointer;border-radius:10px;' +
-          'background:rgba(0,71,171,.22);border:1px solid rgba(125,179,255,.18);';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = (y === year); // default: current year only
-        cb.style.cssText = 'width:15px;height:15px;accent-color:#0064f1;cursor:pointer;';
-        const txt = document.createElement('span');
-        txt.style.cssText = 'font-weight:600;color:#eaf2ff;font-size:12.5px;';
-        txt.textContent = String(y);
-        chip.appendChild(cb);
-        chip.appendChild(txt);
-        yearRow.appendChild(chip);
-        yearChecks.push(cb);
-      });
-      body.appendChild(yearRow);
-
-      // ── Quarter section (current year only) — hidden if current year unticked ──
+      // ── Quarter section (current year) ──
       const qSection = document.createElement('div');
       body.appendChild(qSection);
 
@@ -1941,11 +1888,6 @@
       const listWrap = document.createElement('div');
       qSection.appendChild(listWrap);
 
-      // Hide/show the quarter section as the current-year chip is toggled.
-      const currentYearCb = yearChecks[yearChecks.length - 1];
-      const updateQSection = () => { qSection.style.display = currentYearCb.checked ? '' : 'none'; };
-      yearChecks.forEach((cb) => cb.addEventListener('change', updateQSection));
-      updateQSection();
       let checks = [];
       let listQuarters = [];
       function rebuildList() {
@@ -2004,17 +1946,8 @@
       };
       cancelBtn.addEventListener('click', () => finish(null));
       confirmBtn.addEventListener('click', () => {
-        // Past years (ascending) → one consolidated FY task each; then the
-        // current year's selected quarters (only if the current year is ticked).
-        // yearsArr is already oldest → newest, so order falls out naturally.
-        const pastTasks = yearsArr
-          .filter((y, i) => y !== year && yearChecks[i].checked)
-          .map(buildYearInfo);
-        const quarterTasks = currentYearCb.checked
-          ? listQuarters.filter((_, i) => checks[i].checked)
-          : [];
         finish({
-          quarters: pastTasks.concat(quarterTasks),
+          quarters: listQuarters.filter((_, i) => checks[i].checked),
           currentQuarter: parseInt(cqSelect.value, 10)
         });
       });
@@ -3183,7 +3116,11 @@
     // The real spreadsheet lives at …/downloadTemplate/?instanceRefId=BIRT…;
     // the first thing ADP opens is usually a launcher/viewer page
     // (auditOutput.do). Prefer a URL that looks like the file itself.
-    const phIsFileUrl = (u) => /downloadTemplate|instanceRefId|\.(xlsx?|csv)(\?|$)/i.test(u);
+    // Two known file-URL shapes (varies by client/backend):
+    //   /wfn/chr/reporting/downloadTemplate/?instanceRefId=BIRT<id>_PROD_DCn
+    //   /mascsr/wfn/ireporting/metaservices/reportviewer/download/BIRT<id>_PROD_DCn
+    // (same matcher the ADP Historical bot uses since its v1.15.0)
+    const phIsFileUrl = (u) => /downloadTemplate|instanceRefId|downloadreport|reportviewer\/download|\/BIRT\d|referenceId=|\.(xlsx?|csv)(\?|$)/i.test(u);
     const capturedUrls = () => sn1.urls.concat(sn2 ? sn2.urls : []);
     const capturedForms = () => sn1.forms.concat(sn2 ? sn2.forms : []);
     let url = '';
@@ -3234,6 +3171,8 @@
       // downloadTemplate link, a BIRT… instanceRefId, or a redirect stub
       // (meta refresh / location assignment).
       const phMineHtml = (html, base) => {
+        const mRv = html.match(/[\w\/.:-]*reportviewer\/download\/[\w.-]+/i);
+        if (mRv) { try { return new URL(mRv[0], base).href; } catch (_) { } }
         const mLink = html.match(/[\w\/.:-]*downloadTemplate\/?\?[^"'<>\s\\]+/i);
         if (mLink) { try { return new URL(mLink[0].replace(/&amp;/g, '&'), base).href; } catch (_) { } }
         const mId = html.match(/instanceRefId['"=:\s]+["']?([\w.-]+)/i) || html.match(/\b(BIRT[\w.-]+)\b/);
