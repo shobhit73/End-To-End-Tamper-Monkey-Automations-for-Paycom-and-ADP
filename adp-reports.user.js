@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.7.3
+// @version      1.9.0
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1441,6 +1441,241 @@
     }
   }
 
+  // ───────────────── Time Off Balance Summary flow ─────────────────
+
+  // Year-to-date only: 01/01 of the CURRENT year → today, both ends derived
+  // from the system clock so the range rolls forward on its own each January.
+  // (The Historical Data Bot pulls this same report for a wider window; that
+  // flow is separate and untouched.)
+  function tobsDateRange() {
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    return {
+      from: '01/01/' + d.getFullYear(),
+      to: p2(d.getMonth() + 1) + '/' + p2(d.getDate()) + '/' + d.getFullYear(),
+    };
+  }
+
+  async function downloadTimeOffBalanceSummary(setStatus) {
+    const REPORT = 'Time Off Balance Summary';
+    logInfo('=== Download ' + REPORT + ' ===');
+    resetAbort();
+
+    const range = tobsDateRange();
+    logInfo('Date range (year-to-date): ' + range.from + ' → ' + range.to);
+
+    try {
+      setStatus('Step 1: Opening Reports menu…');
+      checkAbort();
+      if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
+
+      setStatus('Step 2: Navigating to All Standard Reports…');
+      checkAbort();
+      if (!await stepClickAllStandardReports()) { setStatus('Step 2 failed — see log'); return; }
+
+      setStatus('Step 3: Searching for ' + REPORT + '…');
+      checkAbort();
+      if (!await stepSearchDojoReport(REPORT)) { setStatus('Step 3 failed — see log'); return; }
+
+      setStatus('Step 4: Selecting ' + REPORT + '…');
+      checkAbort();
+      if (!await stepSelectStandardReportByTitle(REPORT)) { setStatus('Step 4 failed — see log'); return; }
+
+      setStatus('Step 5: Waiting for Run Report page…');
+      checkAbort();
+      if (!await stepWaitForRunReportPage()) { setStatus('Step 5 failed — see log'); return; }
+
+      // stepWaitForRunReportPage returns as soon as the button TEXT appears, but
+      // ADP is still rendering. Clicking too early makes ADP treat it as a bot
+      // click and silently drop it, so wait for the page sections to populate
+      // and then settle before going on.
+      setStatus('Step 5b: Waiting for report page to fully load…');
+      logInfo('Waiting for report sections to populate...');
+      let sectionsReady = false;
+      for (let i = 0; i < 30; i++) { // up to ~15s
+        checkAbort();
+        const allText = deepQueryAll('*').filter(visible);
+        for (const el of allText) {
+          const txt = (el.textContent || '').trim();
+          if (txt === 'Included Fields' || txt === 'Sort Order' ||
+            txt === 'What\'s Displayed on the Report' || txt.startsWith('All Employees')) {
+            sectionsReady = true; break;
+          }
+        }
+        if (sectionsReady) { logSuccess('Report sections populated'); break; }
+        await sleep(500);
+      }
+      await sleep(3000); // extra settle so ADP finishes wiring up the page
+
+      setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
+      checkAbort();
+      if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
+      await sleep(1000);
+
+      setStatus('Step 7: Selecting all fields…');
+      checkAbort();
+      if (!await stepSelectAllDisplayFields()) { setStatus('Step 7 failed — see log'); return; }
+
+      setStatus('Step 8: Opening Appearance settings…');
+      checkAbort();
+      await sleep(2000);
+      if (!await stepClickAppearanceSettings()) { setStatus('Step 8 failed — see log'); return; }
+
+      setStatus('Step 9: Setting date range ' + range.from + ' → ' + range.to + '…');
+      checkAbort();
+      if (!await stepConfigureDateRangeOnly(range.from, range.to)) { setStatus('Step 9 failed — see log'); return; }
+
+      setStatus('Step 10: Running report…');
+      checkAbort();
+      await sleep(1500);
+      if (!await stepClickRunAsExcel()) { setStatus('Step 10 failed — see log'); return; }
+
+      logSuccess(REPORT + ' triggered — waiting for it on Reports Output');
+      const saved = await downloadFinishedReport(REPORT, setStatus);
+      setStatus(saved ? REPORT + ' downloaded ✓' : REPORT + ' triggered ✓ (download it from Reports Output)');
+      logSuccess('=== ' + REPORT + ' complete ===');
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus(REPORT + ' aborted');
+        logWarn('Flow aborted by user');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + (err && err.message ? err.message : err));
+    }
+  }
+
+  // ───────────────── Employee Lien Detail flow ─────────────────
+
+  // A "Standard" report on ADP's Angular ("adpr") run page: Language / As of
+  // date / Company Codes dual-select / Sort by / Group By / Archived
+  // Employees / Employees with Payroll History, then a single "Run As PDF"
+  // button — this report has no Excel option at all.
+  //
+  // There is no date RANGE here, only a single "As of date". The daily bot
+  // runs it ONCE, as of TODAY — that snapshot is the set of liens currently
+  // active on the employer. (The Historical Data Bot additionally pulls a
+  // prior-year-end snapshot; that flow is separate and untouched.)
+  const LIEN_REPORT = 'Employee Lien Detail';
+
+  function lienTodayDate() {
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    return p2(d.getMonth() + 1) + '/' + p2(d.getDate()) + '/' + d.getFullYear();
+  }
+
+  function findLienAsOfDateInput() {
+    return deepQueryAll('input[name="EmployeeLienDetail-AsOfDate"]').filter(visible)[0] || null;
+  }
+
+  async function stepWaitForLienRunPage() {
+    for (let i = 0; i < 120; i++) { // up to 60s
+      checkAbort();
+      if (findLienAsOfDateInput()) { logSuccess('Employee Lien Detail Run page is up'); await sleep(2000); return true; }
+      await sleep(500);
+    }
+    logError('Employee Lien Detail Run page (As of date field) did not load');
+    return false;
+  }
+
+  // The As of date input is a flatpickr text field bound via Angular ngModel
+  // (it commits on blur) — the same prototype-setter + input/change/blur
+  // dispatch used for every other framework's date fields in this file.
+  async function stepSetLienAsOfDate(value) {
+    const input = findLienAsOfDateInput();
+    if (!input) { logError('As of date field not found'); return false; }
+    setReactInputValue(input, value);
+    await sleep(500);
+    logSuccess('As of date set to ' + value);
+    return true;
+  }
+
+  // Company Codes is a required dual-select (Available → Selected) with its own
+  // "Move all right" button. Sort by / Group By on the SAME page carry the
+  // identical .move-all-right class, so the button is found scoped to the field
+  // group whose label reads "Company Codes" (tolerating the required-field "*").
+  async function stepSelectAllCompanyCodes() {
+    const label = deepQueryAll('*').filter(visible)
+      .find(el => el.children.length === 0 && /^Company Codes\s*\*?\s*$/.test((el.textContent || '').trim()));
+    if (!label) { logError('"Company Codes" label not found'); return false; }
+    let group = label.parentElement, btn = null;
+    for (let d = 0; d < 8 && group && !btn; d++) {
+      btn = group.querySelector && group.querySelector('button.move-all-right[aria-label="Move all right"]');
+      group = group.parentElement;
+    }
+    if (!btn) { logError('Company Codes "Move all right" button not found'); return false; }
+    clickEl(btn);
+    await sleep(500);
+    logSuccess('Company Codes: moved all available codes to Selected');
+    return true;
+  }
+
+  async function stepClickLienRunAsPdf() {
+    const btn = deepQueryAll('button').filter(visible).find(el => normalize(el.textContent) === 'run as pdf');
+    if (!btn) { logError('"Run As PDF" button not found'); return false; }
+    clickEl(btn);
+    logSuccess('Clicked Run As PDF');
+    return true;
+  }
+
+  async function downloadEmployeeLienDetail(setStatus) {
+    logInfo('=== Download ' + LIEN_REPORT + ' ===');
+    resetAbort();
+
+    const asOf = lienTodayDate();
+    logInfo('As of date: ' + asOf + ' (today — current active liens)');
+
+    try {
+      setStatus('Step 1: Opening Reports menu…');
+      checkAbort();
+      if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
+
+      setStatus('Step 2: Navigating to All Standard Reports…');
+      checkAbort();
+      if (!await stepClickAllStandardReports()) { setStatus('Step 2 failed — see log'); return; }
+
+      setStatus('Step 3: Searching for ' + LIEN_REPORT + '…');
+      checkAbort();
+      if (!await stepSearchDojoReport(LIEN_REPORT)) { setStatus('Step 3 failed — see log'); return; }
+
+      setStatus('Step 4: Selecting ' + LIEN_REPORT + '…');
+      checkAbort();
+      if (!await stepSelectStandardReportByTitle(LIEN_REPORT)) { setStatus('Step 4 failed — see log'); return; }
+
+      setStatus('Step 5: Waiting for Run Report page…');
+      checkAbort();
+      if (!await stepWaitForLienRunPage()) { setStatus('Step 5 failed — see log'); return; }
+
+      setStatus('Step 6: Setting As of date to ' + asOf + '…');
+      checkAbort();
+      if (!await stepSetLienAsOfDate(asOf)) { setStatus('Step 6 failed — see log'); return; }
+
+      setStatus('Step 7: Selecting all Company Codes…');
+      checkAbort();
+      if (!await stepSelectAllCompanyCodes()) { setStatus('Step 7 failed — see log'); return; }
+
+      setStatus('Step 8: Running report…');
+      checkAbort();
+      await sleep(800);
+      if (!await stepClickLienRunAsPdf()) { setStatus('Step 8 failed — see log'); return; }
+
+      logSuccess(LIEN_REPORT + ' triggered — waiting for it on Reports Output');
+      const saved = await downloadFinishedReport(LIEN_REPORT, setStatus, 'pdf');
+      setStatus(saved ? LIEN_REPORT + ' downloaded ✓' : LIEN_REPORT + ' triggered ✓ (download it from Reports Output)');
+      logSuccess('=== ' + LIEN_REPORT + ' complete ===');
+
+    } catch (err) {
+      if (err && err.aborted) {
+        setStatus(LIEN_REPORT + ' aborted');
+        logWarn('Flow aborted by user');
+        return;
+      }
+      setStatus('Error — see log');
+      logError('Flow error: ' + (err && err.message ? err.message : err));
+    }
+  }
+
   // ───────────────── direct deposit report flow ─────────────────
 
   // Configure Appearance for Direct Deposit: unmask both Tax ID and Bank Account dropdowns
@@ -2195,6 +2430,123 @@
     await sleep(800);
 
     // 8. Click Save
+    const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+    for (const btn of saveBtns) {
+      if (normalize(btn.textContent) === 'save') {
+        clickEl(btn);
+        logSuccess('Clicked Save on Appearance settings');
+        await sleep(1500);
+        return true;
+      }
+    }
+    logError('Save button not found');
+    return false;
+  }
+
+  // ── Time Off Balance Summary helpers ──
+  // Both are ports of the Historical Data Bot's equivalents (which stay
+  // untouched). They are kept separate from stepConfigureAppearance above
+  // because that one is Payroll-History-specific: it also flips Group By,
+  // Totals Only and Tax ID masking. This report wants ONLY the date range —
+  // sorting, masking and grouping are left exactly as ADP had them.
+
+  // Open the field panel's "Select All", then Save.
+  async function stepSelectAllDisplayFields() {
+    let panelReady = false;
+    for (let i = 0; i < 20 && !panelReady; i++) {
+      const labels = deepQueryAll('.checkactionbubble-text').filter(visible);
+      if (labels.length > 3) { panelReady = true; break; }
+      await sleep(500);
+    }
+    if (!panelReady) {
+      logError('Field selection panel did not load');
+      return false;
+    }
+    logInfo('Field selection panel loaded');
+    await sleep(500);
+
+    let clicked = false;
+    const selectAllBtn = deepQueryAll('#stdrptlabel_selectAll')[0];
+    if (selectAllBtn) {
+      clickEl(selectAllBtn);
+      logSuccess('Clicked Select All');
+      clicked = true;
+    } else {
+      const alt = deepQueryAll('button, a, [role="button"]').filter(visible)
+        .find(el => normalize(el.textContent) === 'select all');
+      if (alt) {
+        clickEl(alt);
+        logSuccess('Clicked Select All (matched by text)');
+        clicked = true;
+      }
+    }
+    if (!clicked) {
+      logError('Select All button not found on the field panel');
+      return false;
+    }
+    await sleep(1200);
+
+    const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
+    for (const btn of buttons) {
+      if (normalize(btn.textContent) === 'save') {
+        clickEl(btn);
+        logSuccess('Clicked Save — all fields selected');
+        await sleep(1200);
+        return true;
+      }
+    }
+    logError('Save button not found on field selection panel');
+    return false;
+  }
+
+  // Appearance variant that ONLY sets the custom date range, then saves.
+  async function stepConfigureDateRangeOnly(fromDate, toDate) {
+    let ready = false;
+    for (let i = 0; i < 24 && !ready; i++) {
+      const els = deepQueryAll('label, span, div').filter(visible);
+      for (const el of els) {
+        const t = (el.textContent || '').trim();
+        if (t === 'Request Period' || t === 'Totals Only') { ready = true; break; }
+      }
+      if (!ready) await sleep(500);
+    }
+    if (!ready) logWarn('Appearance page marker not seen — continuing anyway');
+    await sleep(800);
+
+    // ADP shows a different default here per report, so try each known current
+    // value until one of the dropdowns responds.
+    logInfo('Setting Request Period to Custom Date Range');
+    let periodSet = false;
+    for (const current of ['Last 30 Days', 'Last 30', 'Year-to-Date', 'Custom Date', 'Current']) {
+      if (await selectVdlDropdownOption(current, 'Custom Date Range')) { periodSet = true; break; }
+    }
+    if (!periodSet) logError('Could not switch Request Period to Custom Date Range');
+    await sleep(1500);
+
+    logInfo('Setting date range: ' + fromDate + ' to ' + toDate);
+    const dateInputs = deepQueryAll('input').filter(visible).filter(inp => {
+      const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
+      return ph.includes('mm/dd/yyyy') || ph.includes('mm/dd');
+    });
+
+    if (dateInputs.length >= 2) {
+      dateInputs[0].focus();
+      await sleep(300);
+      setReactInputValue(dateInputs[0], fromDate);
+      await sleep(800);
+      dateInputs[1].focus();
+      await sleep(300);
+      setReactInputValue(dateInputs[1], toDate);
+      await sleep(800);
+      dateInputs[1].blur();
+      await sleep(500);
+      logInfo('Dates entered: ' + fromDate + ' → ' + toDate);
+    } else {
+      logError('Expected 2 date inputs, found ' + dateInputs.length);
+      return false;
+    }
+    await sleep(800);
+
     const saveBtns = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
     for (const btn of saveBtns) {
       if (normalize(btn.textContent) === 'save') {
@@ -3089,13 +3441,35 @@
     };
     phClickTrigger();
     await sleep(800);
-    // Find "View as XLS" in the opened menu — by its stable pendo id first,
-    // then by text. If the menu didn't open, re-click the trigger and retry.
-    const findXlsAnchor = () =>
-      deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0]
-      || deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
-        .find(el => /view as xls/i.test((el.textContent || '').trim()) && (el.textContent || '').trim().length < 30)
-      || null;
+    // Find the "View as …" item in the opened menu — by its stable pendo id
+    // first, then by text. If the menu didn't open, re-click and retry.
+    const findXlsAnchor = () => {
+      const pendo = deepQueryAll('[data-pendo-id="PENDO_ADPR_DATAGRID_VIEW_EXTERNAL"]').filter(visible)[0];
+      if (pendo) return pendo;
+      const combined = deepQueryAll('a, [role="menuitem"], td, div').filter(visible)
+        .find(el => {
+          const t = (el.textContent || '').trim();
+          return t.length < 30 && /view as xls|view as excel|^download$/i.test(t);
+        });
+      if (combined) return combined;
+      // PDF-only reports (Employee Lien Detail) render a "View as" HEADER with
+      // separate short items under it — "PDF" / "Query" — instead of one
+      // combined "View as PDF" row. Find the header, then the nearest item
+      // beneath it whose whole text is just the format name.
+      const header = deepQueryAll('*').filter(visible)
+        .find(el => el.children.length === 0 && (el.textContent || '').trim().toLowerCase() === 'view as');
+      if (header) {
+        let container = header.parentElement;
+        for (let d = 0; d < 4 && container; d++) {
+          const item = Array.from(container.querySelectorAll('a, [role="menuitem"], li, div, button'))
+            .filter(visible)
+            .find(el => /^(pdf|xls|excel|csv)$/i.test((el.textContent || '').trim()));
+          if (item) return item;
+          container = container.parentElement;
+        }
+      }
+      return null;
+    };
     let anchor = null;
     for (let i = 0; i < 24 && !anchor; i++) {
       anchor = findXlsAnchor();
@@ -3107,7 +3481,7 @@
         await sleep(500);
       }
     }
-    if (!anchor) throw new Error('"View as XLS" menu item not found (trigger still in DOM: ' + trigger.isConnected + ')');
+    if (!anchor) throw new Error('"View as" menu item (XLS/Excel/PDF) not found (trigger still in DOM: ' + trigger.isConnected + ')');
 
     const win = (anchor.ownerDocument && anchor.ownerDocument.defaultView) || window;
     const sn1 = phArmSniffer(win);
@@ -3285,13 +3659,16 @@
   // save it as <Client>_<Report>.xlsx (no prefix when the client chip can't
   // be found). On any failure the file stays on Reports Output for a manual
   // fetch; the flow itself still counts as triggered.
-  async function downloadFinishedReport(reportLabel, setStatus) {
+  // `ext` defaults to xlsx — pass 'pdf' for the reports ADP only offers as PDF
+  // (Employee Lien Detail), otherwise the saved file gets the wrong extension
+  // and Windows opens it with the wrong app.
+  async function downloadFinishedReport(reportLabel, setStatus, ext) {
     await sleep(5000); // let ADP land on Reports Output and render the new row
     phDownloadedSigs = new Set();
     const client = detectClientName();
     if (client) logInfo('Client detected: ' + client);
     else logWarn('Client name not detected — file name will have no client prefix');
-    const fname = (client ? safeFileName(client) + '_' : '') + safeFileName(reportLabel) + '.xlsx';
+    const fname = (client ? safeFileName(client) + '_' : '') + safeFileName(reportLabel) + '.' + (ext || 'xlsx');
     try {
       return await phDownloadRenamed({ label: reportLabel, phFileName: fname }, setStatus);
     } catch (err) {
@@ -3528,6 +3905,8 @@
     { key: 'deduction', icon: '🧮', label: 'Deduction', fn: downloadDeductionReport },
     { key: 'directdeposit', icon: '🏦', label: 'Direct Deposit', fn: downloadDirectDeposit },
     { key: 'qualot', icon: '⏱️', label: 'Qualified Overtime', fn: downloadQualifiedOvertime },
+    { key: 'tobs', icon: '🏖️', label: 'Time Off Balance Summary', fn: downloadTimeOffBalanceSummary },
+    { key: 'lien', icon: '⚖️', label: 'Employee Lien Detail', fn: downloadEmployeeLienDetail },
   ];
 
   const REPORT_SEL_KEY = 'adpBot.reportSelection';

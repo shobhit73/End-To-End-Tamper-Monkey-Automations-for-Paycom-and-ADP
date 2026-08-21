@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.24.0
+  // @version      0.26.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable, persistent per-document run log + CSV export)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -336,7 +336,7 @@
     // Both modes IDLE means the user clicked Stop / reset. Used by sleep + waitFor
     // so any in-flight async work bails within ~100ms of the click.
     function shouldAbort() {
-      return !isRunning() && !isPpRunning() && !isSdRunning() && !isTpRunning() && !isQpRunning();
+      return !isRunning() && !isPpRunning() && !isSdRunning() && !isTpRunning() && !isQpRunning() && !isTosRunning() && !isGnRunning();
     }
 
     // Abort-aware sleep: rejects with err.aborted=true if the user clicks Stop
@@ -1000,6 +1000,8 @@
 
     function startPriorPayroll() {
       setState(STATES.IDLE);
+      setTosState(TOS_STATES.IDLE);
+      setGnState(GN_STATES.IDLE);
       setPpTasks([]);
       setPpIndex(0);
       setPpNavAttempts(0);
@@ -1574,7 +1576,15 @@
       log('SPA route detected — schedule editor open, continuing');
       setPpNavAttempts(0); // forward progress
       await sleep(900);
-      await ppHandleSchedulePage();
+      await handleSchedulePageForActiveMode();
+    }
+
+    // The schedule LIST handlers are shared: Garnishment walks the exact same
+    // pages to reach the editor. Only what happens once the pay periods are
+    // scraped differs, so route on whichever mode is actually running.
+    async function handleSchedulePageForActiveMode() {
+      if (isGnRunning()) return await gnHandleSchedulePage();
+      return await ppHandleSchedulePage();
     }
 
     // On the legacy schedule listing page (/processingschedules/indexTable),
@@ -1645,7 +1655,11 @@
       );
     }
 
-    async function ppHandleSchedulePage() {
+    // Open "Schedule Dates" on whichever schedule-editor UI we landed on, wait
+    // for it to render, make sure the current-year tab is active, and scrape
+    // the pay periods. Shared by Prior Payroll and Garnishment — both need
+    // exactly this much before they diverge on what to do with the periods.
+    async function openScheduleDatesAndScrape() {
       // Decide UI type by URL — the dispatcher already routed us here, and a
       // text search is unreliable (Paycom keeps a HIDDEN <h2>/<div> "Schedule
       // Dates" content heading in the DOM, which a text search wrongly grabs
@@ -1700,6 +1714,11 @@
       const periods = scrapePayrollSchedule();
       log(`Scraped ${periods.length} pay periods (year=${new Date().getFullYear()})`);
       if (!periods.length) throw new Error('No pay periods scraped from schedule');
+      return periods;
+    }
+
+    async function ppHandleSchedulePage() {
+      const periods = await openScheduleDatesAndScrape();
 
       const tasks = generateTaskList(periods);
       log(`Generated ${tasks.length} tasks`, tasks);
@@ -2106,6 +2125,8 @@
       setState(STATES.IDLE);
       setPpState(PP_STATES.IDLE);
       setTpState(TP_STATES.IDLE);
+      setTosState(TOS_STATES.IDLE);
+      setGnState(GN_STATES.IDLE);
       setSdState(SD_STATES.AT_REPORT);
       dispatch();
     }
@@ -2219,6 +2240,8 @@
       setState(STATES.IDLE);
       setPpState(PP_STATES.IDLE);
       setSdState(SD_STATES.IDLE);
+      setTosState(TOS_STATES.IDLE);
+      setGnState(GN_STATES.IDLE);
       setTpState(TP_STATES.AT_REPORT);
       // Immediate feedback so the button doesn't look unresponsive while the
       // report page loads (the banner is re-shown on the loaded page below).
@@ -2351,6 +2374,8 @@
       setPpState(PP_STATES.IDLE);
       setSdState(SD_STATES.IDLE);
       setTpState(TP_STATES.IDLE);
+      setTosState(TOS_STATES.IDLE);
+      setGnState(GN_STATES.IDLE);
       setQpState(QP_STATES.AT_REPORT);
       showProgressBanner('Qualified Premiums Report: opening…');
       dispatch();
@@ -2431,6 +2456,406 @@
       }
     }
 
+    // ───────────────── Time-Off Summary (rpt_id=186) ─────────────────
+    // Year-to-date only: 01/01 of the CURRENT year → today. Both ends are
+    // derived from the system clock, so the range rolls forward on its own
+    // each January and nothing here is ever hardcoded. (The historical bot
+    // pulls this same report for a wider window; that flow is untouched.)
+
+    const TOS_STATE_KEY = 'paycomBot.tos.state';
+    const TOS_STATES = {
+      IDLE: 'IDLE',
+      AT_REPORT: 'TOS_AT_REPORT',
+    };
+    const TOS_CONFIG = {
+      reportId: 186,
+    };
+    const tosReportUrl = () =>
+      `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${TOS_CONFIG.reportId}`;
+
+    // { from: '01/01/<this year>', to: '<today>' } in Paycom's MM/DD/YYYY.
+    function tosDateRange() {
+      const d = new Date();
+      const p2 = (n) => String(n).padStart(2, '0');
+      return {
+        from: `01/01/${d.getFullYear()}`,
+        to: `${p2(d.getMonth() + 1)}/${p2(d.getDate())}/${d.getFullYear()}`,
+      };
+    }
+
+    const getTosState = () => localStorage.getItem(TOS_STATE_KEY) || TOS_STATES.IDLE;
+    const setTosState = (s) => {
+      if (s === TOS_STATES.IDLE) localStorage.removeItem(TOS_STATE_KEY);
+      else localStorage.setItem(TOS_STATE_KEY, s);
+      refreshPanel();
+      log('TOS state →', s);
+    };
+    const isTosRunning = () => getTosState() !== TOS_STATES.IDLE;
+
+    function startTimeOffSummary() {
+      setState(STATES.IDLE);
+      setPpState(PP_STATES.IDLE);
+      setSdState(SD_STATES.IDLE);
+      setTpState(TP_STATES.IDLE);
+      setQpState(QP_STATES.IDLE);
+      setTosState(TOS_STATES.AT_REPORT);
+      showProgressBanner('Time-Off Summary: opening…');
+      dispatch();
+    }
+
+    async function tosHandleReportPage() {
+      showProgressBanner('Time-Off Summary: loading report form…');
+      log('TOS: waiting for report form');
+      await waitFor(
+        () => findDateRangeInputs() || findGenerateReportButton(),
+        { timeout: 20000, label: 'Time-Off Summary report form' }
+      );
+      await sleep(500); // settle so the date fields are wired up
+
+      const range = tosDateRange();
+      const dr = findDateRangeInputs();
+      if (!dr) throw new Error('TOS: Date Range inputs not found');
+      log(`TOS: setting From=${range.from}, To=${range.to}`);
+      setInputValue(dr.from, range.from);
+      setInputValue(dr.to, range.to);
+      await sleep(300);
+
+      const selectAll = findEmployeeSelectAllCheckbox();
+      if (selectAll) {
+        if (!selectAll.checked) {
+          log('TOS: clicking Employee Select All');
+          clickEl(selectAll);
+          await sleep(2000); // employee list takes a moment to load
+        } else {
+          log('TOS: Employee Select All already checked');
+        }
+      } else {
+        log('TOS: Warning — Employee Select All checkbox not found');
+      }
+      await sleep(400);
+
+      // Output format LAST: ticking Select All re-renders the form and resets
+      // the format back to HTML, and an HTML run redirects to a view page
+      // instead of producing a Download button.
+      const excelRadio = findRadioByLabel('XLSX')
+        || findRadioByLabel('Excel')
+        || findRadioByLabel('MS Excel');
+      if (excelRadio && !excelRadio.checked) {
+        log('TOS: selecting XLSX');
+        clickEl(excelRadio);
+        await sleep(400);
+      } else if (excelRadio) {
+        log('TOS: XLSX already selected');
+      } else {
+        log('TOS: Warning — XLSX radio not found, using default format');
+      }
+
+      const initialDownloads = getDownloadButtons().length;
+      log(`TOS: initial Download buttons before generate: ${initialDownloads}`);
+
+      const genBtn = findGenerateReportButton();
+      if (!genBtn) throw new Error('TOS: Generate Report button not found');
+      log('TOS: clicking Generate Report');
+      showProgressBanner('Time-Off Summary: generating…');
+      clickEl(genBtn);
+
+      log('TOS: waiting for Download button (up to 10 min)');
+      await waitFor(
+        () => getDownloadButtons().length > initialDownloads,
+        { timeout: 10 * 60 * 1000, interval: 800, label: 'Time-Off Summary Download' }
+      );
+
+      const downloads = getDownloadButtons();
+      downloads.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      log('TOS: clicking newest Download button');
+      clickEl(downloads[0]);
+
+      await sleep(1500);
+      hideProgressBanner();
+      showSuccessBanner(`✓ Time-Off Summary downloaded (${range.from} → ${range.to})`);
+      setTosState(TOS_STATES.IDLE);
+    }
+
+    async function dispatchTimeOffSummary() {
+      if (!isTosRunning()) return;
+      dismissPrivacyBanner();
+      showProgressBanner('Time-Off Summary: opening report page…');
+      const url = location.href;
+      log('TOS dispatch on', location.pathname);
+
+      // Distinguish from the other rpt-generate reports by rpt_id.
+      const onTosReport = url.includes('/rpt-generate.php') &&
+        /[?&]rpt_id=186(?:[&#]|$)/.test(url);
+
+      if (!onTosReport) {
+        location.href = tosReportUrl();
+        return;
+      }
+
+      try {
+        await tosHandleReportPage();
+      } catch (err) {
+        if (err.aborted) { log('TOS aborted by user'); hideProgressBanner(); return; }
+        hideProgressBanner();
+        alert('Paycom Bot (Time-Off Summary): ' + err.message);
+        setTosState(TOS_STATES.IDLE);
+      }
+    }
+
+    // ───────────────── Garnishment Report (rpt_id=20) ─────────────────
+    // Only the LAST processed pay period's garnishments are wanted — those are
+    // the ones currently active. So this flow first walks the SAME Processing
+    // Schedule pages Prior Payroll uses, scrapes the pay periods, takes the
+    // newest row whose status is "Processed", and runs the report with that
+    // row's check date on both ends of the Date Range (the form filters by Pay
+    // Date by default). Nothing is asked of the user and no date is hardcoded.
+    //
+    // (The Historical Data Bot pulls this report for whole years instead; that
+    // flow is separate and untouched.)
+
+    const GN_STATE_KEY = 'paycomBot.gn.state';
+    const GN_PERIOD_KEY = 'paycomBot.gn.period'; // { checkDate, payrollNum, quarter }
+    const GN_STATES = {
+      IDLE: 'IDLE',
+      GO_TO_SCHEDULE: 'GN_GO_TO_SCHEDULE',
+      AT_SCHEDULE: 'GN_AT_SCHEDULE',
+      AT_REPORT: 'GN_AT_REPORT',
+    };
+    const GN_CONFIG = {
+      reportId: 20,
+    };
+    const gnReportUrl = () =>
+      `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${GN_CONFIG.reportId}`;
+
+    const getGnState = () => localStorage.getItem(GN_STATE_KEY) || GN_STATES.IDLE;
+    const setGnState = (s) => {
+      if (s === GN_STATES.IDLE) localStorage.removeItem(GN_STATE_KEY);
+      else localStorage.setItem(GN_STATE_KEY, s);
+      refreshPanel();
+      log('GN state →', s);
+    };
+    const isGnRunning = () => getGnState() !== GN_STATES.IDLE;
+
+    function getGnPeriod() {
+      try { return JSON.parse(localStorage.getItem(GN_PERIOD_KEY) || 'null'); } catch (_) { return null; }
+    }
+    function setGnPeriod(p) {
+      try {
+        if (!p) localStorage.removeItem(GN_PERIOD_KEY);
+        else localStorage.setItem(GN_PERIOD_KEY, JSON.stringify(p));
+      } catch (_) { }
+    }
+
+    function startGarnishment() {
+      setState(STATES.IDLE);
+      setPpState(PP_STATES.IDLE);
+      setSdState(SD_STATES.IDLE);
+      setTpState(TP_STATES.IDLE);
+      setQpState(QP_STATES.IDLE);
+      setTosState(TOS_STATES.IDLE);
+      setGnPeriod(null);
+      setGnState(GN_STATES.GO_TO_SCHEDULE);
+      showProgressBanner('Garnishment: finding the last pay period…');
+      dispatch();
+    }
+
+    // Newest Processed row wins. The scraper returns them in schedule order
+    // (payroll #1 → #52), so the LAST Processed entry is the most recent one —
+    // the same "Processed" test generateTaskList uses.
+    function pickLastProcessedPeriod(periods) {
+      const processed = periods.filter(p => /processed/i.test(p.status || ''));
+      if (!processed.length) return null;
+      return processed[processed.length - 1];
+    }
+
+    // Reached via the shared schedule navigation once the editor page is open.
+    async function gnHandleSchedulePage() {
+      const periods = await openScheduleDatesAndScrape();
+
+      const last = pickLastProcessedPeriod(periods);
+      if (!last) throw new Error('No Processed pay period found in the current year — nothing to run Garnishment for');
+      log(`GN: last processed pay period = #${last.payrollNum} (Q${last.quarter}), check date ${last.checkDate}`);
+
+      setGnPeriod({ checkDate: last.checkDate, payrollNum: last.payrollNum, quarter: last.quarter });
+      setGnState(GN_STATES.AT_REPORT);
+      showProgressBanner(`Garnishment: last pay period #${last.payrollNum} (${last.checkDate}) — opening report…`);
+      location.href = gnReportUrl();
+    }
+
+    async function gnHandleReportPage() {
+      const period = getGnPeriod();
+      if (!period || !period.checkDate) throw new Error('GN: no pay period stored — re-run Garnishment from the start');
+      const when = period.checkDate;
+
+      showProgressBanner('Garnishment: loading report form…');
+      log('GN: waiting for report form');
+      await waitFor(
+        () => findDateRangeInputs() || findGenerateReportButton(),
+        { timeout: 20000, label: 'Garnishment report form' }
+      );
+      await sleep(500); // settle so the date fields are wired up
+
+      const dr = findDateRangeInputs();
+      if (!dr) throw new Error('GN: Date Range inputs not found');
+      log(`GN: setting From=${when}, To=${when} (last pay period #${period.payrollNum})`);
+      setInputValue(dr.from, when);
+      setInputValue(dr.to, when);
+      await sleep(300);
+
+      const selectAll = findEmployeeSelectAllCheckbox();
+      if (selectAll) {
+        if (!selectAll.checked) {
+          log('GN: clicking Employee Select All');
+          clickEl(selectAll);
+          await sleep(2000); // employee list takes a moment to load
+        } else {
+          log('GN: Employee Select All already checked');
+        }
+      } else {
+        log('GN: Warning — Employee Select All checkbox not found');
+      }
+      await sleep(400);
+
+      // Output format LAST: ticking Select All re-renders the form and resets
+      // the format back to HTML, and an HTML run redirects to a view page
+      // instead of producing a Download button.
+      const excelRadio = findRadioByLabel('XLSX')
+        || findRadioByLabel('Excel')
+        || findRadioByLabel('MS Excel');
+      if (excelRadio && !excelRadio.checked) {
+        log('GN: selecting XLSX');
+        clickEl(excelRadio);
+        await sleep(400);
+      } else if (excelRadio) {
+        log('GN: XLSX already selected');
+      } else {
+        log('GN: Warning — XLSX radio not found, using default format');
+      }
+
+      const initialDownloads = getDownloadButtons().length;
+      log(`GN: initial Download buttons before generate: ${initialDownloads}`);
+
+      const genBtn = findGenerateReportButton();
+      if (!genBtn) throw new Error('GN: Generate Report button not found');
+      log('GN: clicking Generate Report');
+      showProgressBanner(`Garnishment (${when}): generating…`);
+      clickEl(genBtn);
+
+      log('GN: waiting for Download button (up to 10 min)');
+      await waitFor(
+        () => getDownloadButtons().length > initialDownloads,
+        { timeout: 10 * 60 * 1000, interval: 800, label: 'Garnishment Download' }
+      );
+
+      const downloads = getDownloadButtons();
+      downloads.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      log('GN: clicking newest Download button');
+      clickEl(downloads[0]);
+
+      await sleep(1500);
+      hideProgressBanner();
+      showSuccessBanner(`✓ Garnishment downloaded — last pay period ${when}`);
+      setGnPeriod(null);
+      setGnState(GN_STATES.IDLE);
+    }
+
+    // Mirrors dispatchPriorPayroll's schedule navigation; the list handlers are
+    // shared and route back here via handleSchedulePageForActiveMode().
+    async function dispatchGarnishment() {
+      if (!isGnRunning()) return;
+      dismissPrivacyBanner();
+      const url = location.href;
+      const state = getGnState();
+      log('GN dispatch on', location.pathname, 'state=', state);
+
+      if (state === GN_STATES.GO_TO_SCHEDULE) {
+        setPpNavAttempts(0);
+        setGnState(GN_STATES.AT_SCHEDULE);
+        location.href = ppScheduleListUrl();
+        return;
+      }
+
+      if (state === GN_STATES.AT_SCHEDULE) {
+        // Editor URL contains the list path as a substring, so test it first.
+        if (url.includes(PP_MANTLE_EDITOR_PATH)) {
+          setPpNavAttempts(0);
+          try {
+            await gnHandleSchedulePage();
+          } catch (err) {
+            if (err.aborted) { log('GN schedule aborted by user'); return; }
+            hideProgressBanner();
+            alert('Paycom Bot (Garnishment, schedule): ' + err.message);
+            setGnState(GN_STATES.IDLE);
+          }
+          return;
+        }
+        if (url.includes(PP_MANTLE_SCHEDULE_PATH)) {
+          try {
+            await ppHandleMantleScheduleList();
+          } catch (err) {
+            if (err.aborted) { log('GN Mantle list aborted by user'); return; }
+            hideProgressBanner();
+            alert('Paycom Bot (Garnishment, schedules): ' + err.message);
+            setGnState(GN_STATES.IDLE);
+          }
+          return;
+        }
+        if (url.includes('/processingschedules/indexTable')) {
+          try {
+            await ppHandleScheduleList();
+          } catch (err) {
+            if (err.aborted) { log('GN list aborted by user'); return; }
+            hideProgressBanner();
+            alert('Paycom Bot (Garnishment, list): ' + err.message);
+            setGnState(GN_STATES.IDLE);
+          }
+          return;
+        }
+        if (/\/processingschedules\/index\/\d+/.test(url)) {
+          setPpNavAttempts(0);
+          try {
+            await gnHandleSchedulePage();
+          } catch (err) {
+            if (err.aborted) { log('GN schedule aborted by user'); return; }
+            hideProgressBanner();
+            alert('Paycom Bot (Garnishment, schedule): ' + err.message);
+            setGnState(GN_STATES.IDLE);
+          }
+          return;
+        }
+        // Unrecognized page → bounce back to the listing, with the same
+        // loop guard Prior Payroll uses.
+        const attempts = getPpNavAttempts();
+        if (attempts >= PP_MAX_NAV_ATTEMPTS) {
+          setGnState(GN_STATES.IDLE);
+          hideProgressBanner();
+          alert('Paycom Bot (Garnishment): stopped after ' + PP_MAX_NAV_ATTEMPTS +
+            ' navigation attempts — kept getting stuck on "' + location.pathname + '".');
+          return;
+        }
+        setPpNavAttempts(attempts + 1);
+        location.href = ppScheduleListUrl();
+        return;
+      }
+
+      if (state === GN_STATES.AT_REPORT) {
+        const onGnReport = url.includes('/rpt-generate.php') &&
+          /[?&]rpt_id=20(?:[&#]|$)/.test(url);
+        if (!onGnReport) {
+          location.href = gnReportUrl();
+          return;
+        }
+        try {
+          await gnHandleReportPage();
+        } catch (err) {
+          if (err.aborted) { log('GN aborted by user'); hideProgressBanner(); return; }
+          hideProgressBanner();
+          alert('Paycom Bot (Garnishment): ' + err.message);
+          setGnState(GN_STATES.IDLE);
+        }
+      }
+    }
+
     // ───────────────── Page-router state machine ─────────────────
 
     async function dispatch() {
@@ -2439,6 +2864,8 @@
       if (isSdRunning()) return await dispatchScheduledDeductions();
       if (isTpRunning()) return await dispatchTaxProfile();
       if (isQpRunning()) return await dispatchQualifiedPremiums();
+      if (isTosRunning()) return await dispatchTimeOffSummary();
+      if (isGnRunning()) return await dispatchGarnishment();
     }
 
     async function dispatchCensus() {
@@ -3621,6 +4048,8 @@
           #paycom-bot-panel .start-sd{background:linear-gradient(135deg,#cad2c5 0%,#aebfb0 100%);color:#2f3e46}
           #paycom-bot-panel .start-tp{background:linear-gradient(135deg,#3f5f56 0%,#354f52 100%);color:#cad2c5}
           #paycom-bot-panel .start-qp{background:linear-gradient(135deg,#84a98c 0%,#52796f 100%);color:#2f3e46}
+          #paycom-bot-panel .start-tos{background:linear-gradient(135deg,#cad2c5 0%,#9bb3a4 100%);color:#2f3e46}
+          #paycom-bot-panel .start-gn{background:linear-gradient(135deg,#6d9079 0%,#52796f 100%);color:#cad2c5}
           #paycom-bot-panel .start-docs{background:linear-gradient(135deg,#6d9079 0%,#52796f 100%);color:#cad2c5}
           #paycom-bot-panel .inspect-html{background:transparent;color:#84a98c;border:1px dashed rgba(132,169,140,.6)}
           #paycom-bot-panel .inspect-html:hover{background:rgba(132,169,140,.1)}
@@ -3653,12 +4082,16 @@
           <div class="status">Sched Deductions <span class="sd-state"></span></div>
           <div class="status">Tax Profile <span class="tp-state"></span></div>
           <div class="status">Qual Premiums <span class="qp-state"></span></div>
+          <div class="status">Time-Off Summary <span class="tos-state"></span></div>
+          <div class="status">Garnishment <span class="gn-state"></span></div>
           <button class="start-all">⚡ Download All Reports</button>
           <button class="start">📊 Start Census Report</button>
           <button class="start-pp">🗓️ Run Prior Payroll</button>
           <button class="start-sd">💸 Run Scheduled Deductions</button>
           <button class="start-tp">🧾 Run Tax Profile Report</button>
           <button class="start-qp">📋 Run Qualified Premiums</button>
+          <button class="start-tos">🏖️ Run Time-Off Summary</button>
+          <button class="start-gn">⚖️ Run Garnishment (last pay period)</button>
           <button class="start-docs">📥 Download All Documents</button>
           <button class="inspect-html" title="Click this, then click any element on the page — its HTML is copied to the clipboard">🔍 Inspect Element HTML</button>
           <button class="stop">⏹ Stop / reset</button>
@@ -3690,6 +4123,8 @@
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
         setQpState(QP_STATES.IDLE);
+        setTosState(TOS_STATES.IDLE);
+        setGnState(GN_STATES.IDLE);
         setState(STATES.RUNNING);
         dispatch();
       });
@@ -3712,7 +4147,18 @@
       });
       panelEl.querySelector('.start-qp').addEventListener('click', () => {
         clearBatch();
+        setTosState(TOS_STATES.IDLE);
+        setGnState(GN_STATES.IDLE);
         startQualifiedPremiums();
+      });
+      panelEl.querySelector('.start-tos').addEventListener('click', () => {
+        clearBatch();
+        setGnState(GN_STATES.IDLE);
+        startTimeOffSummary();
+      });
+      panelEl.querySelector('.start-gn').addEventListener('click', () => {
+        clearBatch();
+        startGarnishment();
       });
       panelEl.querySelector('.start-docs').addEventListener('click', () => {
         // Clear the other modes (this isn't part of their state machine) and
@@ -3723,6 +4169,8 @@
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
         setQpState(QP_STATES.IDLE);
+        setTosState(TOS_STATES.IDLE);
+        setGnState(GN_STATES.IDLE);
         startDocs();
       });
       panelEl.querySelector('.inspect-html').addEventListener('click', () => {
@@ -3765,6 +4213,9 @@
         setSdState(SD_STATES.IDLE);
         setTpState(TP_STATES.IDLE);
         setQpState(QP_STATES.IDLE);
+        setTosState(TOS_STATES.IDLE);
+        setGnState(GN_STATES.IDLE);
+        setGnPeriod(null);
         // Abort the document downloader (if mounted on this page) and clear
         // its flags either way, so a queued auto-start can't fire later.
         if (docsStop) docsStop();
@@ -3925,6 +4376,8 @@
       setChip('.sd-state', getSdState());
       setChip('.tp-state', getTpState());
       setChip('.qp-state', getQpState());
+      setChip('.tos-state', getTosState());
+      setChip('.gn-state', getGnState());
       // Pulsing header dot while anything is running.
       panelEl.classList.toggle('running',
         isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning());
@@ -3944,9 +4397,11 @@
       { key: 'sd', icon: '💸', label: 'Scheduled Deductions' },
       { key: 'tp', icon: '🧾', label: 'Tax Profile' },
       { key: 'qp', icon: '📋', label: 'Qualified Premiums' },
+      { key: 'tos', icon: '🏖️', label: 'Time-Off Summary' },
+      { key: 'gn', icon: '⚖️', label: 'Garnishment (last pay period)' },
     ];
     const pcReport = (key) => PC_REPORTS.find(r => r.key === key);
-    const anyModeRunning = () => isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning();
+    const anyModeRunning = () => isRunning() || isPpRunning() || isSdRunning() || isTpRunning() || isQpRunning() || isTosRunning() || isGnRunning();
 
     // Persisted { key: bool } picker selection; anything missing defaults to on.
     const PC_SEL_KEY = 'paycomBot.reportSelection';
@@ -3985,12 +4440,16 @@
       setSdState(SD_STATES.IDLE);
       setTpState(TP_STATES.IDLE);
       setQpState(QP_STATES.IDLE);
+      setTosState(TOS_STATES.IDLE);
+      setGnState(GN_STATES.IDLE);
       switch (key) {
         case 'census': setState(STATES.RUNNING); dispatch(); break;
         case 'pp': startPriorPayroll(); break;
         case 'sd': startScheduledDeductions(); break;
         case 'tp': startTaxProfile(); break;
         case 'qp': startQualifiedPremiums(); break;
+        case 'tos': startTimeOffSummary(); break;
+        case 'gn': startGarnishment(); break;
         default: log('[Batch] unknown report key: ' + key);
       }
     }
