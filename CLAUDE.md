@@ -195,6 +195,10 @@ C:\Users\shobhit.sharma\.claude\projects\c--Users-shobhit-sharma-Downloads-Playr
 
 `MEMORY.md` is the index. The most useful files there are `project_paycom_reports.md` (current architecture, bug history, open items) and `feedback_arkose_tampermonkey.md` (the validated decision to use Tampermonkey over Playwright stealth). Read those before suggesting any architectural changes.
 
+For the *business* side — who's driving requirements, why historical data matters (Amazon DSP audit exposure), retention scope, rollout status, and links to the report catalog / distribution folder / relevant email threads — see `communication_context.md` in the repo root. Read it before drafting any stakeholder-facing update, and keep it current as decisions land.
+
+**That file is deliberately gitignored and exists only on the local machine.** It carries names, work email addresses, a named client's audit situation and internal Drive links, and **this repository is public** — so never commit it, quote it into a tracked file, or paste its contents anywhere public.
+
 ## Files to ignore
 
 These are leftover from the abandoned Playwright path; they are not part of the runtime:
