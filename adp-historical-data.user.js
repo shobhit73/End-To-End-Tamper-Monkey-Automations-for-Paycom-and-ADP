@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.15.0
+// @version      1.16.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -47,7 +47,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '1.15.0';
+    return '1.16.0';
   })();
 
   const YEARS_KEY = 'historicalBot.adp.years';
@@ -1486,9 +1486,16 @@
     // handles natively. Confirmed live on Employee Lien Detail — the PDF
     // downloaded twice while open/fetch/XHR/submit stayed completely silent.
     //
-    // For the anchor case this is better than capturing a URL: set the
-    // element's own `download` attribute and the browser saves it under OUR
-    // name, with no second copy and no re-fetch.
+    // Retagging that anchor's `download` attribute was tried first and does
+    // NOT work: a Content-Disposition filename from the server overrides the
+    // attribute, so Employee Lien Detail still landed as
+    // "Employee Lien Detail (7).pdf" while the log happily claimed it had
+    // saved InnovDel_Inc_Employee_Lien_Detail_2025.pdf.
+    //
+    // So suppress ADP's native download instead and let the caller fetch the
+    // href itself — saving through a blob: URL is the only way our filename is
+    // actually honoured. releaseSuppressed() puts ADP's own download back if
+    // that fetch fails, so a naming problem never becomes a missing file.
     const AP = win.HTMLAnchorElement && win.HTMLAnchorElement.prototype;
     const oAClick = AP && AP.click;
     if (oAClick) {
@@ -1496,14 +1503,20 @@
         try {
           const href = this.getAttribute && this.getAttribute('href');
           if (href) push(href);
-          if (st.renameTo && this.hasAttribute && this.hasAttribute('download')) {
-            this.setAttribute('download', st.renameTo);
-            st.renamedInPlace = true;
+          if (st.renameTo && href && !/^(#|javascript:)/i.test(href)) {
+            st.suppressed = { el: this, args: arguments };
+            return; // deliberately not calling through
           }
         } catch (_) { }
         return oAClick.apply(this, arguments);
       };
     }
+    st.releaseSuppressed = () => {
+      if (!st.suppressed || !oAClick) return false;
+      const s = st.suppressed;
+      st.suppressed = null;
+      try { oAClick.apply(s.el, s.args); return true; } catch (_) { return false; }
+    };
     // Hidden-iframe downloads: record the src so the caller can fetch it.
     let obs = null;
     try {
@@ -1763,7 +1776,9 @@
     const win = (anchor.ownerDocument && anchor.ownerDocument.defaultView) || window;
     const sn1 = armSniffer(win);
     const sn2 = (win === window) ? null : armSniffer(window);
-    // If ADP downloads by clicking its own <a download>, rename it in place.
+    // Setting renameTo arms the anchor hook: if ADP downloads by clicking its
+    // own <a>, that click is suppressed so we can fetch and save under this
+    // name ourselves (see armSniffer).
     sn1.renameTo = fileName;
     if (sn2) sn2.renameTo = fileName;
     const baseHref = anchor.ownerDocument.baseURI;
@@ -1806,7 +1821,6 @@
       // so "no request captured" must not be read as "the click missed". The
       // retry that assumption justified produced a second copy of every PDF.
       for (let i = 0; i < 40; i++) { // up to 12s for the handler to fire
-        if (sn1.renamedInPlace || (sn2 && sn2.renamedInPlace)) break;
         const arr = capturedUrls();
         const good = arr.find(isFileUrl);
         if (good) { url = good; break; }
@@ -1819,12 +1833,15 @@
       sn1.restore();
       if (sn2) sn2.restore();
     }
-    // ADP's own <a download> was retagged with our filename — the browser has
-    // already saved it correctly, so there is nothing left to fetch.
-    if (sn1.renamedInPlace || (sn2 && sn2.renamedInPlace)) {
-      logSuccess('Saved ' + fileName + ' (renamed ADP\'s own download)');
-      return { ok: true, sig: topSig };
-    }
+    // ADP's own download is held back while we try to save under our name;
+    // hand it back on any failure so the file still reaches Downloads rather
+    // than being lost to a naming problem.
+    const releaseAdpDownload = (why) => {
+      const released = (sn1.releaseSuppressed && sn1.releaseSuppressed()) ||
+        (sn2 && sn2.releaseSuppressed && sn2.releaseSuppressed());
+      if (released) logWarn(label + ': ' + why + " — letting ADP save it under its own name instead");
+      return released;
+    };
     // A plain <a href> navigation calls none of the APIs the sniffer hooks
     // (open/fetch/XHR/submit), so "nothing captured" does NOT mean "no URL" —
     // the item may simply carry the link itself.
@@ -1833,6 +1850,7 @@
       logInfo('Sniffer saw nothing — using the menu item\'s own href');
     }
     if (!url) {
+      releaseAdpDownload('could not capture the file URL');
       logWarn(label + ': could not capture the file URL — the file keeps ADP\'s default name');
       logInfo('  clicked <' + clickTarget.tagName.toLowerCase() + '> "' +
         (clickTarget.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40) +
@@ -1906,9 +1924,11 @@
       // ADP's concurrent-session guard: the file server refuses downloads when
       // the account is also logged in elsewhere. No retry fixes this.
       if (/logged in to ADP Workforce Now in another browser|another browser/i.test(viewerHtml)) {
+        releaseAdpDownload('ADP refused our fetch');
         logError(label + ': ADP refused the download — this account is logged in to ADP in ANOTHER browser/profile. Close the other ADP session (or log out there), then re-run.');
         return { ok: false, sig: topSig };
       }
+      releaseAdpDownload('could not reach the real file');
       logWarn(label + ': could not reach the real file — opening the viewer normally (default name)');
       logInfo('Diagnostics — URLs: ' + JSON.stringify(capturedUrls()) +
         ' | forms: ' + JSON.stringify(capturedForms().map(f => f.method + ' ' + f.action)) +
@@ -2476,13 +2496,35 @@
   // no longer shows it). Falls back to '' → file name simply omits the client.
   let auditClientName = '';
 
+  // Any hyphenated phrase used to satisfy the company-code chip pattern, so the
+  // bot kept naming files after its OWN panel: the subtitle "Prior-year
+  // extracts" parsed as code "Prior" + name "year extracts", and every file
+  // came out as year_extracts_*. Ordinary page text like "Time-Off Summary"
+  // did the same. Two defences, either of which alone fixes it:
+  //   1. never read the bot's own UI (panel + its dialogs)
+  //   2. require a digit in the code — ADP company codes have one (0MJ, 0PY79)
+  const CHIP_RE = /^([A-Za-z0-9.]{2,6})\s*-\s*([A-Za-z].*)$/;
+  const OWN_UI_SEL = '#hd-bot-panel, #hd-mode-pick, #hd-item-pick, #hd-year-pick';
+
+  function parseCompanyChip(text) {
+    const m = (text || '').match(CHIP_RE);
+    if (!m) return '';
+    if (!/[0-9]/.test(m[1])) return ''; // "Prior-year", "Time-Off" — not a code
+    return m[2].trim();
+  }
+
   function detectClientName() {
-    const texts = deepQueryAll('div, span, li, h1, h2, b').filter(visible)
+    const texts = deepQueryAll('div, span, li, h1, h2, b')
+      .filter(visible)
+      .filter(el => !(el.closest && el.closest(OWN_UI_SEL)))
       .map(el => (el.textContent || '').trim())
       .filter(t => t && t.length >= 4 && t.length < 60);
     // 1) "0MJ - Flash Hub Delivery" style company-code chips (any case).
-    const chip = texts.find(t => /^[A-Za-z0-9.]{2,6}\s*-\s*[A-Za-z]/.test(t) && !/no company/i.test(t) && !/^https?:/i.test(t));
-    if (chip) return chip.replace(/^[A-Za-z0-9.]{2,6}\s*-\s*/, '').trim();
+    for (const t of texts) {
+      if (/no company/i.test(t) || /^https?:/i.test(t)) continue;
+      const name = parseCompanyChip(t);
+      if (name) return name;
+    }
     // 2) Top-bar brand: "ADP | <client>" renders as adjacent text; grab the
     //    text right after a lone "ADP" logo text if present.
     const brand = texts.find(t => /^ADP\s*\|\s*\S/.test(t));
@@ -2493,6 +2535,34 @@
     if (auditClientName) return;
     auditClientName = detectClientName();
     if (auditClientName) logInfo('Client detected (' + where + '): ' + auditClientName);
+  }
+
+  // Poll for the client name instead of looking exactly once.
+  //
+  // The company-code chips ("0MJ - Flash Hub Delivery") are rendered
+  // asynchronously by Angular, so a single look taken the moment the run page
+  // appears can land before they exist. There is no second chance either: the
+  // file name is built later on Reports Output, which carries no chip at all —
+  // miss it here and the download is saved with no employer prefix.
+  //
+  // Also logs when it gives up. The old one-shot version returned silently on
+  // failure, so a missing prefix left nothing in the log to explain it.
+  async function waitForClientName(where, ms) {
+    if (auditClientName) return auditClientName;
+    const limit = ms || 15000;
+    const t0 = Date.now();
+    while (Date.now() - t0 < limit) {
+      checkAbort();
+      auditClientName = detectClientName();
+      if (auditClientName) {
+        logInfo('Client detected (' + where + '): ' + auditClientName);
+        return auditClientName;
+      }
+      await sleep(700);
+    }
+    logWarn('Client name not found on the ' + where + ' after ' +
+      Math.round(limit / 1000) + 's — this file will be saved WITHOUT an employer prefix');
+    return '';
   }
 
   const notAvailableError = (what) => { const e = new Error(what + ' not available on this employer'); e.notAvailable = true; return e; };
@@ -3130,9 +3200,13 @@
         }
       },
       { name: 'Wait for Run Report page', fn: () => stepWaitForLienRunPage() },
-      { name: 'Detect client name', fn: async () => { tryDetectClient('Employee Lien Detail run page'); return true; } },
       { name: 'Set As of date (' + asOf.label + ')', fn: () => stepSetLienAsOfDate(asOf.value) },
       { name: 'Select all Company Codes', fn: () => stepSelectAllCompanyCodes() },
+      // AFTER the Company Codes step on purpose: that step just moved the
+      // company-code chips into the Selected list, so the "0MJ - Flash Hub
+      // Delivery" text the client name is read from is guaranteed to be in
+      // the DOM by now. Detecting before it raced the Angular render.
+      { name: 'Detect client name', fn: async () => { await waitForClientName('Employee Lien Detail run page'); return true; } },
       { name: 'Run As PDF', fn: async () => { await sleep(800); return stepClickLienRunAsPdf(); } },
       { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
       {

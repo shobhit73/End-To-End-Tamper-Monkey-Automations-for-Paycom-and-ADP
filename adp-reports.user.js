@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.9.0
+// @version      1.9.1
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -3640,13 +3640,36 @@
 
   // Client name for file prefixes, read from ADP's persistent top bar
   // (same detection as the Historical Data bot).
+  // Any hyphenated phrase satisfies a bare company-code chip pattern, so plain
+  // page text was liable to be read as the client: "Year-to-Date" (the
+  // Appearance request-period dropdown) parses as code "Year" + name "to-Date"
+  // and would prefix files with to_Date_. The Historical bot hit exactly this
+  // and named files after its own "Prior-year extracts" panel subtitle. Two
+  // defences, either of which alone fixes it:
+  //   1. never read the bot's own UI (panel + its dialogs)
+  //   2. require a digit in the code — ADP company codes have one (0MJ, 0PY79)
+  const CHIP_RE = /^([A-Za-z0-9.]{2,6})\s*-\s*([A-Za-z].*)$/;
+  const OWN_UI_SEL = '#adp-bot-panel, #adp-quarter-pick, #adp-downloadall-pick';
+
+  function parseCompanyChip(text) {
+    const m = (text || '').match(CHIP_RE);
+    if (!m) return '';
+    if (!/[0-9]/.test(m[1])) return ''; // "Year-to-Date", "Non-Exempt" — not a code
+    return m[2].trim();
+  }
+
   function detectClientName() {
-    const texts = deepQueryAll('div, span, li, h1, h2, b').filter(visible)
+    const texts = deepQueryAll('div, span, li, h1, h2, b')
+      .filter(visible)
+      .filter(el => !(el.closest && el.closest(OWN_UI_SEL)))
       .map(el => (el.textContent || '').trim())
       .filter(t => t && t.length >= 4 && t.length < 60);
     // 1) "0MJ - Flash Hub Delivery" style company-code chips (any case).
-    const chip = texts.find(t => /^[A-Za-z0-9.]{2,6}\s*-\s*[A-Za-z]/.test(t) && !/no company/i.test(t) && !/^https?:/i.test(t));
-    if (chip) return chip.replace(/^[A-Za-z0-9.]{2,6}\s*-\s*/, '').trim();
+    for (const t of texts) {
+      if (/no company/i.test(t) || /^https?:/i.test(t)) continue;
+      const name = parseCompanyChip(t);
+      if (name) return name;
+    }
     // 2) Top-bar brand: "ADP | <client>".
     const brand = texts.find(t => /^ADP\s*\|\s*\S/.test(t));
     if (brand) return brand.replace(/^ADP\s*\|\s*/, '').trim();
