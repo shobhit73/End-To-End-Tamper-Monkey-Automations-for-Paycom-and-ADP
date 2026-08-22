@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Paycom Historical Data Bot
 // @namespace    https://www.paycomonline.net/
-// @version      0.34.1
+// @version      0.35.0
 // @description  Historical Data Bot — downloads Paycom historical reports as Excel for all employees. All dates are computed at run time (previous year + current year; Prior Payroll goes back 3 years) — nothing is hardcoded. Sections: Time-Off, Time & Attendance, Accrual, HR & Audit, Payroll (ARW wizard), E-Verify (grid export + all-case detail scrape). User opens Paycom, picks a section, ticks reports, and the bot navigates, configures, generates, and downloads each file with a clean name.
 // @match        https://www.paycomonline.net/v4/cl/*
 // @run-at       document-end
@@ -750,6 +750,78 @@
     return tryHay(location.href + ' ' + (document.documentElement.innerHTML || '') + ' ' + (document.cookie || ''));
   }
 
+  // ───────────────── Client name (file-name prefix) ─────────────────
+  // Every downloaded file is prefixed with the client, so files from two
+  // different employers never sit in Downloads looking identical.
+  //
+  // Paycom prints the employer in the header of every page as
+  //   [0PY79] SPELMAN LOGISTICS INC
+  // Matched on that text rather than on any class/id: this bot already learned
+  // the hard way that Paycom's markup shifts between pages and keeps hidden
+  // duplicate copies, whereas the "[code] NAME" text is stable everywhere.
+  //
+  // Cached per RUN (cleared in startRun), never across runs — otherwise
+  // switching Paycom accounts mid-session would silently stamp the previous
+  // client's name onto the new client's files.
+  const CLIENT_KEY = 'histbot.client';
+  const CLIENT_RE = /^\[([A-Za-z0-9]{2,10})\]\s*([A-Za-z0-9][A-Za-z0-9 .,&%*()@#!+-]{1,59}?)\s*$/;
+
+  // A bracketed prefix alone is not enough: report pages carry things like
+  // "[MTD] / QTD / YTD", which matched an earlier, looser pattern and would
+  // have prefixed every file with "/_QTD_/_YTD". Paycom client codes always
+  // contain a digit (0PY79, 0JP05, 0MJ), so require one.
+  function parseClientText(text) {
+    const m = (text || '').match(CLIENT_RE);
+    if (!m) return '';
+    if (!/[0-9]/.test(m[1])) return '';    // not a Paycom client code
+    if (!/[A-Za-z]/.test(m[2])) return ''; // name must have letters
+    return m[2].trim();
+  }
+
+  function detectClientName() {
+    // 1) One element holding the whole "[code] NAME".
+    for (const el of document.querySelectorAll('span, div, td, li, a, p, b, strong, h1, h2')) {
+      if (!visible(el) || el.children.length) continue;
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 70) continue;
+      const name = parseClientText(t);
+      if (name) return name;
+    }
+    // 2) Code and name split across siblings — read the parent's combined text.
+    for (const el of document.querySelectorAll('span, div, td, li, a, b, strong')) {
+      if (!visible(el) || el.children.length) continue;
+      if (!/^\[[A-Za-z0-9]{2,10}\]$/.test((el.textContent || '').trim())) continue;
+      const parent = el.parentElement;
+      if (!parent) continue;
+      const name = parseClientText((parent.textContent || '').replace(/\s+/g, ' ').trim());
+      if (name) return name;
+    }
+    return '';
+  }
+
+  // "SPELMAN LOGISTICS INC" → "SPELMAN_LOGISTICS_INC"
+  function safeClientName(name) {
+    return String(name || '').replace(/[^\w]+/g, '_').replace(/^_+|_+$/g, '');
+  }
+
+  // Returns "<Client>_" ready to prepend, or '' when the header can't be read
+  // (a missing prefix is never worth failing or delaying a download over).
+  function clientPrefix() {
+    let cached = '';
+    try { cached = localStorage.getItem(CLIENT_KEY) || ''; } catch (_) { }
+    if (cached) return safeClientName(cached) + '_';
+    const found = detectClientName();
+    if (!found) {
+      uiLog('⚠ Client name not found in the page header — saving without a client prefix');
+      return '';
+    }
+    try { localStorage.setItem(CLIENT_KEY, found); } catch (_) { }
+    uiLog(`Client detected: ${found}`);
+    return safeClientName(found) + '_';
+  }
+
+  const clearClientName = () => { try { localStorage.removeItem(CLIENT_KEY); } catch (_) { } };
+
   function saveBlob(blob, name) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -877,9 +949,10 @@
   // first; it silently handed back that range's file. Every caller now resolves
   // its OWN queue row by timestamp. Don't reintroduce it.)
 
-  // Download the report behind a SPECIFIC Download button, saved as <baseName>.<ext>.
+  // Download the report behind a SPECIFIC Download button, saved as
+  // <Client>_<baseName>.<ext>.
   async function downloadViaButton(btn, baseName) {
-    const fileName = `${baseName}.${extForButton(btn)}`;
+    const fileName = `${clientPrefix()}${baseName}.${extForButton(btn)}`;
 
     // Report-center style first (slug reports); falls through to legacy path.
     if (await tryReportCenterDownload(btn, fileName)) { return; }
@@ -2218,7 +2291,7 @@
   async function everifyFinishScrape(report, idx, queue) {
     const results = loadEverifyResults();
     const csv = everifyResultsToCsv(results);
-    const fname = `EVerifyCaseDetails_${THISYEAR}.csv`;
+    const fname = `${clientPrefix()}EVerifyCaseDetails_${THISYEAR}.csv`;
     saveBlob(new Blob([csv], { type: 'text/csv;charset=utf-8;' }), fname);
     uiLog(`✓ Saved ${fname} (${results.length} case(s))`);
     showBanner(`✓ ${report.name} — ${results.length} case(s) downloaded`, true);
@@ -2293,6 +2366,7 @@
     clearWz();
     clearPipe();
     clearLog();
+    clearClientName(); // re-detect per run — the employer may have changed
     // Version in the very first log line — so a stale Tampermonkey copy is
     // obvious at a glance (we lost a debugging round to exactly that).
     let ver = '';
