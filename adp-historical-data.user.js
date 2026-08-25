@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.16.0
+// @version      1.18.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -47,7 +47,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '1.16.0';
+    return '1.18.0';
   })();
 
   const YEARS_KEY = 'historicalBot.adp.years';
@@ -1557,6 +1557,13 @@
   // it, the classic newest-Completed-row behaviour applies.
   // Optional `waitMsOverride`: a longer completion wait for slow reports.
   async function downloadRenamed(fileName, label, targetSig, waitMsOverride) {
+    // Employer prefix is applied HERE, the one place every flow's download
+    // funnels through. Doing it per flow is exactly how Payroll History, Time
+    // Off and T&A Timecards ended up saving with no prefix while Audit Trail,
+    // Form I-9 and Lien Detail had one — three flows quietly missed.
+    // Safe on Reports Output because the name now comes from ADP's app bar,
+    // which is on every page.
+    fileName = clientPrefix() + fileName;
     setStatus('Waiting for ' + label + ' to finish generating…');
     const completedNear = (top) => deepQueryAll('*').filter(visible).some(el =>
       (el.textContent || '').trim() === 'Completed' &&
@@ -2513,7 +2520,37 @@
     return m[2].trim();
   }
 
+  // ADP's masthead carries the employer on EVERY page — crucially including
+  // Reports Output, where the file name is built. The company-code chips the
+  // old strategies relied on only exist on some run pages (Lien Detail has
+  // them, Form I-9 does not), which is why I-9 downloads had no prefix.
+  //
+  //   <sfc-shell-app-bar …>InnovDel Inc<wfn-shell-app-bar-search>…
+  //
+  // The name is a DIRECT TEXT NODE of the app bar (slotted into .branding-area
+  // inside the component's shadow DOM), so read only the element's own text
+  // nodes: .textContent would drag in every icon label after it — Things to
+  // Do, Calendar, Learn, Bridge, Support, Marketplace, Chat.
+  function clientFromAppBar() {
+    for (const bar of deepQueryAll('sfc-shell-app-bar')) {
+      const own = Array.from(bar.childNodes || [])
+        .filter(n => n.nodeType === 3) // text nodes only
+        .map(n => (n.textContent || '').trim())
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (own.length >= 2 && own.length <= 60) return own;
+    }
+    return '';
+  }
+
   function detectClientName() {
+    // 0) The app bar — present on every page, so this is the one that makes
+    //    detection work no matter which report or page we are on.
+    const fromBar = clientFromAppBar();
+    if (fromBar) return fromBar;
+
     const texts = deepQueryAll('div, span, li, h1, h2, b')
       .filter(visible)
       .filter(el => !(el.closest && el.closest(OWN_UI_SEL)))
@@ -2535,6 +2572,22 @@
     if (auditClientName) return;
     auditClientName = detectClientName();
     if (auditClientName) logInfo('Client detected (' + where + '): ' + auditClientName);
+  }
+
+  // "<Employer>_" ready to prepend, or '' when the name cannot be read (a
+  // missing prefix must never block or delay a download). Used by
+  // downloadRenamed so every flow gets it without having to remember to.
+  let warnedNoClient = false;
+  function clientPrefix() {
+    if (!auditClientName) auditClientName = detectClientName();
+    if (!auditClientName) {
+      if (!warnedNoClient) {
+        logWarn('Employer name could not be read from the ADP app bar — files will save without a prefix');
+        warnedNoClient = true;
+      }
+      return '';
+    }
+    return safeFileName(auditClientName) + '_';
   }
 
   // Poll for the client name instead of looking exactly once.
@@ -2729,9 +2782,9 @@
   }
 
   // <client>_Audit_Trail_Report_<Qn-YYYY>.xlsx — client detected at run time.
+  // No employer prefix here — downloadRenamed adds it for every flow.
   function auditFileName(rng) {
-    return (auditClientName ? safeFileName(auditClientName) + '_' : '') +
-      'Audit_Trail_Report_' + rng.label + '.xlsx';
+    return 'Audit_Trail_Report_' + rng.label + '.xlsx';
   }
 
   // Submit ONE quarter: navigate → configure → Run as Excel. No download here —
@@ -3063,8 +3116,7 @@
       { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
       {
         name: 'Download', fn: async () => {
-          const fileName = (auditClientName ? safeFileName(auditClientName) + '_' : '') +
-            'Form_I9_EVerify_Information.xlsx';
+          const fileName = 'Form_I9_EVerify_Information.xlsx';
           try {
             const res = await downloadRenamed(fileName, I9_REPORT);
             if (res && res.sig) downloadedSigs.add(res.sig);
@@ -3211,8 +3263,7 @@
       { name: 'Wait for Reports Output redirect', fn: async () => { await sleep(5000); return true; } },
       {
         name: 'Download', fn: async () => {
-          const fileName = (auditClientName ? safeFileName(auditClientName) + '_' : '') +
-            'Employee_Lien_Detail_' + asOf.label + '.pdf';
+          const fileName = 'Employee_Lien_Detail_' + asOf.label + '.pdf';
           lastSaveOk = false;
           try {
             const res = await downloadRenamed(fileName, LIEN_REPORT + ' (' + asOf.label + ')');

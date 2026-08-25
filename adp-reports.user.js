@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.9.1
+// @version      1.10.0
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -3278,7 +3278,11 @@
         const first = inRange[0], last = inRange[inRange.length - 1];
         const begin = await phReadPeriodStartFor(first.pay);
         if (!begin) { logWarn('Could not read Period Start Date for ' + t.label + ' — default name'); continue; }
-        t.phFileName = 'PriorPayroll_' + phCompact(begin) + '_' + phCompact(last.end) + '_' + phCompact(last.pay) + '.xlsx';
+        // Client prefix here too, so Payroll History files sit alongside the
+        // other reports' <Client>_… names instead of being the odd one out.
+        const phClient = detectClientName();
+        t.phFileName = (phClient ? safeFileName(phClient) + '_' : '') +
+          'PriorPayroll_' + phCompact(begin) + '_' + phCompact(last.end) + '_' + phCompact(last.pay) + '.xlsx';
         logSuccess(t.label + ' → ' + t.phFileName);
       }
     }
@@ -3658,7 +3662,37 @@
     return m[2].trim();
   }
 
+  // ADP's masthead carries the employer on EVERY page — crucially including
+  // Reports Output, which is where this bot builds the file name (it looks for
+  // the client AFTER Run as Excel has already navigated away from the report
+  // page). The company-code chips the other strategies rely on do not exist
+  // there, which is why Direct Deposit and friends downloaded with no prefix.
+  //
+  //   <sfc-shell-app-bar …>InnovDel Inc<wfn-shell-app-bar-search>…
+  //
+  // The name is a DIRECT TEXT NODE of the app bar (slotted into .branding-area
+  // inside the component's shadow DOM), so read only the element's own text
+  // nodes: .textContent would drag in every icon label after it — Things to
+  // Do, Calendar, Learn, Bridge, Support, Marketplace, Chat.
+  function clientFromAppBar() {
+    for (const bar of deepQueryAll('sfc-shell-app-bar')) {
+      const own = Array.from(bar.childNodes || [])
+        .filter(n => n.nodeType === 3) // text nodes only
+        .map(n => (n.textContent || '').trim())
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (own.length >= 2 && own.length <= 60) return own;
+    }
+    return '';
+  }
+
   function detectClientName() {
+    // 0) The app bar — present on every page, including Reports Output.
+    const fromBar = clientFromAppBar();
+    if (fromBar) return fromBar;
+
     const texts = deepQueryAll('div, span, li, h1, h2, b')
       .filter(visible)
       .filter(el => !(el.closest && el.closest(OWN_UI_SEL)))
