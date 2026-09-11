@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.18.0
+// @version      1.18.1
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -2511,7 +2511,10 @@
   //   1. never read the bot's own UI (panel + its dialogs)
   //   2. require a digit in the code — ADP company codes have one (0MJ, 0PY79)
   const CHIP_RE = /^([A-Za-z0-9.]{2,6})\s*-\s*([A-Za-z].*)$/;
-  const OWN_UI_SEL = '#hd-bot-panel, #hd-mode-pick, #hd-item-pick, #hd-year-pick';
+  // Also exclude the Daily bot's UI — both ADP bots share these pages, and
+  // the other panel's log text can carry digit-bearing chip-shaped strings
+  // (logged filenames like "…Q1-2026") that survive the digit check above.
+  const OWN_UI_SEL = '#hd-bot-panel, #hd-mode-pick, #hd-item-pick, #hd-year-pick, #adp-bot-panel, #adp-quarter-pick, #adp-downloadall-pick, #adp-export-bot';
 
   function parseCompanyChip(text) {
     const m = (text || '').match(CHIP_RE);

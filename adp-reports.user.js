@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.10.0
+// @version      1.10.1
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -3653,7 +3653,11 @@
   //   1. never read the bot's own UI (panel + its dialogs)
   //   2. require a digit in the code — ADP company codes have one (0MJ, 0PY79)
   const CHIP_RE = /^([A-Za-z0-9.]{2,6})\s*-\s*([A-Za-z].*)$/;
-  const OWN_UI_SEL = '#adp-bot-panel, #adp-quarter-pick, #adp-downloadall-pick';
+  // Also exclude the OTHER ADP bots' UI — the Historical bot and the Export
+  // Documents fallback panel share these pages, and their panel/log text can
+  // carry digit-bearing chip-shaped strings (logged filenames like "…Q1-2026")
+  // that survive the digit check above.
+  const OWN_UI_SEL = '#adp-bot-panel, #adp-quarter-pick, #adp-downloadall-pick, #adp-export-bot, #hd-bot-panel, #hd-mode-pick, #hd-item-pick, #hd-year-pick';
 
   function parseCompanyChip(text) {
     const m = (text || '').match(CHIP_RE);
