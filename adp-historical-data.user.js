@@ -47,7 +47,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '1.18.0';
+    return '1.18.1';
   })();
 
   const YEARS_KEY = 'historicalBot.adp.years';
