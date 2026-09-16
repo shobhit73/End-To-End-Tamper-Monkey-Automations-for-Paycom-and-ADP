@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.10.1
+// @version      1.10.2
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -92,6 +92,11 @@
     "Generation Suffix Code (Personal Profile)",
     "Generation Suffix Description (Personal Profile)",
     "Associate ID (Employment Profile)",
+    // Employers with more than one company (e.g. a DSP plus a non-DSP
+    // entity) return every company's employees once the user has "All
+    // companies" access, so this column is what lets the team filter each
+    // employee to the right company before running the API.
+    "Payroll Company Code (Employment Profile)",
     "Position ID (Employment Profile)",
     "Birth Date (Personal Profile)",
     "Tax ID (SSN) (Personal Profile)",
