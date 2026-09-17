@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.10.2
+// @version      1.10.3
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -1448,16 +1448,15 @@
 
   // ───────────────── Time Off Balance Summary flow ─────────────────
 
-  // Year-to-date only: 01/01 of the CURRENT year → today, both ends derived
-  // from the system clock so the range rolls forward on its own each January.
-  // (The Historical Data Bot pulls this same report for a wider window; that
-  // flow is separate and untouched.)
+  // Full current calendar year: 01/01 → 12/31, the year taken from the system
+  // clock so the range rolls forward on its own each January. (The Historical
+  // Data Bot pulls this same report for a wider window; that flow is separate
+  // and untouched.)
   function tobsDateRange() {
-    const d = new Date();
-    const p2 = (n) => String(n).padStart(2, '0');
+    const year = new Date().getFullYear();
     return {
-      from: '01/01/' + d.getFullYear(),
-      to: p2(d.getMonth() + 1) + '/' + p2(d.getDate()) + '/' + d.getFullYear(),
+      from: '01/01/' + year,
+      to: '12/31/' + year,
     };
   }
 
@@ -1467,7 +1466,7 @@
     resetAbort();
 
     const range = tobsDateRange();
-    logInfo('Date range (year-to-date): ' + range.from + ' → ' + range.to);
+    logInfo('Date range (full year): ' + range.from + ' → ' + range.to);
 
     try {
       setStatus('Step 1: Opening Reports menu…');
