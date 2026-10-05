@@ -10,3 +10,7 @@ recon.json
 # client's audit situation, and internal Drive links. This repository is
 # PUBLIC, so this file stays local — keep it out of any commit.
 communication_context.md
+
+# Python bytecode from distribution-docs/generate.py
+__pycache__/
+*.pyc
