@@ -2,7 +2,7 @@
 // @name         ADP — Historical Data Bot
 // @namespace    https://workforcenow.adp.com/
 // @author       Rohit Kaushik
-// @version      1.18.1
+// @version      1.19.0
 // @description  Downloads one consolidated Payroll History file per prior calendar year from ADP Workforce Now.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -2479,6 +2479,17 @@
   // ───────────────────────── Audit Trail (quarterly) ─────────────────────────
 
   // Quarters of last year + current year, future quarters skipped; MM/DD/YYYY.
+  //
+  // The quarter in progress is included, because waiting for it to close would
+  // leave the most recent weeks uncollectable for a client migrating mid-
+  // quarter. But it is only ever partial, so it gets the same two defences the
+  // year path already uses (see yearDateRange / yearLabel):
+  //
+  //   • `to` stops at today. Asking ADP for a range running to 12/31 is not a
+  //     range the report is meant to take, and there is no data there yet.
+  //   • the label carries '-to-date', so Q4-2026-to-date.xlsx cannot be read as
+  //     a whole quarter — by a person, or by the Historical Data tracker, which
+  //     marks a report Present off the file name alone.
   function auditQuarters() {
     const now = new Date();
     const out = [];
@@ -2486,11 +2497,15 @@
       for (let q = 0; q < 4; q++) {
         const from = new Date(y, q * 3, 1);
         if (from > now) break;
-        const to = new Date(y, q * 3 + 3, 0);
+        const end = new Date(y, q * 3 + 3, 0);
+        const partial = end > now;
+        const to = partial ? now : end;
         out.push({
-          label: 'Q' + (q + 1) + '-' + y, // file-name convention: Q1-2025
+          // file-name convention: Q1-2025, and Q4-2026-to-date while running
+          label: 'Q' + (q + 1) + '-' + y + (partial ? '-to-date' : ''),
           from: pad2(from.getMonth() + 1) + '/' + pad2(from.getDate()) + '/' + y,
-          to: pad2(to.getMonth() + 1) + '/' + pad2(to.getDate()) + '/' + y,
+          to: pad2(to.getMonth() + 1) + '/' + pad2(to.getDate()) + '/' + to.getFullYear(),
+          partial: partial,
         });
       }
     }
@@ -2947,8 +2962,9 @@
     const quarters = auditQuarters();
     const picked = await showItemPickDialog({
       title: 'Audit Trail — choose quarter(s)',
-      hint: 'One .xlsx per quarter. Untick the quarters you already downloaded. Skipped automatically if this employer has no Audit Trail access.',
-      items: quarters.map(q => q.label + '   (' + q.from + ' → ' + q.to + ')'),
+      hint: 'One .xlsx per quarter. Untick the quarters you already downloaded. Skipped automatically if this employer has no Audit Trail access. A quarter marked "still running" stops at today and will need pulling again once it closes.',
+      items: quarters.map(q => q.label + '   (' + q.from + ' → ' + q.to + ')' +
+                               (q.partial ? '   — still running' : '')),
       storageKey: AUDIT_KEY,
     });
     if (picked === null) { setStatus('Cancelled'); logInfo('Quarter selection cancelled'); return; }
