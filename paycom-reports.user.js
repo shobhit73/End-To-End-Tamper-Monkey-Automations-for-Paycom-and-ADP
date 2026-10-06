@@ -20,7 +20,7 @@
           return GM_info.script.version;
         }
       } catch (_) { }
-      return '0.23.1';
+      return '0.27.0';
     })();
 
     const STATE_KEY = 'paycomBot.state';

@@ -24,7 +24,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '1.7.1';
+    return '1.10.3';
   })();
 
   // ───────────────── column lists (verbatim from v9.2 ADP Multi-Mode Assistant) ─────────────────

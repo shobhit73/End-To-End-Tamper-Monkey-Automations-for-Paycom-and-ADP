@@ -20,7 +20,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '0.34.1';
+    return '0.35.0';
   })();
 
   // ── Duplicate-instance guards ──
