@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.26.0
+  // @version      0.27.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable, persistent per-document run log + CSV export)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -2938,6 +2938,7 @@
     // Set by setupDocDownloader() once its controls mount on the Doc Dashboard.
     let docsStartFresh = null;     // start a fresh document download run
     let docsResume = null;         // resume an interrupted run
+    let docsStartFromPage = null;  // start a run at a page the user names
     let docsRunAfterReload = null; // continue a run after Apply Filters reloaded the page
     let docsStop = null;           // abort an in-flight run (wired to Stop / reset)
 
@@ -3169,6 +3170,31 @@
         downloadText(logToCsv(bad), 'paycom_dl_FAILED_' + stamp() + '.csv');
       }
 
+      // Same exports, but written to disk WITHOUT anyone clicking and without
+      // alert() on an empty log. A document run goes overnight: the summary
+      // dialog and the export buttons are useless at 3am, so whatever happened
+      // has to already be a file in Downloads by morning. Called from runEnd,
+      // which runs in a finally — so a stall, a stop or a crash still leaves
+      // the evidence behind.
+      function autoExportLogs(tag) {
+        try {
+          logFlush(true);
+          const entries = logAll();
+          if (!entries.length) return;
+          const when = stamp();
+          downloadText(logToCsv(entries), 'paycom_dl_log_' + tag + '_' + when + '.csv');
+          const bad = entries.filter((e) => e.s !== 'ok');
+          if (bad.length) {
+            downloadText(logToCsv(bad), 'paycom_dl_FAILED_' + tag + '_' + when + '.csv');
+          }
+          const runs = runsRead();
+          if (runs.length) downloadText(runsToCsv(runs), 'paycom_dl_runs_' + tag + '_' + when + '.csv');
+          console.log('[DL] Auto-saved log CSV(s) to Downloads');
+        } catch (e) {
+          console.warn('[DL] Auto-export of the log failed:', e);
+        }
+      }
+
       // ── run-summary bookkeeping ──
       function runStart(state) {
         currentRunId = 'run_' + stamp();
@@ -3197,6 +3223,8 @@
           runsWrite(runs);
         }
         console.log(`[DL] ── run ${currentRunId} ended: ${status} ──`);
+        // Write the log to disk every time a run ends, however it ended.
+        autoExportLogs(String(status).replace(/[^\w-]+/g, '-').slice(0, 24) || 'end');
       }
 
       // Last-ditch flush if the tab is closed or navigates away mid-run.
@@ -3245,6 +3273,16 @@
       const getCurrentPage = () => {
         const el = document.querySelector('#ee-doc-table_paginate .paginate_button.current');
         return el ? parseInt(el.textContent, 10) : 1;
+      };
+      // Highest page number the pager shows. DataTables renders only a window
+      // of buttons ("1 2 3 … 207"), and the last numbered one is the real
+      // total, so this is right even when the middle is elided. 0 = unknown,
+      // in which case the caller must not treat it as a limit.
+      const getTotalPages = () => {
+        const nums = Array.from(document.querySelectorAll('#ee-doc-table_paginate .paginate_button'))
+          .map((b) => parseInt((b.textContent || '').trim(), 10))
+          .filter((n) => isFinite(n));
+        return nums.length ? Math.max.apply(null, nums) : 0;
       };
       function escHtml(s) {
         return String(s ?? '')
@@ -3770,6 +3808,11 @@
         return b;
       };
       const resumeBtn = mkBtn('', '#e67e22'); resumeBtn.style.display = 'none';
+      // Resume only exists while a half-finished run is still saved, and that
+      // state is wiped on completion AND on Stop/reset. A run that ends on
+      // page 148 of 207 then has no way back except redoing all 147 pages, so
+      // this starts at any page the user names.
+      const fromPageBtn = mkBtn('⏭ Start from page…', '#8e44ad');
       const pauseBtn = mkBtn('⏸  Pause', '#7f8c8d'); pauseBtn.style.display = 'none';
 
       // Persistent-log controls. These stay useful after a run ends (or dies)
@@ -3783,6 +3826,7 @@
 
       container.appendChild(statusEl);
       container.appendChild(resumeBtn);
+      container.appendChild(fromPageBtn);
       container.appendChild(pauseBtn);
       container.appendChild(logInfoEl);
       container.appendChild(exportBtn);
@@ -3885,6 +3929,28 @@
           runWith(s);
         } finally { starting = false; }
       };
+      // Same as a fresh start, except the run begins on `page` instead of 1.
+      // The date filter is applied the same way, so the page numbering matches
+      // the run being continued — start it with the SAME year range as before,
+      // otherwise page 148 is a different page.
+      docsStartFromPage = async (page) => {
+        if (running || starting) return;
+        starting = true;
+        stopRequested = false;
+        try {
+          const range = readStoredRange() || computeFilterRange();
+          if (!range) { statusEl.textContent = 'Documents: cancelled'; return; }
+          clearDlState();
+          await applyLastModifiedFilter(range.from, range.to);
+          if (stopRequested) { statusEl.textContent = 'Documents: stopped'; return; }
+          try { localStorage.removeItem('paycomBot.docs.postFilterStart'); } catch (_) {}
+          const s = freshDlState();
+          s.currentPage = page;
+          saveDlState(s);
+          console.log('[DL] Starting from page ' + page);
+          runWith(s);
+        } finally { starting = false; }
+      };
       docsResume = async () => {
         if (running || starting) return;
         starting = true;
@@ -3921,6 +3987,27 @@
       };
 
       resumeBtn.addEventListener('click', () => docsResume());
+      fromPageBtn.addEventListener('click', () => {
+        const total = getTotalPages();
+        const answer = window.prompt(
+          'Start the document download from which page?' +
+          String.fromCharCode(10, 10) +
+          'Pick the page the previous run stopped on — everything from there to the' +
+          String.fromCharCode(10) +
+          'last page is downloaded. Use the SAME year range as that run, or the' +
+          String.fromCharCode(10) +
+          'page numbers will not line up.' +
+          (total ? String.fromCharCode(10, 10) + 'This view currently has ' + total + ' pages.' : ''),
+          '1');
+        if (answer === null) return;
+        const page = parseInt(String(answer).trim(), 10);
+        if (!isFinite(page) || page < 1) { alert('Enter a page number of 1 or more.'); return; }
+        if (total && page > total) {
+          alert('This view only has ' + total + ' pages.');
+          return;
+        }
+        docsStartFromPage(page);
+      });
 
       console.log('[Paycom DL] doc-downloader mounted on Doc Dashboard.');
     }
