@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ADP Workforce Now - Unified Automation (Reports + Export Documents)
 // @namespace    adp-doc-export-tools
-// @version      1.10.3
+// @version      1.11.13
 // @description  Reports automation (Download All, Census, SIT/FIT, License/EC, Tax Validation, Payroll History, Deduction, Direct Deposit, Qualified Overtime Wages and Tips) + Export Documents bot (auto-detect categories, sequential export, auto-download). One shared panel.
 // @match        https://workforcenow.adp.com/*
 // @noframes
@@ -24,7 +24,7 @@
         return GM_info.script.version;
       }
     } catch (_) { }
-    return '1.10.3';
+    return '1.11.13';
   })();
 
   // ───────────────── column lists (verbatim from v9.2 ADP Multi-Mode Assistant) ─────────────────
@@ -921,6 +921,20 @@
   async function stepClickWhatsDisplayed() {
     let target = null;
     for (let i = 0; i < 20 && !target; i++) {
+      // Strategy 0: ADP's own stable identity for the button — captured live:
+      //   <sdf-button id="whats-displayed-button" aria-label="What's Displayed
+      //   on the Report" …>. Text search below can grab a WRAPPER with
+      //   role="button" whose textContent merely CONTAINS the label (seen on
+      //   Time Off Balance Summary) — clicking that wrapper does nothing.
+      const byId = deepQueryAll(
+        '#whats-displayed-button, sdf-button[aria-label*="Displayed on the Report"]'
+      ).filter(visible)[0];
+      if (byId) {
+        target = byId;
+        logInfo('Found What\'s Displayed by its own id/aria-label');
+        break;
+      }
+
       // Strategy 1: find a clickable element whose text contains "What's Displayed"
       const clickables = deepQueryAll('a, button, [role="button"], [role="link"]').filter(visible);
       for (const el of clickables) {
@@ -966,9 +980,36 @@
     }
 
     logInfo('Found What\'s Displayed target:', target.tagName);
-    clickEl(target);
+    sdfComposedClick(target);
     logSuccess('Clicked "What\'s Displayed on the Report"');
     return true;
+  }
+
+  // One composed, coordinate-carrying synthetic click. Stencil <sdf-button>s
+  // need this: plain synthetic MouseEvents are composed:false (they never
+  // cross the shadow boundary) and clickEl's sequence carries no coordinates.
+  // Verified LIVE on the Time Off Balance Summary run page: this opens the
+  // field panel and toggles its Select All where clickEl does nothing. Ends
+  // with exactly ONE native .click() — two activations toggle a panel
+  // open-then-shut. Prefers the shadow root's inner native control when the
+  // component has one (some sdf-button builds render only a <div> inside).
+  function sdfComposedClick(target) {
+    let clickTarget = target;
+    try {
+      const inner = target.shadowRoot && target.shadowRoot.querySelector('button, [role="button"], a');
+      if (inner) clickTarget = inner;
+    } catch (_) { }
+    try { clickTarget.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch (_) { }
+    const rect = clickTarget.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+    const win = (clickTarget.ownerDocument && clickTarget.ownerDocument.defaultView) || window;
+    const opts = { bubbles: true, cancelable: true, composed: true, view: win, button: 0, clientX: cx, clientY: cy };
+    const PE = win.PointerEvent || win.MouseEvent;
+    const fire = (Ctor, type) => { try { clickTarget.dispatchEvent(new Ctor(type, Object.assign({ pointerId: 1, isPrimary: true }, opts))); } catch (_) { } };
+    fire(PE, 'pointerover'); fire(win.MouseEvent, 'mouseover');
+    fire(PE, 'pointerdown'); fire(win.MouseEvent, 'mousedown');
+    fire(PE, 'pointerup'); fire(win.MouseEvent, 'mouseup');
+    try { clickTarget.click(); } catch (_) { }
   }
 
   // Step P6b: on the "What's Displayed" panel, clear all defaults then select
@@ -1460,88 +1501,194 @@
     };
   }
 
+  // The slide-in field pane's shell is open (it has rendered its intro text)
+  // but none of the real panel controls ever mounted — the signature of the
+  // trusted-input-gated variant.
+  function tosPaneShellStuck() {
+    const pane = deepQueryAll('#runtimecard-slidein')[0];
+    return !!pane && ((pane.textContent || '').trim().length > 200) && !fieldPanelOpen();
+  }
+
+  // Best-effort close of a stuck half-open slide-in pane so the Appearance
+  // steps underneath become clickable again: its Cancel button, its Back
+  // link, and Escape — whichever responds.
+  async function tosCloseStuckFieldPane() {
+    for (let i = 0; i < 3; i++) {
+      const pane = deepQueryAll('#runtimecard-slidein')[0];
+      if (!pane) return true;
+      const cancel = deepQueryAll('#stdrptbtnCancel2ndSlider').filter(visible)[0];
+      const back = deepQueryAll('a, button, sdf-button, [role="button"]').filter(visible)
+        .find(el => /^(back|cancel)$/i.test((el.textContent || '').replace(/[^a-z]/gi, '')));
+      if (cancel) clickEl(cancel);
+      else if (back) sdfComposedClick(back);
+      try {
+        const doc = pane.ownerDocument || document;
+        const esc = { key: 'Escape', keyCode: 27, bubbles: true, composed: true };
+        doc.dispatchEvent(new KeyboardEvent('keydown', esc));
+        pane.dispatchEvent(new KeyboardEvent('keydown', esc));
+      } catch (_) { }
+      await sleep(1200);
+      if (!deepQueryAll('#runtimecard-slidein')[0]) { logInfo('Stuck field pane closed'); return true; }
+    }
+    logWarn('Could not confirm the field pane closed — continuing anyway');
+    return false;
+  }
+
+  // One standard Time Off report, end to end: navigate → Select All fields →
+  // Custom Date Range only → Run as Excel → auto-download from Reports Output
+  // under a client-prefixed name. Both Time Off reports share this exact
+  // shape, so one runner serves the pair. Returns true only when the file
+  // was actually saved. Step failures log + return false (the caller still
+  // tries the other report); only an abort throws.
+  async function runTimeOffStandardReport(REPORT, range, seq, setStatus, opts) {
+    logInfo('───── ' + REPORT + ' (' + seq + ') ─────');
+    const S = (msg) => setStatus('[' + seq + '] ' + msg);
+
+    S('Step 1: Opening Reports menu…');
+    checkAbort();
+    if (!await stepOpenReportsMenu()) { S('Step 1 failed — see log'); return false; }
+
+    S('Step 2: Navigating to All Standard Reports…');
+    checkAbort();
+    if (!await stepClickAllStandardReports()) { S('Step 2 failed — see log'); return false; }
+
+    S('Step 3: Searching for ' + REPORT + '…');
+    checkAbort();
+    if (!await stepSearchDojoReport(REPORT)) { S('Step 3 failed — see log'); return false; }
+
+    S('Step 4: Selecting ' + REPORT + '…');
+    checkAbort();
+    if (!await stepSelectStandardReportByTitle(REPORT)) { S('Step 4 failed — see log'); return false; }
+
+    S('Step 5: Waiting for Run Report page…');
+    checkAbort();
+    if (!await stepWaitForRunReportPage()) { S('Step 5 failed — see log'); return false; }
+
+    // stepWaitForRunReportPage returns as soon as the button TEXT appears, but
+    // ADP is still rendering. Clicking too early makes ADP treat it as a bot
+    // click and silently drop it, so wait for the page sections to populate
+    // and then settle before going on.
+    S('Step 5b: Waiting for report page to fully load…');
+    logInfo('Waiting for report sections to populate...');
+    // "Fully loaded" = BOTH section links exist AND have real geometry.
+    // During hydration they sit in the DOM at 0x0 (seen live) — a mere text
+    // match passes way too early, and clicks on zero-size targets go nowhere.
+    let sectionsReady = false;
+    for (let i = 0; i < 60; i++) { // up to ~30s
+      checkAbort();
+      let wd = false, ap = false;
+      for (const el of deepQueryAll('span, div, a, h3, sdf-button, sdf-link, button')) {
+        const t = (el.textContent || '').trim();
+        if (t !== 'What\'s Displayed on the Report' && t !== 'Appearance and Other Settings') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) { if (t.charAt(0) === 'W') wd = true; else ap = true; }
+        if (wd && ap) break;
+      }
+      if (wd && ap) { sectionsReady = true; break; }
+      if (i > 0 && i % 20 === 0) logInfo('Report page still loading… (' + (i / 2) + 's)');
+      await sleep(500);
+    }
+    if (sectionsReady) logSuccess('Report sections populated (with geometry)');
+    else logWarn('Report sections not confirmed after 30s — continuing anyway');
+    await sleep(5000); // generous settle so ADP finishes wiring its handlers
+
+    // ADP silently DROPS the "What's Displayed" click when the page isn't
+    // fully wired yet — and the section markers in step 5b can appear before
+    // the handlers do (one marker is the button's own text), so the settle is
+    // no guarantee. A dropped click means the panel never opens no matter how
+    // long we wait. So: click, give the panel 15s, and if it never showed,
+    // click again — up to 3 attempts, full 45s wait on the last.
+    let fieldsOk = false;
+    if (opts && opts.skipFieldPanel) {
+      // Field selection was saved manually once (Select All + Save) — ADP
+      // persists it per user+report, and this report's panel variant cannot
+      // be driven synthetically anyway (trusted-input-gated, proven live).
+      // Not opening the panel at all is faster AND safer: no stuck overlay.
+      logInfo('Skipping the field panel for ' + REPORT + ' — using the saved field selection (set once manually: Select All + Save)');
+      fieldsOk = true;
+    } else
+    for (let attempt = 1; attempt <= 3 && !fieldsOk; attempt++) {
+      checkAbort();
+      const panelAlreadyOpen = fieldPanelOpen();
+      if (!panelAlreadyOpen) {
+        S('Step 6: Opening "What\'s Displayed on the Report"' + (attempt > 1 ? ' (attempt ' + attempt + '/3)' : '') + '…');
+        if (attempt > 1) logInfo('Field panel never appeared — re-clicking "What\'s Displayed" (attempt ' + attempt + '/3)');
+        const clickedOk = await stepClickWhatsDisplayed();
+        if (!clickedOk && attempt === 1) { S('Step 6 failed — see log'); return false; }
+        // On a retry, "pencil not found" usually means the click DID land and
+        // the slide-in panel is open on top of it, still loading its content
+        // (seen live: the panel's controls mount several seconds after the
+        // overlay appears, and the open overlay hides the pencil). Keep
+        // waiting for the panel instead of giving up.
+        if (!clickedOk) logInfo('Pencil not found on retry — panel is likely open and still loading; waiting for it');
+        await sleep(1000);
+      }
+      S('Step 7: Selecting all fields…');
+      fieldsOk = await stepSelectAllDisplayFields(attempt < 3 ? 15 : 45);
+      // Fast-detect the TRUSTED-INPUT-GATED panel variant: the slide-in pane
+      // shell is open (heading + intro text present) but its field list never
+      // mounted. Proven live on Time Off Balance Summary: a synthetic click
+      // opens the shell, but the Select All / field rows mount ONLY on a real
+      // (isTrusted) user interaction, which a userscript cannot fake — no
+      // amount of waiting or re-clicking helps, so stop burning attempts.
+      if (!fieldsOk && tosPaneShellStuck()) {
+        logInfo('Slide-in pane shell is open but its content is input-gated — skipping further attempts');
+        break;
+      }
+    }
+    if (!fieldsOk) {
+      // Run the report anyway with its SAVED field selection — ADP persists
+      // "What's Displayed" choices per user+report, so a ONE-TIME manual
+      // Select All + Save on this report makes every later run complete.
+      logWarn('Field panel could not be driven on this page — running with the report\'s saved field selection. ' +
+        'One-time fix: open "What\'s Displayed on the Report" manually, click Select All, then Save; ADP remembers it for all future runs.');
+      await tosCloseStuckFieldPane();
+    }
+
+    S('Step 8: Opening Appearance settings…');
+    checkAbort();
+    await sleep(2000);
+    if (!await stepClickAppearanceSettings()) { S('Step 8 failed — see log'); return false; }
+
+    S('Step 9: Setting date range ' + range.from + ' → ' + range.to + '…');
+    checkAbort();
+    if (!await stepConfigureDateRangeOnly(range.from, range.to)) { S('Step 9 failed — see log'); return false; }
+
+    S('Step 10: Running report…');
+    checkAbort();
+    await sleep(1500);
+    if (!await stepClickRunAsExcel()) { S('Step 10 failed — see log'); return false; }
+
+    logSuccess(REPORT + ' triggered — waiting for it on Reports Output');
+    const saved = await downloadFinishedReport(REPORT, setStatus);
+    if (saved) logSuccess(REPORT + ' downloaded ✓');
+    else logWarn(REPORT + ' triggered, but not auto-downloaded — fetch it from Reports Output');
+    return saved;
+  }
+
+  // ONE button, TWO reports, strictly serial (mirrors the Paycom bot's
+  // Time-Off pair): Time Off Balance Summary runs and downloads first —
+  // exactly as before — and only then does the flow re-navigate and run
+  // the "Time Off Request" report the same way, with the same full-year range.
   async function downloadTimeOffBalanceSummary(setStatus) {
-    const REPORT = 'Time Off Balance Summary';
-    logInfo('=== Download ' + REPORT + ' ===');
+    logInfo('=== Download Time Off Balance Summary + Time Off Request ===');
     resetAbort();
 
     const range = tobsDateRange();
     logInfo('Date range (full year): ' + range.from + ' → ' + range.to);
 
     try {
-      setStatus('Step 1: Opening Reports menu…');
+      const ok1 = await runTimeOffStandardReport('Time Off Balance Summary', range, '1/2', setStatus);
       checkAbort();
-      if (!await stepOpenReportsMenu()) { setStatus('Step 1 failed — see log'); return; }
-
-      setStatus('Step 2: Navigating to All Standard Reports…');
-      checkAbort();
-      if (!await stepClickAllStandardReports()) { setStatus('Step 2 failed — see log'); return; }
-
-      setStatus('Step 3: Searching for ' + REPORT + '…');
-      checkAbort();
-      if (!await stepSearchDojoReport(REPORT)) { setStatus('Step 3 failed — see log'); return; }
-
-      setStatus('Step 4: Selecting ' + REPORT + '…');
-      checkAbort();
-      if (!await stepSelectStandardReportByTitle(REPORT)) { setStatus('Step 4 failed — see log'); return; }
-
-      setStatus('Step 5: Waiting for Run Report page…');
-      checkAbort();
-      if (!await stepWaitForRunReportPage()) { setStatus('Step 5 failed — see log'); return; }
-
-      // stepWaitForRunReportPage returns as soon as the button TEXT appears, but
-      // ADP is still rendering. Clicking too early makes ADP treat it as a bot
-      // click and silently drop it, so wait for the page sections to populate
-      // and then settle before going on.
-      setStatus('Step 5b: Waiting for report page to fully load…');
-      logInfo('Waiting for report sections to populate...');
-      let sectionsReady = false;
-      for (let i = 0; i < 30; i++) { // up to ~15s
-        checkAbort();
-        const allText = deepQueryAll('*').filter(visible);
-        for (const el of allText) {
-          const txt = (el.textContent || '').trim();
-          if (txt === 'Included Fields' || txt === 'Sort Order' ||
-            txt === 'What\'s Displayed on the Report' || txt.startsWith('All Employees')) {
-            sectionsReady = true; break;
-          }
-        }
-        if (sectionsReady) { logSuccess('Report sections populated'); break; }
-        await sleep(500);
-      }
-      await sleep(3000); // extra settle so ADP finishes wiring up the page
-
-      setStatus('Step 6: Opening "What\'s Displayed on the Report"…');
-      checkAbort();
-      if (!await stepClickWhatsDisplayed()) { setStatus('Step 6 failed — see log'); return; }
-      await sleep(1000);
-
-      setStatus('Step 7: Selecting all fields…');
-      checkAbort();
-      if (!await stepSelectAllDisplayFields()) { setStatus('Step 7 failed — see log'); return; }
-
-      setStatus('Step 8: Opening Appearance settings…');
-      checkAbort();
-      await sleep(2000);
-      if (!await stepClickAppearanceSettings()) { setStatus('Step 8 failed — see log'); return; }
-
-      setStatus('Step 9: Setting date range ' + range.from + ' → ' + range.to + '…');
-      checkAbort();
-      if (!await stepConfigureDateRangeOnly(range.from, range.to)) { setStatus('Step 9 failed — see log'); return; }
-
-      setStatus('Step 10: Running report…');
-      checkAbort();
-      await sleep(1500);
-      if (!await stepClickRunAsExcel()) { setStatus('Step 10 failed — see log'); return; }
-
-      logSuccess(REPORT + ' triggered — waiting for it on Reports Output');
-      const saved = await downloadFinishedReport(REPORT, setStatus);
-      setStatus(saved ? REPORT + ' downloaded ✓' : REPORT + ' triggered ✓ (download it from Reports Output)');
-      logSuccess('=== ' + REPORT + ' complete ===');
-
+      await sleep(3000); // settle on Reports Output before re-navigating
+      const ok2 = await runTimeOffStandardReport('Time Off Request', range, '2/2', setStatus);
+      setStatus(ok1 && ok2
+        ? 'Time Off reports (2/2) downloaded ✓'
+        : 'Time Off reports triggered ✓ — check Reports Output for any not auto-downloaded');
+      logSuccess('=== Time Off Balance Summary + Time Off Request complete ===');
     } catch (err) {
       if (err && err.aborted) {
-        setStatus(REPORT + ' aborted');
+        setStatus('Time Off reports aborted');
         logWarn('Flow aborted by user');
         return;
       }
@@ -2199,6 +2346,27 @@
 
   // Helper: click a VDL dropdown, then select an option by text
   async function selectVdlDropdownOption(dropdownText, optionText) {
+    // NATIVE <select> variant first (some Appearance panels, e.g. Time Off
+    // Request's slide-in, use a real <select>): its popup cannot be opened
+    // synthetically and its <option>s never match the custom-dropdown
+    // selectors below — set the value directly via the native setter.
+    const wantOpt = optionText.toLowerCase();
+    const wantCur = dropdownText.toLowerCase();
+    for (const sel of deepQueryAll('select').filter(visible)) {
+      const opts = Array.from(sel.options || []);
+      const cur = ((sel.selectedOptions && sel.selectedOptions[0] ? sel.selectedOptions[0].text : '') || '').trim().toLowerCase();
+      const target = opts.find(o => ((o.text || o.textContent || '').trim().toLowerCase()) === wantOpt);
+      if (!target || cur !== wantCur) continue;
+      try {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+        setter.call(sel, target.value);
+      } catch (_) { sel.value = target.value; }
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      logInfo('Selected "' + optionText + '" (native select)');
+      return true;
+    }
+
     // Find the dropdown by its current displayed text
     const dropdowns = deepQueryAll('.vdl-dropdown-list__input, [class*="dropdown"]').filter(visible);
     let dropdown = null;
@@ -2224,33 +2392,36 @@
       return false;
     }
 
-    // Click to open
+    // Click to open, then POLL for the option — the list can render a beat
+    // after the open click, and a long list keeps the wanted option below
+    // the scroll fold (scrollIntoView before clicking).
     clickEl(dropdown);
-    await sleep(500);
-
-    // Find and click the option
-    const options = deepQueryAll('li, [role="option"], [role="menuitem"], [class*="dropdown"] [class*="option"], .vdl-dropdown-list__option').filter(visible);
-    for (const opt of options) {
-      const text = (opt.textContent || '').trim().toLowerCase();
-      if (text === optionText.toLowerCase()) {
-        clickEl(opt);
-        logInfo('Selected "' + optionText + '" from dropdown');
-        return true;
+    for (let i = 0; i < 8; i++) {
+      await sleep(500);
+      const options = deepQueryAll('li, [role="option"], [role="menuitem"], option, [class*="dropdown"] [class*="option"], .vdl-dropdown-list__option').filter(visible);
+      for (const opt of options) {
+        const text = (opt.textContent || '').trim().toLowerCase();
+        if (text === optionText.toLowerCase()) {
+          try { opt.scrollIntoView({ block: 'nearest' }); } catch (_) { }
+          clickEl(opt);
+          logInfo('Selected "' + optionText + '" from dropdown');
+          return true;
+        }
+      }
+      // Fallback: search all visible elements for the option text
+      const allEls = deepQueryAll('span, div, li, a').filter(visible);
+      for (const el of allEls) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (text === optionText.toLowerCase() && el.closest('[class*="dropdown"], [role="listbox"], ul')) {
+          try { el.scrollIntoView({ block: 'nearest' }); } catch (_) { }
+          clickEl(el);
+          logInfo('Selected "' + optionText + '" (fallback)');
+          return true;
+        }
       }
     }
 
-    // Fallback: search all visible elements for the option text
-    const allEls = deepQueryAll('span, div, li, a').filter(visible);
-    for (const el of allEls) {
-      const text = (el.textContent || '').trim().toLowerCase();
-      if (text === optionText.toLowerCase() && el.closest('[class*="dropdown"], [role="listbox"], ul')) {
-        clickEl(el);
-        logInfo('Selected "' + optionText + '" (fallback)');
-        return true;
-      }
-    }
-
-    logError('Option "' + optionText + '" not found in dropdown');
+    logError('Option "' + optionText + '" not found in dropdown (waited 4s)');
     return false;
   }
 
@@ -2454,16 +2625,38 @@
   // Totals Only and Tax ID masking. This report wants ONLY the date range —
   // sorting, masking and grouping are left exactly as ADP had them.
 
-  // Open the field panel's "Select All", then Save.
-  async function stepSelectAllDisplayFields() {
+  // Is the field panel open? Detect by the panel's own Select All control —
+  // NOT by counting field checkboxes. A "> 3 fields" count silently fails on
+  // reports whose panel has only a few fields (Time Off Balance Summary on
+  // some clients): the panel WAS open, the bot declared it missing, and the
+  // retry's re-click then toggled the open panel shut.
+  function fieldPanelOpen() {
+    if (deepQueryAll('#stdrptlabel_selectAll').filter(visible).length > 0) return true;
+    if (deepQueryAll('.checkactionbubble-text').filter(visible).length > 3) return true;
+    // NEW sdf-style panel variant (seen live on Time Off Balance Summary):
+    // a "Select Fields to Display" heading with checkbox-style ☐Select All /
+    // ☐Clear All links and rounded field rows — none of the classic markers
+    // exist in it, which made the bot declare an OPEN panel missing (and the
+    // open overlay also hides the pencil button, hence "pencil not found" on
+    // the retry).
+    return deepQueryAll('h1, h2, h3, h4, div, span, p, legend, label')
+      .some(el => visible(el) && el.children.length === 0 &&
+        (el.textContent || '').trim() === 'Select Fields to Display');
+  }
+
+  // Open the field panel's "Select All", then Save. maxWaitSecs is the panel
+  // wait — callers that RE-CLICK "What's Displayed" on failure pass a short
+  // wait per attempt (a dropped click means the panel will NEVER come, so
+  // waiting the full 45s per attempt just burns time).
+  async function stepSelectAllDisplayFields(maxWaitSecs = 45) {
     let panelReady = false;
-    for (let i = 0; i < 20 && !panelReady; i++) {
-      const labels = deepQueryAll('.checkactionbubble-text').filter(visible);
-      if (labels.length > 3) { panelReady = true; break; }
+    for (let i = 0; i < maxWaitSecs * 2 && !panelReady; i++) {
+      if (fieldPanelOpen()) { panelReady = true; break; }
+      if (i > 0 && i % 20 === 0) logInfo('Field panel still loading… (' + (i / 2) + 's)');
       await sleep(500);
     }
     if (!panelReady) {
-      logError('Field selection panel did not load');
+      logError('Field selection panel did not load (waited ' + maxWaitSecs + 's)');
       return false;
     }
     logInfo('Field selection panel loaded');
@@ -2472,15 +2665,31 @@
     let clicked = false;
     const selectAllBtn = deepQueryAll('#stdrptlabel_selectAll')[0];
     if (selectAllBtn) {
-      clickEl(selectAllBtn);
+      // On the slide-in panel variant this is an <sdf-button> — it needs the
+      // composed click (clickEl's plain events never reach its handler).
+      sdfComposedClick(selectAllBtn);
       logSuccess('Clicked Select All');
       clicked = true;
     } else {
-      const alt = deepQueryAll('button, a, [role="button"]').filter(visible)
-        .find(el => normalize(el.textContent) === 'select all');
+      // Classic text fallback first; then the NEW sdf-panel variant, where
+      // "Select All" is a checkbox + label (not a button). Exact text match
+      // so "Clear All" and field rows are never grabbed; prefer the deepest
+      // matching node (a wrapper's textContent also equals "Select All"),
+      // and click its checkbox input when there is one.
+      const candidates = deepQueryAll('button, a, [role="button"], label, sdf-checkbox, span, div')
+        .filter(visible)
+        .filter(el => normalize(el.textContent) === 'select all')
+        .sort((x, y) => x.querySelectorAll('*').length - y.querySelectorAll('*').length);
+      const alt = candidates[0];
       if (alt) {
-        clickEl(alt);
-        logSuccess('Clicked Select All (matched by text)');
+        let cb = null;
+        try {
+          cb = alt.querySelector('input[type="checkbox"]')
+            || (alt.closest('label, sdf-checkbox') && alt.closest('label, sdf-checkbox').querySelector('input[type="checkbox"]'))
+            || (alt.parentElement && alt.parentElement.querySelector('input[type="checkbox"]'));
+        } catch (_) { }
+        clickEl(cb || alt);
+        logSuccess('Clicked Select All (' + (cb ? 'checkbox variant' : 'matched by text') + ')');
         clicked = true;
       }
     }
@@ -2490,6 +2699,15 @@
     }
     await sleep(1200);
 
+    // Slide-in panel variant's Save has a stable id (#stdrptbtnApply —
+    // captured live); fall back to the text match for the classic panel.
+    const applyBtn = deepQueryAll('#stdrptbtnApply').filter(visible)[0];
+    if (applyBtn) {
+      clickEl(applyBtn);
+      logSuccess('Clicked Save — all fields selected');
+      await sleep(1200);
+      return true;
+    }
     const buttons = deepQueryAll('button, sdf-button, [role="button"]').filter(visible);
     for (const btn of buttons) {
       if (normalize(btn.textContent) === 'save') {
@@ -2517,21 +2735,41 @@
     if (!ready) logWarn('Appearance page marker not seen — continuing anyway');
     await sleep(800);
 
-    // ADP shows a different default here per report, so try each known current
-    // value until one of the dropdowns responds.
+    // Guard: if the dropdown already shows "Custom Date Range" (e.g. a
+    // leftover from an earlier attempt in this same session), skip switching.
     logInfo('Setting Request Period to Custom Date Range');
-    let periodSet = false;
-    for (const current of ['Last 30 Days', 'Last 30', 'Year-to-Date', 'Custom Date', 'Current']) {
-      if (await selectVdlDropdownOption(current, 'Custom Date Range')) { periodSet = true; break; }
+    const alreadyCustom = deepQueryAll('.vdl-dropdown-list__input, [class*="dropdown"]').filter(visible)
+      .some(dd => (dd.textContent || '').trim().toLowerCase() === 'custom date range');
+    let periodSet = alreadyCustom;
+    if (alreadyCustom) {
+      logInfo('Request Period already shows Custom Date Range — no switch needed');
+    } else {
+      // ADP shows a different default here per report, so try each known
+      // current value until one of the dropdowns responds.
+      for (const current of ['Last 30 Days', 'Last 30', 'Year-to-Date', 'Custom Date', 'Current']) {
+        if (await selectVdlDropdownOption(current, 'Custom Date Range')) { periodSet = true; break; }
+      }
     }
     if (!periodSet) logError('Could not switch Request Period to Custom Date Range');
     await sleep(1500);
 
     logInfo('Setting date range: ' + fromDate + ' to ' + toDate);
-    const dateInputs = deepQueryAll('input').filter(visible).filter(inp => {
-      const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
-      return ph.includes('mm/dd/yyyy') || ph.includes('mm/dd');
-    });
+    // The two date inputs normally carry an mm/dd/yyyy placeholder — but in
+    // the remembered-Custom-Date-Range state they can render with VALUES and
+    // no placeholder, so fall back to finding them by value. Poll briefly:
+    // they mount a beat after the dropdown settles.
+    let dateInputs = [];
+    for (let i = 0; i < 16 && dateInputs.length < 2; i++) {
+      dateInputs = deepQueryAll('input').filter(visible).filter(inp => {
+        const ph = (inp.getAttribute('placeholder') || '').toLowerCase();
+        return ph.includes('mm/dd/yyyy') || ph.includes('mm/dd');
+      });
+      if (dateInputs.length < 2) {
+        dateInputs = deepQueryAll('input').filter(visible)
+          .filter(inp => /^\d{2}\/\d{2}\/\d{4}$/.test((inp.value || '').trim()));
+      }
+      if (dateInputs.length < 2) await sleep(500);
+    }
 
     if (dateInputs.length >= 2) {
       dateInputs[0].focus();
