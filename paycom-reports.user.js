@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.27.0
+  // @version      0.28.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable, persistent per-document run log + CSV export)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -20,7 +20,7 @@
           return GM_info.script.version;
         }
       } catch (_) { }
-      return '0.27.0';
+      return '0.28.0';
     })();
 
     const STATE_KEY = 'paycomBot.state';
@@ -1655,6 +1655,51 @@
       );
     }
 
+    // The Mantle Schedule Dates view renders each quarter as an EXPANSION
+    // PANEL and opens only the current quarter by default — so the scraper
+    // (visible cards only) would read just that quarter. Expand every
+    // collapsed one before scraping. The header is the OUTER
+    // <div role="button" aria-expanded="false"> containing a <p>"Quarter N";
+    // the chevron inside is its own aria-hidden role="button" decoy — never
+    // click it. Its CSS classes are JSS-generated (jsspayroll-setupNNN) and
+    // unstable, so key ONLY on aria-expanded + the label text. Clicking only
+    // aria-expanded="false" headers also guarantees we never toggle the
+    // already-open quarter shut. Legacy table clients have no such headers —
+    // this is a no-op there.
+    async function expandAllQuarterPanels() {
+      const collapsedHeaders = () =>
+        Array.from(document.querySelectorAll('[role="button"][aria-expanded="false"]'))
+          .filter(visible)
+          .filter(h => Array.from(h.querySelectorAll('p'))
+            .some(p => /^Quarter\s+[1-4]$/i.test((p.textContent || '').trim())));
+      let expanded = 0;
+      for (let pass = 0; pass < 8; pass++) { // re-query per click — React re-renders replace nodes
+        const closed = collapsedHeaders();
+        if (!closed.length) break;
+        const h = closed[0];
+        const label = ((h.textContent || '').match(/Quarter\s+[1-4]/i) || ['quarter section'])[0];
+        log(`Expanding collapsed ${label} panel`);
+        const cardsBefore = scrapeMantleSchedule().length;
+        robustClick(h);
+        try {
+          await waitFor(
+            () => h.getAttribute('aria-expanded') === 'true'
+              || scrapeMantleSchedule().length > cardsBefore,
+            { timeout: 6000, interval: 250, label: label + ' panel to expand' }
+          );
+          expanded++;
+        } catch (err) {
+          if (err && err.aborted) throw err;
+          log(`${label} panel did not expand — continuing with the rest`);
+        }
+        await sleep(400); // let the panel's cards finish rendering
+      }
+      if (expanded) {
+        log(`Expanded ${expanded} quarter panel(s)`);
+        await sleep(600); // settle before the scrape
+      }
+    }
+
     // Open "Schedule Dates" on whichever schedule-editor UI we landed on, wait
     // for it to render, make sure the current-year tab is active, and scrape
     // the pay periods. Shared by Prior Payroll and Garnishment — both need
@@ -1710,6 +1755,7 @@
       }
 
       await ensureCurrentYearTab();
+      await expandAllQuarterPanels();
 
       const periods = scrapePayrollSchedule();
       log(`Scraped ${periods.length} pay periods (year=${new Date().getFullYear()})`);
@@ -1829,7 +1875,14 @@
     // file as PriorPayroll_<dates>.csv — the fetch completing IS the
     // "download done" signal, so the caller moves to the next task immediately.
     async function ppDownloadReportFile(task, downloadBtn) {
-      const fileName = downloadFileName(task);
+      return downloadQueueFileAs(downloadBtn, downloadFileName(task), 'PP');
+    }
+
+    // Shared by Prior Payroll and the Time-Off pair. Saving via our own fetch
+    // + blob <a download> ALWAYS starts the browser download (and pre-fills
+    // the Save dialog when "ask where to save" is on) — unlike Paycom's own
+    // Download-click handler, which silently does nothing for some reports.
+    async function downloadQueueFileAs(downloadBtn, fileName, tag) {
       const nonce = getSessionNonce();
       if (!nonce) throw new Error('Could not find session_nonce on the page');
 
@@ -1838,9 +1891,9 @@
       let capturedTransid = rowMatch ? rowMatch[1] : '';
 
       if (capturedTransid) {
-        log(`PP: transid=${capturedTransid} read directly from the queue row's own id — no click needed`);
+        log(`${tag}: transid=${capturedTransid} read directly from the queue row's own id — no click needed`);
       } else {
-        log('PP: queue row id not found (unexpected layout) — falling back to click + intercept');
+        log(`${tag}: queue row id not found (unexpected layout) — falling back to click + intercept`);
         const proto = window.XMLHttpRequest.prototype;
         const origOpen = proto.open;
         const origSend = proto.send;
@@ -1852,7 +1905,7 @@
           if (/one-time-password/i.test(this.__ppUrl || '')) {
             const m = (this.__ppUrl || '').match(/transid=(\d+)/i);
             if (m) capturedTransid = m[1];
-            log(`PP: captured transid=${capturedTransid} from one-time-password XHR; ` +
+            log(`${tag}: captured transid=${capturedTransid} from one-time-password XHR; ` +
               `aborting it to suppress Paycom's own (default-named) download`);
             const r = origSend.apply(this, args);
             try { this.abort(); } catch (_) {}
@@ -1869,8 +1922,8 @@
         } catch (waitErr) {
           if (waitErr && waitErr.aborted) throw waitErr;
           const e = new Error('No queue-row id and no one-time-password XHR fired for this report — '
-            + 'could not determine its transid. Check Downloads for a "…Employee_YTD_Balances_Report…" '
-            + 'file and rename it by hand if needed.');
+            + 'could not determine its transid. Check Downloads for a file saved under Paycom\'s '
+            + 'default name and rename it by hand if needed.');
           e.otpNotFired = true;
           throw e;
         } finally {
@@ -1880,7 +1933,7 @@
 
       const url = 'https://www.paycomonline.net/v4/cl/rpt-generateproc.php'
         + `?session_nonce=${encodeURIComponent(nonce)}&download=1&transid=${encodeURIComponent(capturedTransid)}`;
-      log(`PP: fetching report file directly (transid=${capturedTransid})`);
+      log(`${tag}: fetching report file directly (transid=${capturedTransid})`);
 
       const ctrl = new AbortController();
       const killer = setTimeout(() => ctrl.abort(), 180000); // 3-min safety cap
@@ -1906,7 +1959,7 @@
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
-      log(`PP: saved "${fileName}" (${blob.size} bytes)`);
+      log(`${tag}: saved "${fileName}" (${blob.size} bytes)`);
     }
 
     async function ppHandleReportPage() {
@@ -2456,30 +2509,37 @@
       }
     }
 
-    // ───────────────── Time-Off Summary (rpt_id=186) ─────────────────
-    // Year-to-date only: 01/01 of the CURRENT year → today. Both ends are
-    // derived from the system clock, so the range rolls forward on its own
-    // each January and nothing here is ever hardcoded. (The historical bot
-    // pulls this same report for a wider window; that flow is untouched.)
+    // ───────────────── Time-Off Summary (rpt_id=186) + Time-Off Audit (rpt_id=182) ─────────────────
+    // ONE button, TWO reports, strictly serial: the Summary report runs and
+    // downloads first; only after its Download button has appeared and been
+    // clicked does the flow navigate on to the Audit report page and repeat.
+    // Both use the same full-current-year range: 01/01 → 12/31 of the CURRENT
+    // year (matching the ADP bot's Time Off Balance Summary), the year taken
+    // from the system clock so the range rolls forward on its own each
+    // January — nothing here is ever hardcoded. (The historical bot pulls
+    // these same reports for a wider window; that flow is untouched.)
 
     const TOS_STATE_KEY = 'paycomBot.tos.state';
     const TOS_STATES = {
       IDLE: 'IDLE',
-      AT_REPORT: 'TOS_AT_REPORT',
+      AT_REPORT: 'TOS_AT_REPORT',   // report 1/2: Time-Off Summary (186)
+      AT_AUDIT: 'TOS_AT_AUDIT',     // report 2/2: Time-Off Audit (182)
     };
     const TOS_CONFIG = {
-      reportId: 186,
+      reportId: 186,       // Time-Off Summary
+      auditReportId: 182,  // Time-Off Audit (same id the Historical bot uses)
     };
     const tosReportUrl = () =>
       `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${TOS_CONFIG.reportId}`;
+    const tosAuditUrl = () =>
+      `https://www.paycomonline.net/v4/cl/rpt-generate.php?rpt_id=${TOS_CONFIG.auditReportId}`;
 
-    // { from: '01/01/<this year>', to: '<today>' } in Paycom's MM/DD/YYYY.
+    // { from: '01/01/<this year>', to: '12/31/<this year>' } in MM/DD/YYYY.
     function tosDateRange() {
-      const d = new Date();
-      const p2 = (n) => String(n).padStart(2, '0');
+      const year = new Date().getFullYear();
       return {
-        from: `01/01/${d.getFullYear()}`,
-        to: `${p2(d.getMonth() + 1)}/${p2(d.getDate())}/${d.getFullYear()}`,
+        from: `01/01/${year}`,
+        to: `12/31/${year}`,
       };
     }
 
@@ -2503,18 +2563,21 @@
       dispatch();
     }
 
-    async function tosHandleReportPage() {
-      showProgressBanner('Time-Off Summary: loading report form…');
-      log('TOS: waiting for report form');
+    // Fill the (shared-shape) report form, generate, wait for the Download
+    // button, click it. Used verbatim by BOTH Time-Off reports — their
+    // rpt-generate pages have identical controls. Returns the range used.
+    async function tosFillGenerateAndDownload(label, fileBase) {
+      showProgressBanner(label + ': loading report form…');
+      log(`TOS: waiting for ${label} report form`);
       await waitFor(
         () => findDateRangeInputs() || findGenerateReportButton(),
-        { timeout: 20000, label: 'Time-Off Summary report form' }
+        { timeout: 20000, label: label + ' report form' }
       );
       await sleep(500); // settle so the date fields are wired up
 
       const range = tosDateRange();
       const dr = findDateRangeInputs();
-      if (!dr) throw new Error('TOS: Date Range inputs not found');
+      if (!dr) throw new Error(label + ': Date Range inputs not found');
       log(`TOS: setting From=${range.from}, To=${range.to}`);
       setInputValue(dr.from, range.from);
       setInputValue(dr.to, range.to);
@@ -2554,46 +2617,70 @@
       log(`TOS: initial Download buttons before generate: ${initialDownloads}`);
 
       const genBtn = findGenerateReportButton();
-      if (!genBtn) throw new Error('TOS: Generate Report button not found');
-      log('TOS: clicking Generate Report');
-      showProgressBanner('Time-Off Summary: generating…');
+      if (!genBtn) throw new Error(label + ': Generate Report button not found');
+      log(`TOS: clicking Generate Report (${label})`);
+      showProgressBanner(label + ': generating…');
       clickEl(genBtn);
 
-      log('TOS: waiting for Download button (up to 10 min)');
+      log(`TOS: waiting for ${label} Download button (up to 10 min)`);
       await waitFor(
         () => getDownloadButtons().length > initialDownloads,
-        { timeout: 10 * 60 * 1000, interval: 800, label: 'Time-Off Summary Download' }
+        { timeout: 10 * 60 * 1000, interval: 800, label: label + ' Download' }
       );
 
       const downloads = getDownloadButtons();
       downloads.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-      log('TOS: clicking newest Download button');
-      clickEl(downloads[0]);
+      // Don't trust Paycom's own Download-click handler — it silently does
+      // nothing for some reports (no Save dialog, no file). Read the queue
+      // row's transid and fetch the file ourselves instead; the fetch
+      // completing IS the "download done" signal, so the caller can move
+      // straight on to the next report.
+      const fileName = `${fileBase}_${new Date().getFullYear()}.xlsx`;
+      log(`TOS: downloading via queue-row transid as "${fileName}" (${label})`);
+      await downloadQueueFileAs(downloads[0], fileName, 'TOS');
+      return range;
+    }
 
-      await sleep(1500);
+    // Report 1/2 — Time-Off Summary. Once ITS file is downloading, hand off
+    // to the Audit report via a full navigation; the dispatcher resumes there.
+    async function tosHandleReportPage() {
+      const range = await tosFillGenerateAndDownload('Time-Off Summary (1/2)', 'TimeOffSummary');
+      showSuccessBanner(`✓ Time-Off Summary downloaded (${range.from} → ${range.to}) — starting Time-Off Audit…`);
+      setTosState(TOS_STATES.AT_AUDIT);
+      location.href = tosAuditUrl();
+    }
+
+    // Report 2/2 — Time-Off Audit. Same form, different rpt_id; finishes the run.
+    async function tosHandleAuditPage() {
+      const range = await tosFillGenerateAndDownload('Time-Off Audit (2/2)', 'TimeOffAudit');
       hideProgressBanner();
-      showSuccessBanner(`✓ Time-Off Summary downloaded (${range.from} → ${range.to})`);
+      showSuccessBanner(`✓ Time-Off Summary + Time-Off Audit downloaded (${range.from} → ${range.to})`);
       setTosState(TOS_STATES.IDLE);
     }
 
     async function dispatchTimeOffSummary() {
       if (!isTosRunning()) return;
       dismissPrivacyBanner();
-      showProgressBanner('Time-Off Summary: opening report page…');
+      const st = getTosState();
       const url = location.href;
-      log('TOS dispatch on', location.pathname);
+      log('TOS dispatch on', location.pathname, 'state=', st);
 
       // Distinguish from the other rpt-generate reports by rpt_id.
-      const onTosReport = url.includes('/rpt-generate.php') &&
-        /[?&]rpt_id=186(?:[&#]|$)/.test(url);
+      const onRptPage = (id) => url.includes('/rpt-generate.php') &&
+        new RegExp('[?&]rpt_id=' + id + '(?:[&#]|$)').test(url);
+      const onAudit = st === TOS_STATES.AT_AUDIT;
+      const wantedUrl = onAudit ? tosAuditUrl() : tosReportUrl();
+      const wantedId = onAudit ? TOS_CONFIG.auditReportId : TOS_CONFIG.reportId;
 
-      if (!onTosReport) {
-        location.href = tosReportUrl();
+      showProgressBanner((onAudit ? 'Time-Off Audit' : 'Time-Off Summary') + ': opening report page…');
+      if (!onRptPage(wantedId)) {
+        location.href = wantedUrl;
         return;
       }
 
       try {
-        await tosHandleReportPage();
+        if (onAudit) await tosHandleAuditPage();
+        else await tosHandleReportPage();
       } catch (err) {
         if (err.aborted) { log('TOS aborted by user'); hideProgressBanner(); return; }
         hideProgressBanner();
