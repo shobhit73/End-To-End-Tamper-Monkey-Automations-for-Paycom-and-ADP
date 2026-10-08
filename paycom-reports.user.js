@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.29.0
+  // @version      0.29.1
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable, persistent per-document run log + CSV export)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -20,7 +20,7 @@
           return GM_info.script.version;
         }
       } catch (_) { }
-      return '0.29.0';
+      return '0.29.1';
     })();
 
     const STATE_KEY = 'paycomBot.state';
@@ -3401,19 +3401,35 @@
       // has to already be a file in Downloads by morning. Called from runEnd,
       // which runs in a finally — so a stall, a stop or a crash still leaves
       // the evidence behind.
-      function autoExportLogs(tag) {
+      // Writes ONLY what this run produced, and as few files as will do:
+      //   a scan      -> one SCAN csv, the inventory it just took
+      //   a download  -> the log, plus a FAILED csv only if THIS run failed
+      //                  anything
+      // The first version dumped three files after every run — full log,
+      // failures and run history — which after a scan meant two files that
+      // had nothing to do with the scan (a FAILED list left over from older
+      // runs, and the run history). Run history is still one click away under
+      // "Export log CSV".
+      function autoExportLogs(tag, runId, scanOnly) {
         try {
           logFlush(true);
-          const entries = logAll();
-          if (!entries.length) return;
+          const all = logAll();
+          if (!all.length) return;
+          const mine = runId ? all.filter((e) => e.run === runId) : all;
+          if (!mine.length) return;
           const when = stamp();
-          downloadText(logToCsv(entries), 'paycom_dl_log_' + tag + '_' + when + '.csv');
-          const bad = entries.filter(isFailure);
+
+          if (scanOnly) {
+            downloadText(logToCsv(mine), 'paycom_dl_SCAN_' + when + '.csv');
+            console.log('[DL] Auto-saved the scan CSV to Downloads');
+            return;
+          }
+
+          downloadText(logToCsv(all), 'paycom_dl_log_' + tag + '_' + when + '.csv');
+          const bad = mine.filter(isFailure);
           if (bad.length) {
             downloadText(logToCsv(bad), 'paycom_dl_FAILED_' + tag + '_' + when + '.csv');
           }
-          const runs = runsRead();
-          if (runs.length) downloadText(runsToCsv(runs), 'paycom_dl_runs_' + tag + '_' + when + '.csv');
           console.log('[DL] Auto-saved log CSV(s) to Downloads');
         } catch (e) {
           console.warn('[DL] Auto-export of the log failed:', e);
@@ -3448,8 +3464,11 @@
           runsWrite(runs);
         }
         console.log(`[DL] ── run ${currentRunId} ended: ${status} ──`);
-        // Write the log to disk every time a run ends, however it ended.
-        autoExportLogs(String(status).replace(/[^\w-]+/g, '-').slice(0, 24) || 'end');
+        // Write this run's log to disk every time a run ends, however it ended.
+        autoExportLogs(
+          String(status).replace(/[^\w-]+/g, '-').slice(0, 24) || 'end',
+          currentRunId,
+          !!state.scanOnly);
       }
 
       // Last-ditch flush if the tab is closed or navigates away mid-run.
@@ -3818,11 +3837,12 @@
               `Scan done: ${state.scanned || 0} rows listed, ` +
               `${state.skippedDocs.length} with no file link`;
             alert(
-              'Scan finished.' + String.fromCharCode(10, 10) +
+              'Scan finished. Nothing was downloaded except the list itself.' +
+              String.fromCharCode(10, 10) +
               'Rows listed in the grid: ' + (state.scanned || 0) + String.fromCharCode(10) +
               'Of those, with no file link: ' + state.skippedDocs.length + String.fromCharCode(10, 10) +
-              'The full list is in the auto-saved log CSV. After the download run,' + String.fromCharCode(10) +
-              'use "Compare scan vs downloads".');
+              'Saved to Downloads as paycom_dl_SCAN_*.csv' + String.fromCharCode(10) +
+              'After the download run, use "Compare scan vs downloads".');
             return;
           }
           showSummary(state);
@@ -4326,6 +4346,8 @@
           'It walks the list exactly as it is filtered right now and records' + nl +
           'every row — employee, document, whether the row has a file link, and' + nl +
           'anything the grid flags on it such as "Missing".' + nl + nl +
+          'No documents are saved. At the end ONE file lands in Downloads:' + nl +
+          'paycom_dl_SCAN_<time>.csv, the list it just took.' + nl + nl +
           'Afterwards, "Compare scan vs downloads" tells you which documents' + nl +
           'are not on disk and why.' +
           (total ? nl + nl + 'This list currently has ' + total + ' pages.' : ''))) return;
