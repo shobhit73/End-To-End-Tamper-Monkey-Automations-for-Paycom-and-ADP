@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.28.0
+  // @version      0.28.1
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable, persistent per-document run log + CSV export)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -20,7 +20,7 @@
           return GM_info.script.version;
         }
       } catch (_) { }
-      return '0.28.0';
+      return '0.28.1';
     })();
 
     const STATE_KEY = 'paycomBot.state';
@@ -3039,26 +3039,84 @@
       })();
     }
 
-    // Ask the user which year to START from. The END date is always Dec 31 of
-    // the current year (auto-updates each year). Returns
+    // Parse one end of the "Last Modified" filter. Accepts either a bare year
+    // or a full date, because both are things people actually ask for:
+    //   '2022'       -> 01/01/2022 (from) or 12/31/2022 (to)
+    //   '09/01/2026' -> that exact day
+    //   '2026-09-01' -> the same day, ISO order
+    // Returns 'MM/DD/YYYY', or '' when the text is not a date we recognise.
+    function parseFilterDate(raw, which) {
+      const s = String(raw == null ? '' : raw).trim();
+      const pad = (n) => String(n).padStart(2, '0');
+      const yearOk = (y) => y >= 1990 && y <= new Date().getFullYear() + 1;
+      // Reject a day that does not exist (02/30) rather than letting Date roll
+      // it forward into March. A silently shifted filter is worse than a
+      // rejected one.
+      const realDate = (y, m, d) => {
+        const dt = new Date(y, m - 1, d);
+        return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+      };
+
+      let m = s.match(/^(\d{4})$/);
+      if (m) {
+        const y = +m[1];
+        if (!yearOk(y)) return '';
+        return which === 'to' ? `12/31/${y}` : `01/01/${y}`;
+      }
+      m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/); // MM/DD/YYYY
+      if (m) {
+        const mo = +m[1], d = +m[2], y = +m[3];
+        if (!yearOk(y) || !realDate(y, mo, d)) return '';
+        return `${pad(mo)}/${pad(d)}/${y}`;
+      }
+      m = s.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/); // YYYY-MM-DD
+      if (m) {
+        const y = +m[1], mo = +m[2], d = +m[3];
+        if (!yearOk(y) || !realDate(y, mo, d)) return '';
+        return `${pad(mo)}/${pad(d)}/${y}`;
+      }
+      return '';
+    }
+
+    // Ask for BOTH ends of the "Last Modified" filter. Returns
     // { from:'MM/DD/YYYY', to:'MM/DD/YYYY' } or null if the user cancels.
+    //
+    // This used to ask only for a start YEAR and always end at Dec 31 of the
+    // current year, so a narrow pull ("1 Sep to 31 Dec") was impossible - the
+    // whole year came down instead.
     function computeFilterRange() {
       const currentYear = new Date().getFullYear();
-      const toStr = `12/31/${currentYear}`;
-      const def = String(Math.max(1990, currentYear - 4));
-      while (true) {
+      const nl = String.fromCharCode(10);
+      const help = nl + 'Type a YEAR (2022) or a full date (09/01/2026).';
+
+      let from = '';
+      while (!from) {
         const raw = window.prompt(
-          'Download All Documents — enter the START YEAR for the "Last Modified" filter.\n' +
-          `From = 01/01/<year>, To = 12/31/${currentYear} (end of the current year).`,
-          def
-        );
+          'Download All Documents - FROM date for the "Last Modified" filter.' + help +
+          nl + 'A year here means 01/01 of that year.',
+          String(Math.max(1990, currentYear - 4)));
         if (raw === null) return null; // cancelled
-        const n = parseInt(String(raw).trim(), 10);
-        if (Number.isInteger(n) && n >= 1990 && n <= currentYear) {
-          return { from: `01/01/${n}`, to: toStr };
-        }
-        alert(`Please enter a 4-digit year between 1990 and ${currentYear}.`);
+        from = parseFilterDate(raw, 'from');
+        if (!from) alert('Could not read that. Enter a year (2022) or a date (09/01/2026).');
       }
+
+      let to = '';
+      while (!to) {
+        const raw = window.prompt(
+          'FROM = ' + from + nl + nl +
+          'Now the TO date.' + help +
+          nl + 'A year here means 12/31 of that year.',
+          `12/31/${currentYear}`);
+        if (raw === null) return null; // cancelled
+        to = parseFilterDate(raw, 'to');
+        if (!to) { alert('Could not read that. Enter a year (2026) or a date (12/31/2026).'); continue; }
+        const asNum = (d) => { const p = d.split('/'); return +(p[2] + p[0] + p[1]); };
+        if (asNum(to) < asNum(from)) {
+          alert('The TO date is before the FROM date (' + from + '). Enter a later date.');
+          to = '';
+        }
+      }
+      return { from, to };
     }
 
     // Entry point for the panel's "Download All Documents" button. Prompts for
@@ -4016,25 +4074,24 @@
           runWith(s);
         } finally { starting = false; }
       };
-      // Same as a fresh start, except the run begins on `page` instead of 1.
-      // The date filter is applied the same way, so the page numbering matches
-      // the run being continued — start it with the SAME year range as before,
-      // otherwise page 148 is a different page.
+      // Download the grid EXACTLY AS IT IS ON SCREEN, starting at `page`.
+      //
+      // Deliberately touches no filter: whatever is showing — the filter a
+      // previous run applied, or one the user set by hand in Paycom — is what
+      // gets downloaded. The first version re-applied the stored date range
+      // here, which silently overrode a hand-set filter and left nobody able
+      // to say what the button would actually pull. "What you see is what it
+      // downloads" keeps the page numbers meaning what they look like.
       docsStartFromPage = async (page) => {
         if (running || starting) return;
         starting = true;
         stopRequested = false;
         try {
-          const range = readStoredRange() || computeFilterRange();
-          if (!range) { statusEl.textContent = 'Documents: cancelled'; return; }
           clearDlState();
-          await applyLastModifiedFilter(range.from, range.to);
-          if (stopRequested) { statusEl.textContent = 'Documents: stopped'; return; }
-          try { localStorage.removeItem('paycomBot.docs.postFilterStart'); } catch (_) {}
           const s = freshDlState();
           s.currentPage = page;
           saveDlState(s);
-          console.log('[DL] Starting from page ' + page);
+          console.log('[DL] Starting from page ' + page + ' using the filter already on screen');
           runWith(s);
         } finally { starting = false; }
       };
@@ -4076,15 +4133,15 @@
       resumeBtn.addEventListener('click', () => docsResume());
       fromPageBtn.addEventListener('click', () => {
         const total = getTotalPages();
+        const nl = String.fromCharCode(10);
         const answer = window.prompt(
-          'Start the document download from which page?' +
-          String.fromCharCode(10, 10) +
-          'Pick the page the previous run stopped on — everything from there to the' +
-          String.fromCharCode(10) +
-          'last page is downloaded. Use the SAME year range as that run, or the' +
-          String.fromCharCode(10) +
-          'page numbers will not line up.' +
-          (total ? String.fromCharCode(10, 10) + 'This view currently has ' + total + ' pages.' : ''),
+          'Start downloading THIS list, from which page?' + nl + nl +
+          'It downloads exactly what is on screen right now. The filter already' + nl +
+          'applied here is used as-is and is NOT changed.' + nl + nl +
+          'So: set the Last Modified filter in Paycom first (or let a previous' + nl +
+          'run set it), then enter the page to start from. Everything from that' + nl +
+          'page to the last page is downloaded.' +
+          (total ? nl + nl + 'This list currently has ' + total + ' pages.' : ''),
           '1');
         if (answer === null) return;
         const page = parseInt(String(answer).trim(), 10);
