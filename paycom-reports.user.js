@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Paycom Daily Reports Automation
   // @namespace    https://www.paycomonline.net/
-  // @version      0.28.1
+  // @version      0.29.0
   // @description  Census report (full) + Prior Payroll YTD report (Mantle schedule page → confirm dialog → fill → generate → download as PriorPayroll_*.csv → loop, past quarters consolidated / current quarter per-pay-period) + Scheduled Deductions report (rpt_id=8) + Tax Profile report (rpt_id=15) + Doc Dashboard: Download All Documents (fetch→blob, paginated, resumable, persistent per-document run log + CSV export)
   // @match        https://www.paycomonline.net/v4/cl/*
   // @run-at       document-end
@@ -20,7 +20,7 @@
           return GM_info.script.version;
         }
       } catch (_) { }
-      return '0.28.1';
+      return '0.29.0';
     })();
 
     const STATE_KEY = 'paycomBot.state';
@@ -3026,6 +3026,7 @@
     let docsStartFresh = null;     // start a fresh document download run
     let docsResume = null;         // resume an interrupted run
     let docsStartFromPage = null;  // start a run at a page the user names
+    let docsScanAll = null;        // inventory every page, downloading nothing
     let docsRunAfterReload = null; // continue a run after Apply Filters reloaded the page
     let docsStop = null;           // abort an in-flight run (wired to Stop / reset)
 
@@ -3285,6 +3286,10 @@
         ['content_type',  (e) => e.ct || ''],
         ['attempts',      (e) => (e.a === undefined ? '' : e.a)],
         ['reason',        (e) => e.r || ''],
+        // Filled in by a scan: whether the row carried a download link at all,
+        // and anything the grid flagged on it ("Missing" etc.).
+        ['has_file_link', (e) => (e.u === undefined ? '' : (e.u ? 'yes' : 'NO'))],
+        ['grid_flags',    (e) => e.fl || ''],
       ];
       function logToCsv(entries) {
         const head = LOG_COLS.map((c) => c[0]).join(',');
@@ -3308,11 +3313,86 @@
         const runs = runsRead();
         if (runs.length) downloadText(runsToCsv(runs), 'paycom_dl_runs_' + stamp() + '.csv');
       }
+      // Only real failures: 'dup' is a non-event, and 'scan' rows are an
+      // inventory, not a problem list — both would bury the handful of rows
+      // someone actually has to look at.
+      const isFailure = (e) => e.s === 'fail';
+
       function exportFailedLog() {
         logFlush(true);
-        const bad = logAll().filter((e) => e.s !== 'ok');
+        const bad = logAll().filter(isFailure);
         if (!bad.length) { alert('No failed or skipped documents logged.'); return; }
         downloadText(logToCsv(bad), 'paycom_dl_FAILED_' + stamp() + '.csv');
+      }
+
+      // ── scan vs downloads ──
+      // Answers the only question that matters after a two-day run: of
+      // everything the grid listed, what is NOT on disk, and why.
+      //
+      // Matches on doc id, which is what both passes key on. Rows whose id
+      // could not be read fall back to employee + document + template.
+      function compareScanToDownloads() {
+        logFlush(true);
+        const all = logAll();
+        const scans = all.filter((e) => e.s === 'scan');
+        if (!scans.length) {
+          alert('No scan recorded yet.' + String.fromCharCode(10, 10) +
+            'Run "Scan all pages" first, then compare after the download run.');
+          return;
+        }
+        const key = (e) => (e.id && String(e.id).indexOf('noid-') !== 0)
+          ? 'id:' + e.id
+          : 'nm:' + (e.ec || '') + '|' + (e.dn || '') + '|' + (e.ft || '');
+
+        // Latest state per key from the download side.
+        const got = Object.create(null);
+        const failed = Object.create(null);
+        all.forEach((e) => {
+          if (e.s === 'ok') got[key(e)] = e;
+          else if (e.s === 'fail') failed[key(e)] = e;
+        });
+
+        // One row per document the scan saw, newest scan entry wins.
+        const seen = Object.create(null);
+        scans.forEach((e) => { seen[key(e)] = e; });
+
+        const rows = [];
+        let okCount = 0;
+        Object.keys(seen).forEach((k) => {
+          const s = seen[k];
+          const hit = got[k];
+          if (hit) { okCount++; return; }      // on disk, nothing to report
+          const f = failed[k];
+          let verdict, why;
+          if (!s.u) {
+            verdict = 'nothing to download';
+            why = s.fl ? ('row carries no file link — grid says ' + s.fl)
+                       : 'row carries no file link';
+          } else if (f) {
+            verdict = 'download failed';
+            why = f.r || 'see the log';
+          } else {
+            verdict = 'never attempted';
+            why = 'the run did not reach this row (stopped, or still to resume)';
+          }
+          rows.push([
+            verdict, why, s.p, s.ec, s.en, s.dn, s.ft, s.id,
+            s.u ? 'yes' : 'NO', s.fl || '',
+          ]);
+        });
+
+        const head = 'verdict,why,page,emp_code,emp_name,doc_name,file_template,doc_id,had_file_link,grid_flags';
+        const body = rows.map((r) => r.map(csvCell).join(',')).join(CRLF);
+        downloadText([head].concat(body ? [body] : []).join(CRLF),
+          'paycom_dl_COMPARE_' + stamp() + '.csv');
+
+        const tally = rows.reduce((m, r) => { m[r[0]] = (m[r[0]] || 0) + 1; return m; }, {});
+        alert(
+          'Scanned (listed in the grid): ' + Object.keys(seen).length + String.fromCharCode(10) +
+          'Downloaded and on disk: ' + okCount + String.fromCharCode(10) +
+          'Not on disk: ' + rows.length + String.fromCharCode(10, 10) +
+          Object.keys(tally).map((k) => '  ' + k + ': ' + tally[k]).join(String.fromCharCode(10)) +
+          String.fromCharCode(10, 10) + 'Details saved as paycom_dl_COMPARE_*.csv');
       }
 
       // Same exports, but written to disk WITHOUT anyone clicking and without
@@ -3328,7 +3408,7 @@
           if (!entries.length) return;
           const when = stamp();
           downloadText(logToCsv(entries), 'paycom_dl_log_' + tag + '_' + when + '.csv');
-          const bad = entries.filter((e) => e.s !== 'ok');
+          const bad = entries.filter(isFailure);
           if (bad.length) {
             downloadText(logToCsv(bad), 'paycom_dl_FAILED_' + tag + '_' + when + '.csv');
           }
@@ -3475,7 +3555,32 @@
           fileTemplate,
           docId: docId || `noid-${Math.random().toString(36).slice(2)}`,
           dlUrl,
+          flags: rowFlags(row),
         };
+      }
+
+      // Column headers, by cell index, so a flag can name the column it came
+      // from instead of saying "column 7".
+      function headerNames() {
+        return Array.from(document.querySelectorAll('#ee-doc-table thead th'))
+          .map((th) => (th.textContent || '').replace(/\s+/g, ' ').trim());
+      }
+
+      // What the GRID itself says about this row, for rows that turn out to
+      // have no file behind them. Paycom marks an unsigned/unreturned document
+      // by putting "Missing" in the signature or reminder column, and that is
+      // the difference between "the bot failed" and "there is nothing here to
+      // download" — which is exactly what the scan is meant to settle.
+      function rowFlags(row) {
+        const heads = headerNames();
+        const out = [];
+        Array.from(row.querySelectorAll('td')).forEach((td, i) => {
+          const txt = (td.textContent || '').replace(/\s+/g, ' ').trim();
+          if (/^(missing|expired|pending|not signed|incomplete)$/i.test(txt)) {
+            out.push((heads[i] || ('col' + (i + 1))) + '=' + txt);
+          }
+        });
+        return out.join('; ');
       }
 
       // ── core: fetch() file → Blob → save to disk ──
@@ -3535,6 +3640,33 @@
         const rows = Array.from(document.querySelectorAll('#ee-doc-table tbody tr[role="row"]'));
         console.log(`[DL] Page ${state.currentPage} — ${rows.length} rows`);
 
+        // Scan mode: record what the grid HOLDS, download nothing. One pass
+        // over 250 pages takes minutes instead of days, and gives the list to
+        // compare a finished download run against — so "this document never
+        // arrived" can be answered with "because its row says Missing" or
+        // "because the row carried no file link", instead of a guess.
+        if (state.scanOnly) {
+          for (let i = 0; i < rows.length; i++) {
+            if (stopRequested) { console.log('[DL] Scan stopped at row ' + (i + 1)); return; }
+            const info = getRowInfo(rows[i]);
+            await waitWhilePaused();
+            if (stopRequested) return;
+            state.totalAttempted++;
+            state.scanned = (state.scanned || 0) + 1;
+            if (!info.dlUrl) state.skippedDocs.push({ ...info, reason: 'No file link on the row', page: state.currentPage });
+            logAppend(logRow(info, state, 'scan', {
+              u: info.dlUrl ? 1 : 0,
+              fl: info.flags || '',
+              r: info.dlUrl ? '' : 'No file link on the row',
+            }));
+            statusEl.textContent =
+              `Scanning: p${state.currentPage} row ${i + 1}/${rows.length}` +
+              ` | listed ${state.scanned}, no-file ${state.skippedDocs.length}`;
+          }
+          saveDlState(state);
+          return;
+        }
+
         for (let i = 0; i < rows.length; i++) {
           if (stopRequested) { console.log('[DL] Stop requested — halting at row ' + (i + 1)); return; }
           const info = getRowInfo(rows[i]);
@@ -3557,7 +3689,7 @@
           if (!info.dlUrl) {
             const noUrl = 'No download URL found in row DOM';
             state.skippedDocs.push({ ...info, reason: noUrl, page: state.currentPage });
-            logAppend(logRow(info, state, 'fail', { r: noUrl, a: 0 }));
+            logAppend(logRow(info, state, 'fail', { r: noUrl, a: 0, u: 0, fl: info.flags || '' }));
             saveDlState(state);
             continue;
           }
@@ -3680,6 +3812,19 @@
 
           state.isComplete = true;
           saveDlState(state);
+          if (state.scanOnly) {
+            clearDlState();
+            statusEl.textContent =
+              `Scan done: ${state.scanned || 0} rows listed, ` +
+              `${state.skippedDocs.length} with no file link`;
+            alert(
+              'Scan finished.' + String.fromCharCode(10, 10) +
+              'Rows listed in the grid: ' + (state.scanned || 0) + String.fromCharCode(10) +
+              'Of those, with no file link: ' + state.skippedDocs.length + String.fromCharCode(10, 10) +
+              'The full list is in the auto-saved log CSV. After the download run,' + String.fromCharCode(10) +
+              'use "Compare scan vs downloads".');
+            return;
+          }
           showSummary(state);
           clearDlState();
           statusEl.textContent = `Docs done: ✓ ${state.downloadedDocIds.size} ✗ ${state.skippedDocs.length}`;
@@ -3958,6 +4103,8 @@
       // page 148 of 207 then has no way back except redoing all 147 pages, so
       // this starts at any page the user names.
       const fromPageBtn = mkBtn('⏭ Start from page…', '#8e44ad');
+      const scanBtn = mkBtn('🔍 Scan all pages (no download)', '#16a085');
+      const compareBtn = mkBtn('🧮 Compare scan vs downloads', '#d35400');
       const pauseBtn = mkBtn('⏸  Pause', '#7f8c8d'); pauseBtn.style.display = 'none';
 
       // Persistent-log controls. These stay useful after a run ends (or dies)
@@ -3972,6 +4119,8 @@
       container.appendChild(statusEl);
       container.appendChild(resumeBtn);
       container.appendChild(fromPageBtn);
+      container.appendChild(scanBtn);
+      container.appendChild(compareBtn);
       container.appendChild(pauseBtn);
       container.appendChild(logInfoEl);
       container.appendChild(exportBtn);
@@ -4095,6 +4244,23 @@
           runWith(s);
         } finally { starting = false; }
       };
+      // Inventory pass: same walk over the same pages, downloading nothing.
+      // Uses the filter already on screen, for the same reason Start-from-page
+      // does — the scan has to cover exactly the list the download run will.
+      docsScanAll = async (startPage) => {
+        if (running || starting) return;
+        starting = true;
+        stopRequested = false;
+        try {
+          clearDlState();
+          const s = freshDlState();
+          s.scanOnly = true;
+          s.currentPage = startPage || 1;
+          saveDlState(s);
+          console.log('[DL] Scan-only pass from page ' + s.currentPage);
+          runWith(s);
+        } finally { starting = false; }
+      };
       docsResume = async () => {
         if (running || starting) return;
         starting = true;
@@ -4152,6 +4318,20 @@
         }
         docsStartFromPage(page);
       });
+      scanBtn.addEventListener('click', () => {
+        const nl = String.fromCharCode(10);
+        const total = getTotalPages();
+        if (!window.confirm(
+          'Scan every page WITHOUT downloading anything?' + nl + nl +
+          'It walks the list exactly as it is filtered right now and records' + nl +
+          'every row — employee, document, whether the row has a file link, and' + nl +
+          'anything the grid flags on it such as "Missing".' + nl + nl +
+          'Afterwards, "Compare scan vs downloads" tells you which documents' + nl +
+          'are not on disk and why.' +
+          (total ? nl + nl + 'This list currently has ' + total + ' pages.' : ''))) return;
+        docsScanAll(1);
+      });
+      compareBtn.addEventListener('click', compareScanToDownloads);
 
       console.log('[Paycom DL] doc-downloader mounted on Doc Dashboard.');
     }
